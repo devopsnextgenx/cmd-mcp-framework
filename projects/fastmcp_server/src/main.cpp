@@ -7,6 +7,8 @@
 #include <map>
 #include <algorithm>
 #include <cctype>
+#include <algorithm>
+#include <cctype>
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -178,6 +180,24 @@ std::string toUpperAscii(std::string value) {
   return value;
 }
 
+std::string toLowerAscii(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+    return static_cast<char>(std::tolower(ch));
+  });
+  return value;
+}
+
+std::string canonicalResourceName(const std::string& plugin_name) {
+  const auto upper = toUpperAscii(plugin_name);
+  if (upper == "GEO") {
+    return "geometry";
+  }
+  if (upper == "MATH") {
+    return "math";
+  }
+  return toLowerAscii(plugin_name);
+}
+
 std::string resolvePluginName(const cmdsdk::CommandMetadata& metadata) {
   // Prefer the explicit plugin_name field populated by setPluginName().
   if (!metadata.plugin_name.empty()) {
@@ -293,6 +313,24 @@ const PluginInfo* findPluginInfo(const std::map<std::string, PluginInfo>& plugin
     }
   }
 
+  const auto requested_lower = toLowerAscii(requested_name);
+  for (const auto& [plugin_name, plugin_info] : plugins) {
+    const auto plugin_upper = toUpperAscii(plugin_name);
+    if ((requested_lower == "geo" || requested_lower == "geometry") &&
+        plugin_upper == "GEO") {
+      resolved_name = plugin_name;
+      return &plugin_info;
+    }
+    if (requested_lower == "math" && plugin_upper == "MATH") {
+      resolved_name = plugin_name;
+      return &plugin_info;
+    }
+    if (canonicalResourceName(plugin_name) == requested_lower) {
+      resolved_name = plugin_name;
+      return &plugin_info;
+    }
+  }
+
   return nullptr;
 }
 
@@ -387,9 +425,10 @@ nlohmann::json handleMcpRequest(const nlohmann::json& request,
     });
 
     for (const auto& [plugin_name, _] : plugins) {
+      const auto resource_name = canonicalResourceName(plugin_name);
       resources.push_back({
-          {"uri",         "plugin://" + plugin_name},
-          {"name",        "Plugin: " + plugin_name},
+          {"uri",         "plugin://" + resource_name},
+          {"name",        "Plugin: " + resource_name},
           {"description", "Details for " + plugin_name + " plugin including available SubCommand types"},
           {"mimeType",    "text/markdown"}
       });
@@ -420,20 +459,25 @@ nlohmann::json handleMcpRequest(const nlohmann::json& request,
       });
     }
 
+    std::string requested_resource = uri;
     if (uri.starts_with("plugin://")) {
-      const std::string plugin_name = uri.substr(9);
+      requested_resource = uri.substr(9);
+    }
+
+    if (!requested_resource.empty()) {
       std::string resolved_name;
-      const auto* plugin_info = findPluginInfo(plugins, plugin_name, resolved_name);
+      const auto* plugin_info = findPluginInfo(plugins, requested_resource, resolved_name);
       if (plugin_info != nullptr) {
+        const auto canonical_uri = "plugin://" + canonicalResourceName(resolved_name);
         return makeJsonRpcResult(id, {
             {"contents", {{
-                {"uri",      uri},
+                {"uri",      canonical_uri},
                 {"mimeType", "text/markdown"},
                 {"text",     buildPluginDetailsMarkdown(resolved_name, *plugin_info)}
             }}}
         });
       }
-      return makeJsonRpcError(id, -32001, "Plugin not found: " + plugin_name);
+      return makeJsonRpcError(id, -32001, "Plugin not found: " + requested_resource);
     }
 
     return makeJsonRpcError(id, -32001, "Resource not found: " + uri);
@@ -1153,6 +1197,9 @@ int main(int argc, char** argv) {
   // ─────────────────────────────────────────────────────────────────────────
   server.Get("/", [&](const httplib::Request&, httplib::Response& response) {
     addCorsHeaders(response);
+    response.set_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    response.set_header("Pragma", "no-cache");
+    response.set_header("Expires", "0");
     response.set_content(defaultHtmlPage(config.port, config.protocol_mode, plugins),
                          "text/html");
   });
