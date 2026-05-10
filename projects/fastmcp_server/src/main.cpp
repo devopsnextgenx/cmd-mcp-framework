@@ -161,13 +161,8 @@ nlohmann::json commandToMcpTool(const cmdsdk::CommandMetadata& metadata) {
 
   const auto subtype_response_schemas = buildSubtypeResponseSchemas(metadata);
   if (!subtype_response_schemas.empty()) {
-    nlohmann::json one_of = nlohmann::json::array();
-    for (const auto& [subtype_name, schema] : subtype_response_schemas.items()) {
-      (void)subtype_name;
-      one_of.push_back(schema);
-    }
     tool["outputSchema"] = {
-        {"oneOf", one_of},
+        {"type", "object"},
         {"description", "Subtype-specific response schema. See x-subTypeResponseSchemas for subtype mapping."}
     };
     tool["x-subTypeResponseSchemas"] = subtype_response_schemas;
