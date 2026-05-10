@@ -460,7 +460,7 @@ nlohmann::json handleMcpRequest(const nlohmann::json& request,
       structured_result = nlohmann::json{{"result", raw_result}};
     }
 
-    // Include subTypeExecuted if subType was in the request
+    // Include subTypeExecuted if subType was in the request (MCP protocol standard)
     if (args.contains("subType") && args["subType"].is_string()) {
       const auto subtype_executed = args["subType"].get<std::string>();
       structured_result["subTypeExecuted"] = subtype_executed;
