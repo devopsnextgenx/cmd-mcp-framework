@@ -1,0 +1,151 @@
+openapi: 3.0.0
+info:
+  title: Math Command Provider API
+  description: Mathematical operations provider for FastMCP
+  version: 1.0.0
+  contact:
+    name: Math Provider
+servers:
+  - url: /
+    description: FastMCP Server
+tags:
+  - name: MATH
+    description: Mathematical operations
+
+paths:
+  /api/math.calculate:
+    post:
+      operationId: math.calculate
+      summary: Perform mathematical operations
+      description: Execute various mathematical operations on two operands including addition, subtraction, multiplication, division, modulo, and power.
+      tags:
+        - MATH
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - subType
+                - left
+                - right
+              properties:
+                subType:
+                  type: string
+                  description: The mathematical operation to perform
+                  enum:
+                    - MATH.ADD
+                    - MATH.SUB
+                    - MATH.MUL
+                    - MATH.DIV
+                    - MATH.MOD
+                    - MATH.POW
+                  example: MATH.ADD
+                left:
+                  type: number
+                  description: The left operand
+                  example: 5
+                right:
+                  type: number
+                  description: The right operand
+                  example: 3
+            examples:
+              addExample:
+                value:
+                  subType: MATH.ADD
+                  left: 5
+                  right: 3
+                  description: Add 5 + 3
+              multiplyExample:
+                value:
+                  subType: MATH.MUL
+                  left: 4
+                  right: 7
+                  description: Multiply 4 * 7
+      responses:
+        '200':
+          description: Operation executed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  result:
+                    type: object
+                    example:
+                      operation: MATH.ADD
+                      left: 5
+                      right: 3
+                      value: 8
+        '400':
+          description: Invalid request or validation failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  error:
+                    type: string
+                    example: "Validation failed: subType must be one of MATH.ADD, MATH.SUB, ..."
+        '500':
+          description: Server error during execution
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  error:
+                    type: string
+                    example: "Execution failed: Division by zero"
+
+components:
+  schemas:
+    MathOperation:
+      type: string
+      enum:
+        - MATH.ADD
+        - MATH.SUB
+        - MATH.MUL
+        - MATH.DIV
+        - MATH.MOD
+        - MATH.POW
+      description: Available mathematical operations
+    
+    MathRequest:
+      type: object
+      required:
+        - subType
+        - left
+        - right
+      properties:
+        subType:
+          $ref: '#/components/schemas/MathOperation'
+        left:
+          type: number
+          description: Left operand
+        right:
+          type: number
+          description: Right operand
+    
+    MathResult:
+      type: object
+      properties:
+        operation:
+          $ref: '#/components/schemas/MathOperation'
+        left:
+          type: number
+        right:
+          type: number
+        value:
+          type: number
+          description: The result of the operation
