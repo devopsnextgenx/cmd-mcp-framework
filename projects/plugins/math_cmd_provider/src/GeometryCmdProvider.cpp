@@ -56,7 +56,7 @@ static constexpr double PI = M_PI;
 class GeometryCmdProvider final : public cmdsdk::SubCmd {
  public:
   GeometryCmdProvider() : cmdsdk::SubCmd() {
-    setPluginName("GEOMETRY");
+    setPluginName("GEO");
  
     registerSubCmdType("GEO.PERIMETER.TRIANGLE",  {"GEO.PERIMETER.TRIANGLE",  "Perimeter of a triangle. Params: a, b, c."});
     registerSubCmdType("GEO.PERIMETER.RECTANGLE", {"GEO.PERIMETER.RECTANGLE", "Perimeter of a rectangle. Params: a (length), b (width)."});
@@ -80,7 +80,7 @@ class GeometryCmdProvider final : public cmdsdk::SubCmd {
  
   cmdsdk::CommandMetadata buildMetadata() const override {
     cmdsdk::CommandMetadata metadata;
-    metadata.cmd_name   = "geometry.calculate";
+    metadata.cmd_name   = "geo.calculate";
     metadata.description =
         "Geometry command provider extending abstract Cmd. Calculates perimeter, "
         "area, and volume for triangles, rectangles, circles, pyramids, "
