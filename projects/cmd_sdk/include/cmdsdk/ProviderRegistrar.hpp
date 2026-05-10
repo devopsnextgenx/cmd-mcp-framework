@@ -127,6 +127,9 @@ struct AutoRegister {
 // The macro deliberately uses __COUNTER__ to guarantee a unique variable name
 // even when multiple providers are registered in the same translation unit.
 // -----------------------------------------------------------------------------
-#define CMDSDK_REGISTER_PROVIDER(ClassName)                                    \
-  static ::cmdsdk::AutoRegister<ClassName>                                     \
-      _cmdsdk_auto_register_##ClassName##_##__COUNTER__  // NOLINT
+#define CMDSDK_CONCAT_IMPL(a, b) a##b
+#define CMDSDK_CONCAT(a, b) CMDSDK_CONCAT_IMPL(a, b)
+
+#define CMDSDK_REGISTER_PROVIDER(ClassName)                                \
+  static ::cmdsdk::AutoRegister<ClassName>                                 \
+      CMDSDK_CONCAT(_cmdsdk_auto_register_, __COUNTER__)  // NOLINT
