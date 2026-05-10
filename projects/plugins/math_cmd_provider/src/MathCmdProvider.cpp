@@ -9,30 +9,9 @@
 #include "cmdsdk/CommandRegistry.hpp"
 #include "cmdsdk/PluginApi.hpp"
 #include "cmdsdk/SubCmd.hpp"
+#include "cmdsdk/ProviderRegistrar.hpp"
 
 namespace {
-cmdsdk::CommandMetadata buildMathMetadata() {
-  cmdsdk::CommandMetadata metadata;
-  metadata.cmd_name = "math.calculate";
-  metadata.description =
-      "Math command provider extending abstract Cmd. Demonstrates subtype registration with switch-case execution.";
-  metadata.parameters = {
-      {"subType", "string", true, "Allowed values: MATH.ADD, MATH.SUB, MATH.MUL, MATH.DIV, MATH.MOD, MATH.POW.",
-       "Selects which mathematical operation to perform."},
-      {"left", "number", true, "Must be numeric.", "Left operand."},
-      {"right", "number", true, "Must be numeric.", "Right operand."},
-  };
-  metadata.sub_cmd_types = {
-      {"MATH.ADD", "Add left and right."},
-      {"MATH.SUB", "Subtract right from left."},
-      {"MATH.MUL", "Multiply left and right."},
-      {"MATH.DIV", "Divide left by right."},
-      {"MATH.MOD", "Modulo of left by right."},
-      {"MATH.POW", "Raise left to the power of right."},
-  };
-  return metadata;
-}
-
 class MathCmdProvider final : public cmdsdk::SubCmd {
  public:
   MathCmdProvider() : cmdsdk::SubCmd() {
@@ -43,6 +22,30 @@ class MathCmdProvider final : public cmdsdk::SubCmd {
     registerSubCmdType("MATH.DIV", {"MATH.DIV", "Divide left by right."});
     registerSubCmdType("MATH.MOD", {"MATH.MOD", "Modulo of left by right."});
     registerSubCmdType("MATH.POW", {"MATH.POW", "Raise left to the power of right."});
+  }
+
+  cmdsdk::CommandMetadata buildMetadata() const override {
+    cmdsdk::CommandMetadata metadata;
+    metadata.cmd_name   = "math.calculate";
+    metadata.description =
+        "Math command provider extending abstract Cmd. Demonstrates subtype "
+        "registration with switch-case execution.";
+    metadata.parameters = {
+        {"subType", "string", true,
+         "Allowed values: MATH.ADD, MATH.SUB, MATH.MUL, MATH.DIV, MATH.MOD, MATH.POW.",
+         "Selects which mathematical operation to perform."},
+        {"left",  "number", true, "Must be numeric.", "Left operand."},
+        {"right", "number", true, "Must be numeric.", "Right operand."},
+    };
+    metadata.sub_cmd_types = {
+        {"MATH.ADD", "Add left and right."},
+        {"MATH.SUB", "Subtract right from left."},
+        {"MATH.MUL", "Multiply left and right."},
+        {"MATH.DIV", "Divide left by right."},
+        {"MATH.MOD", "Modulo of left by right."},
+        {"MATH.POW", "Raise left to the power of right."},
+    };
+    return metadata;
   }
 
   bool validate(const nlohmann::json& input, std::string& error) override {
@@ -174,11 +177,4 @@ class MathCmdProvider final : public cmdsdk::SubCmd {
 
 }  // namespace
 
-extern "C" CMDSDK_API void RegisterCommands(cmdsdk::CommandRegistry& registry) {
-  std::string error;
-  if (!registry.registerCommand(buildMathMetadata(), []() -> std::unique_ptr<cmdsdk::ICmd> {
-        return std::make_unique<MathCmdProvider>();
-      }, error)) {
-    std::cerr << "math_cmd_provider registration error: " << error << '\n';
-  }
-}
+CMDSDK_REGISTER_PROVIDER(MathCmdProvider);

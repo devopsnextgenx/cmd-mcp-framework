@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <sstream>
+#include <set>
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -13,6 +14,14 @@
 namespace {
 
 constexpr int kDefaultServerPort = CMDSDK_SERVER_PORT;
+
+// ---------------------------------------------------------------------------
+// Known SDK libraries that live in lib/ but are NOT plugins.
+// Extend this list if more SDK shared libs are added.
+// ---------------------------------------------------------------------------
+static const std::set<std::string> kNonPluginLibs = {
+    "libcmd_sdk.so",
+};
 
 struct ServerConfig {
   int port = kDefaultServerPort;
@@ -49,51 +58,44 @@ void addCorsHeaders(httplib::Response& response) {
   response.set_header("Access-Control-Allow-Headers", "Content-Type, MCP-Session-Id, MCP-Protocol-Version");
 }
 
-nlohmann::json parameterToMcpSchema(const cmdsdk::ParameterMetadata& parameter, const nlohmann::json& subtype_options = nullptr) {
-  std::string type = "string";  // default
-  if (parameter.parameter_type == "number") {
-    type = "number";
-  } else if (parameter.parameter_type == "boolean") {
-    type = "boolean";
-  } else if (parameter.parameter_type == "object") {
-    type = "object";
-  } else if (parameter.parameter_type == "array") {
-    type = "array";
-  }
-  // else string
+nlohmann::json parameterToMcpSchema(const cmdsdk::ParameterMetadata& parameter,
+                                     const nlohmann::json& subtype_options = nullptr) {
+  std::string type = "string";
+  if (parameter.parameter_type == "number")       type = "number";
+  else if (parameter.parameter_type == "boolean") type = "boolean";
+  else if (parameter.parameter_type == "object")  type = "object";
+  else if (parameter.parameter_type == "array")   type = "array";
+
   nlohmann::json schema = {
-      {"type", type},
+      {"type",        type},
       {"description", parameter.description}
   };
-  
-  // Add enum values for subType parameter
-  if (parameter.parameter_name == "subType" && subtype_options != nullptr && subtype_options.is_array()) {
+
+  if (parameter.parameter_name == "subType" &&
+      subtype_options != nullptr && subtype_options.is_array()) {
     schema["enum"] = subtype_options;
   }
-  
-  if (!parameter.validation.empty()) {
-    // simplistic validation
-  }
+
   return schema;
 }
 
 nlohmann::json commandToMcpTool(const cmdsdk::CommandMetadata& metadata) {
-  // Extract subType enum values from sub_cmd_types
   nlohmann::json subtype_enums = nlohmann::json::array();
   for (const auto& subtype : metadata.sub_cmd_types) {
     subtype_enums.push_back(subtype.sub_type_name);
   }
-  
+
   nlohmann::json inputSchema = {
-      {"type", "object"},
+      {"type",       "object"},
       {"properties", nlohmann::json::object()},
-      {"required", nlohmann::json::array()}
+      {"required",   nlohmann::json::array()}
   };
+
   for (const auto& param : metadata.parameters) {
-    // Pass subtype_enums only for the subType parameter
-    nlohmann::json param_schema = (param.parameter_name == "subType" && !subtype_enums.empty())
-                                   ? parameterToMcpSchema(param, subtype_enums)
-                                   : parameterToMcpSchema(param);
+    nlohmann::json param_schema =
+        (param.parameter_name == "subType" && !subtype_enums.empty())
+            ? parameterToMcpSchema(param, subtype_enums)
+            : parameterToMcpSchema(param);
     inputSchema["properties"][param.parameter_name] = param_schema;
     if (param.required) {
       inputSchema["required"].push_back(param.parameter_name);
@@ -101,62 +103,66 @@ nlohmann::json commandToMcpTool(const cmdsdk::CommandMetadata& metadata) {
   }
 
   return {
-      {"name", metadata.cmd_name},
+      {"name",        metadata.cmd_name},
       {"description", metadata.description},
       {"inputSchema", inputSchema}
   };
 }
 
 nlohmann::json makeJsonRpcResult(const nlohmann::json& id, const nlohmann::json& result) {
-  return {
-      {"jsonrpc", "2.0"},
-      {"id", id},
-      {"result", result},
-  };
+  return {{"jsonrpc", "2.0"}, {"id", id}, {"result", result}};
 }
 
 nlohmann::json makeJsonRpcError(const nlohmann::json& id, int code, const std::string& message) {
   return {
       {"jsonrpc", "2.0"},
-      {"id", id},
-      {"error",
-       {
-           {"code", code},
-           {"message", message},
-       }},
+      {"id",      id},
+      {"error",   {{"code", code}, {"message", message}}}
   };
 }
 
-// Helper: Extract plugin name from subtype (format: PLUGIN_NAME.SUBTYPE)
-std::string extractPluginName(const std::string& subtype_name) {
-  size_t dot_pos = subtype_name.find('.');
-  if (dot_pos != std::string::npos) {
-    return subtype_name.substr(0, dot_pos);
+// ---------------------------------------------------------------------------
+// Plugin registry helpers
+//
+// A "plugin name" is derived from the plugin_name field set via
+// SubCmd::setPluginName() and exposed through CommandMetadata::plugin_name.
+//
+// Fallback: if plugin_name is empty, extract the first dot-segment of the
+// first sub_cmd_type name (e.g. "MATH" from "MATH.ADD").
+// ---------------------------------------------------------------------------
+using PluginInfo = std::map<std::string, std::string>;  // subtype_name -> description
+
+std::string resolvePluginName(const cmdsdk::CommandMetadata& metadata) {
+  // Prefer the explicit plugin_name field populated by setPluginName().
+  if (!metadata.plugin_name.empty()) {
+    return metadata.plugin_name;
   }
-  return "";
+  // Fallback: first dot-segment of the first registered sub-type name.
+  if (!metadata.sub_cmd_types.empty()) {
+    const auto& first = metadata.sub_cmd_types.front().sub_type_name;
+    const auto dot = first.find('.');
+    if (dot != std::string::npos) {
+      return first.substr(0, dot);
+    }
+    return first;
+  }
+  // Last resort: use the command name itself.
+  return metadata.cmd_name;
 }
 
-// Helper: Build a map of plugins with their subtypes and commands
-using PluginInfo = std::map<std::string, std::string>;  // subtype_name -> description
 std::map<std::string, PluginInfo> buildPluginRegistry(const cmdsdk::CommandRegistry& registry) {
   std::map<std::string, PluginInfo> plugins;
-  
   for (const auto& metadata : registry.listMetadata()) {
+    const std::string plugin_name = resolvePluginName(metadata);
     for (const auto& subtype : metadata.sub_cmd_types) {
-      std::string plugin_name = extractPluginName(subtype.sub_type_name);
-      if (!plugin_name.empty()) {
-        plugins[plugin_name][subtype.sub_type_name] = subtype.description;
-      }
+      plugins[plugin_name][subtype.sub_type_name] = subtype.description;
     }
   }
-  
   return plugins;
 }
 
-// Helper: Build markdown documentation for all plugins
 std::string buildPluginsMarkdown(const std::map<std::string, PluginInfo>& plugins) {
   std::string doc = "# Available Plugins and SubCommand Types\n\n";
-  
   for (const auto& [plugin_name, subtypes] : plugins) {
     doc += "## Plugin: " + plugin_name + "\n\n";
     doc += "### Available SubCommand Types:\n\n";
@@ -165,157 +171,146 @@ std::string buildPluginsMarkdown(const std::map<std::string, PluginInfo>& plugin
     }
     doc += "\n";
   }
-  
   return doc;
 }
 
-// Helper: Build markdown for a specific plugin
-std::string buildPluginDetailsMarkdown(const std::string& plugin_name, const PluginInfo& plugin_info) {
+std::string buildPluginDetailsMarkdown(const std::string& plugin_name,
+                                        const PluginInfo& plugin_info) {
   std::string doc = "# Plugin: " + plugin_name + "\n\n";
   doc += "## Available SubCommand Types\n\n";
-  
   for (const auto& [subtype_name, description] : plugin_info) {
     doc += "- **" + subtype_name + "**: " + description + "\n";
   }
-  
   return doc;
 }
 
-nlohmann::json handleMcpRequest(const nlohmann::json& request, cmdsdk::CommandRegistry& registry) {
+// ---------------------------------------------------------------------------
+// MCP request dispatcher
+// ---------------------------------------------------------------------------
+nlohmann::json handleMcpRequest(const nlohmann::json& request,
+                                 cmdsdk::CommandRegistry& registry) {
   const auto id = request.contains("id") ? request.at("id") : nlohmann::json(nullptr);
 
-  if (!request.is_object()) {
+  if (!request.is_object())
     return makeJsonRpcError(id, -32600, "Invalid Request: body must be an object.");
-  }
-
-  if (!request.contains("jsonrpc") || request.at("jsonrpc") != "2.0") {
+  if (!request.contains("jsonrpc") || request.at("jsonrpc") != "2.0")
     return makeJsonRpcError(id, -32600, "Invalid Request: jsonrpc must be 2.0.");
-  }
-
-  if (!request.contains("method") || !request.at("method").is_string()) {
+  if (!request.contains("method") || !request.at("method").is_string())
     return makeJsonRpcError(id, -32600, "Invalid Request: method must be a string.");
-  }
 
   const auto method = request.at("method").get<std::string>();
+
+  // ── initialize ────────────────────────────────────────────────────────────
   if (method == "initialize") {
     return makeJsonRpcResult(id, {
         {"protocolVersion", "2024-11-05"},
         {"capabilities", {
-            {"tools", {{"listChanged", true}}},
+            {"tools",     {{"listChanged", true}}},
             {"resources", {{"listChanged", true}}}
         }},
-        {"serverInfo", {
-            {"name", "fastmcp_server"},
-            {"version", "0.1.0"}
-        }}
+        {"serverInfo", {{"name", "fastmcp_server"}, {"version", "0.1.0"}}}
     });
   }
 
+  // ── tools/list ────────────────────────────────────────────────────────────
   if (method == "tools/list") {
     nlohmann::json tools = nlohmann::json::array();
-    for (const auto& command_metadata : registry.listMetadata()) {
-      tools.push_back(commandToMcpTool(command_metadata));
+    for (const auto& metadata : registry.listMetadata()) {
+      tools.push_back(commandToMcpTool(metadata));
     }
     return makeJsonRpcResult(id, {{"tools", tools}});
   }
 
+  // ── tools/call ────────────────────────────────────────────────────────────
   if (method == "tools/call") {
-    if (!request.contains("params") || !request.at("params").is_object()) {
+    if (!request.contains("params") || !request.at("params").is_object())
       return makeJsonRpcError(id, -32602, "Invalid params: params must be an object.");
-    }
 
     const auto& params = request.at("params");
-    if (!params.contains("name") || !params.at("name").is_string()) {
+    if (!params.contains("name") || !params.at("name").is_string())
       return makeJsonRpcError(id, -32602, "Invalid params: name must be a string.");
-    }
 
     const auto cmd_name = params.at("name").get<std::string>();
-    const auto args = params.contains("arguments") ? params.at("arguments") : nlohmann::json::object();
-    if (!args.is_object()) {
+    const auto args = params.contains("arguments")
+                          ? params.at("arguments")
+                          : nlohmann::json::object();
+    if (!args.is_object())
       return makeJsonRpcError(id, -32602, "Invalid params: arguments must be a JSON object.");
-    }
 
     auto command = registry.create(cmd_name);
-    if (!command) {
+    if (!command)
       return makeJsonRpcError(id, -32601, "Tool not found: " + cmd_name);
-    }
 
     std::string error;
-    if (!command->validate(args, error)) {
+    if (!command->validate(args, error))
       return makeJsonRpcError(id, -32000, "Validation failed: " + error);
-    }
-
-    if (!command->execute(args, error)) {
+    if (!command->execute(args, error))
       return makeJsonRpcError(id, -32001, "Execution failed: " + error);
-    }
 
-    return makeJsonRpcResult(id, {{"content", {{{"type", "text"}, {"text", command->getResult().dump()}} }}});
+    return makeJsonRpcResult(id, {
+        {"content", {{{"type", "text"}, {"text", command->getResult().dump()}}}}
+    });
   }
 
+  // ── resources/list ────────────────────────────────────────────────────────
   if (method == "resources/list") {
     auto plugins = buildPluginRegistry(registry);
     nlohmann::json resources = nlohmann::json::array();
-    
-    // Add main plugins overview resource
+
     resources.push_back({
-        {"uri", "plugins://overview"},
-        {"name", "Plugins Overview"},
+        {"uri",         "plugins://overview"},
+        {"name",        "Plugins Overview"},
         {"description", "Overview of all available plugins and their SubCommand types"},
-        {"mimeType", "text/markdown"}
+        {"mimeType",    "text/markdown"}
     });
-    
-    // Add individual plugin resources
+
     for (const auto& [plugin_name, _] : plugins) {
       resources.push_back({
-          {"uri", "plugin://" + plugin_name},
-          {"name", "Plugin: " + plugin_name},
+          {"uri",         "plugin://" + plugin_name},
+          {"name",        "Plugin: " + plugin_name},
           {"description", "Details for " + plugin_name + " plugin including available SubCommand types"},
-          {"mimeType", "text/markdown"}
+          {"mimeType",    "text/markdown"}
       });
     }
-    
+
     return makeJsonRpcResult(id, {{"resources", resources}});
   }
 
+  // ── resources/read ────────────────────────────────────────────────────────
   if (method == "resources/read") {
-    if (!request.contains("params") || !request.at("params").is_object()) {
+    if (!request.contains("params") || !request.at("params").is_object())
       return makeJsonRpcError(id, -32602, "Invalid params: params must be an object.");
-    }
 
     const auto& params = request.at("params");
-    if (!params.contains("uri") || !params.at("uri").is_string()) {
+    if (!params.contains("uri") || !params.at("uri").is_string())
       return makeJsonRpcError(id, -32602, "Invalid params: uri must be a string.");
-    }
 
-    std::string uri = params.at("uri").get<std::string>();
+    const std::string uri = params.at("uri").get<std::string>();
     auto plugins = buildPluginRegistry(registry);
 
     if (uri == "plugins://overview") {
-      std::string content = buildPluginsMarkdown(plugins);
       return makeJsonRpcResult(id, {
           {"contents", {{
-              {"uri", uri},
+              {"uri",      uri},
               {"mimeType", "text/markdown"},
-              {"text", content}
+              {"text",     buildPluginsMarkdown(plugins)}
           }}}
       });
     }
 
-    if (uri.find("plugin://") == 0) {
-      std::string plugin_name = uri.substr(9);  // Remove "plugin://" prefix
+    if (uri.starts_with("plugin://")) {
+      const std::string plugin_name = uri.substr(9);
       auto it = plugins.find(plugin_name);
       if (it != plugins.end()) {
-        std::string content = buildPluginDetailsMarkdown(plugin_name, it->second);
         return makeJsonRpcResult(id, {
             {"contents", {{
-                {"uri", uri},
+                {"uri",      uri},
                 {"mimeType", "text/markdown"},
-                {"text", content}
+                {"text",     buildPluginDetailsMarkdown(plugin_name, it->second)}
             }}}
         });
-      } else {
-        return makeJsonRpcError(id, -32001, "Plugin not found: " + plugin_name);
       }
+      return makeJsonRpcError(id, -32001, "Plugin not found: " + plugin_name);
     }
 
     return makeJsonRpcError(id, -32001, "Resource not found: " + uri);
@@ -324,23 +319,34 @@ nlohmann::json handleMcpRequest(const nlohmann::json& request, cmdsdk::CommandRe
   return makeJsonRpcError(id, -32601, "Method not found.");
 }
 
+// ---------------------------------------------------------------------------
+// Plugin discovery
+//
+// Scans <executable>/../lib/ for shared libraries, skipping known SDK libs
+// (libcmd_sdk.so) that are not plugins and would cause spurious load errors.
+// ---------------------------------------------------------------------------
 std::vector<std::filesystem::path> getAllPluginsInLib(const char* argv0) {
-  const auto executable_path = std::filesystem::absolute(argv0);
+  const auto executable_path      = std::filesystem::absolute(argv0);
   const auto executable_directory = executable_path.parent_path();
-  const auto lib_path = executable_directory.parent_path() / "lib";
+  const auto lib_path             = executable_directory.parent_path() / "lib";
 
   std::vector<std::filesystem::path> plugins;
-  if (std::filesystem::exists(lib_path) && std::filesystem::is_directory(lib_path)) {
-    for (const auto& entry : std::filesystem::directory_iterator(lib_path)) {
-      if (entry.is_regular_file()) {
-        const auto& path = entry.path();
-        const auto filename = path.filename().string();
-        // Check if it's a shared library (starts with lib and ends with .so on Linux)
-        if (filename.starts_with("lib") && filename.ends_with(".so")) {
-          plugins.push_back(path);
-        }
-      }
+  if (!std::filesystem::exists(lib_path) || !std::filesystem::is_directory(lib_path))
+    return plugins;
+
+  for (const auto& entry : std::filesystem::directory_iterator(lib_path)) {
+    if (!entry.is_regular_file()) continue;
+
+    const auto& path     = entry.path();
+    const auto  filename = path.filename().string();
+
+    if (!filename.starts_with("lib") || !filename.ends_with(".so")) continue;
+    if (kNonPluginLibs.count(filename)) {
+      std::cout << "Skipping SDK library (not a plugin): " << filename << '\n';
+      continue;
     }
+
+    plugins.push_back(path);
   }
   return plugins;
 }
@@ -361,11 +367,11 @@ std::string defaultHtmlPage(int port) {
   <p>Server is running on port <code>)" + std::to_string(port) + R"(</code> with MCP Streamable HTTP enabled.</p>
   <h2>Endpoints</h2>
   <ul>
-    <li><code>POST /mcp</code> - MCP JSON-RPC endpoint for tools and resources.</li>
+    <li><code>POST /mcp</code> — MCP JSON-RPC endpoint for tools and resources.</li>
   </ul>
   <h2>MCP Usage Notes</h2>
   <p>Use this server URL: <code>http://localhost:)" + std::to_string(port) + R"(/mcp</code></p>
-  <p>Start by calling <code>initialize</code> method, then <code>tools/list</code> to discover commands.</p>
+  <p>Start by calling <code>initialize</code>, then <code>tools/list</code> to discover commands.</p>
 </body>
 </html>)";
 }
@@ -396,15 +402,12 @@ int main(int argc, char** argv) {
   if (!loaded_at_least_one_plugin) {
     std::cerr << "No plugins were loaded. /resources will be empty until commands are registered.\n";
   } else {
-    // Log registered commands and subtypes
     std::cout << "Registered commands:\n";
     for (const auto& metadata : registry.listMetadata()) {
-      std::cout << "  - " << metadata.cmd_name << ": " << metadata.description << '\n';
-      if (!metadata.sub_cmd_types.empty()) {
-        std::cout << "    Subtypes:\n";
-        for (const auto& subtype : metadata.sub_cmd_types) {
-          std::cout << "      - " << subtype.sub_type_name << ": " << subtype.description << '\n';
-        }
+      std::cout << "  - [" << resolvePluginName(metadata) << "] "
+                << metadata.cmd_name << ": " << metadata.description << '\n';
+      for (const auto& subtype : metadata.sub_cmd_types) {
+        std::cout << "      - " << subtype.sub_type_name << ": " << subtype.description << '\n';
       }
     }
   }
@@ -427,7 +430,8 @@ int main(int argc, char** argv) {
     try {
       rpc_request = nlohmann::json::parse(request.body);
     } catch (const std::exception& parse_error) {
-      const auto error = makeJsonRpcError(nullptr, -32700, "Parse error: " + std::string(parse_error.what()));
+      const auto error = makeJsonRpcError(nullptr, -32700,
+                                          "Parse error: " + std::string(parse_error.what()));
       response.status = 400;
       response.set_content(error.dump(), "application/json");
       return;
