@@ -20,6 +20,7 @@ class SubCmd : public Cmd {
   ~SubCmd() override = default;
 
   void registerSubCmdType(const SubCmdType& type, SubCmdTypeMetadata metadata);
+  virtual CommandMetadata buildMetadata() const = 0;
 
  protected:
   void setPluginName(const std::string& name);

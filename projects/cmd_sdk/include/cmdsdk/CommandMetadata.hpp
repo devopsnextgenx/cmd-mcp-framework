@@ -19,6 +19,7 @@ struct SubCmdTypeMetadata {
 };
 
 struct CommandMetadata {
+  std::string plugin_name;
   std::string cmd_name;
   std::string description;
   std::vector<ParameterMetadata> parameters;

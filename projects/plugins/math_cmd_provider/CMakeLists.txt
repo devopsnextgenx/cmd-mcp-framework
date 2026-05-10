@@ -1,5 +1,7 @@
 add_library(math_cmd_provider SHARED
   src/MathCmdProvider.cpp
+  src/GeometryCmdProvider.cpp
+  ${CMDSDK_REGISTRAR_SRC} 
 )
 
 target_link_libraries(math_cmd_provider
