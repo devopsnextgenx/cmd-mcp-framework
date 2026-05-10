@@ -80,11 +80,13 @@ class OpenApiGenerator {
   /**
    * Generate OpenAPI response schema.
    *
-   * Returns generic result object with text content.
+    * Returns subtype-aware schema when sub_cmd_types carry response_schema.
+    * Falls back to generic result object when subtype response metadata is absent.
    *
+    * @param metadata Command metadata with optional per-subtype response schemas
    * @return OpenAPI responses object (200 + error responses)
    */
-  static nlohmann::json createOpenApiResponses();
+    static nlohmann::json createOpenApiResponses(const CommandMetadata& metadata);
 
  private:
   static std::string mapParameterTypeToOpenApi(const std::string& cmdsdk_type);
@@ -166,16 +168,31 @@ inline nlohmann::json OpenApiGenerator::createOpenApiRequestBody(
   return body;
 }
 
-inline nlohmann::json OpenApiGenerator::createOpenApiResponses() {
+inline nlohmann::json OpenApiGenerator::createOpenApiResponses(
+    const CommandMetadata& metadata) {
   // Success response (200)
   nlohmann::json response_200 = nlohmann::json::object();
   response_200["description"] = "Command executed successfully";
+
+  nlohmann::json subtype_schemas = nlohmann::json::array();
+  for (const auto& subtype : metadata.sub_cmd_types) {
+    if (subtype.response_schema.is_object() && !subtype.response_schema.empty()) {
+      subtype_schemas.push_back(subtype.response_schema);
+    }
+  }
+
   nlohmann::json success_schema = nlohmann::json::object();
-  success_schema["type"] = "object";
-  success_schema["properties"]["result"] = {
-      {"type", "object"},
-      {"description", "Command result"}
-  };
+  if (!subtype_schemas.empty()) {
+    success_schema["oneOf"] = subtype_schemas;
+    success_schema["description"] = "Subtype-specific command result";
+  } else {
+    success_schema["type"] = "object";
+    success_schema["properties"]["result"] = {
+        {"type", "object"},
+        {"description", "Command result"}
+    };
+  }
+
   response_200["content"]["application/json"]["schema"] = success_schema;
 
   // Error response (400/500)
@@ -213,7 +230,7 @@ inline nlohmann::json OpenApiGenerator::commandMetadataToOpenApiPathItem(
   operation["operationId"] = metadata.cmd_name;
   operation["tags"] = nlohmann::json::array({plugin_name});
   operation["requestBody"] = createOpenApiRequestBody(metadata, subtype_enums);
-  operation["responses"] = createOpenApiResponses();
+  operation["responses"] = createOpenApiResponses(metadata);
 
   nlohmann::json path_item = nlohmann::json::object();
   path_item["post"] = operation;

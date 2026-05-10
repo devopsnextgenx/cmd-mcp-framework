@@ -120,6 +120,16 @@ nlohmann::json parameterToMcpSchema(const cmdsdk::ParameterMetadata& parameter,
   return schema;
 }
 
+nlohmann::json buildSubtypeResponseSchemas(const cmdsdk::CommandMetadata& metadata) {
+  nlohmann::json schemas = nlohmann::json::object();
+  for (const auto& subtype : metadata.sub_cmd_types) {
+    if (subtype.response_schema.is_object() && !subtype.response_schema.empty()) {
+      schemas[subtype.sub_type_name] = subtype.response_schema;
+    }
+  }
+  return schemas;
+}
+
 nlohmann::json commandToMcpTool(const cmdsdk::CommandMetadata& metadata) {
   nlohmann::json subtype_enums = nlohmann::json::array();
   for (const auto& subtype : metadata.sub_cmd_types) {
@@ -143,11 +153,27 @@ nlohmann::json commandToMcpTool(const cmdsdk::CommandMetadata& metadata) {
     }
   }
 
-  return {
+  nlohmann::json tool = {
       {"name",        metadata.cmd_name},
       {"description", metadata.description},
       {"inputSchema", inputSchema}
   };
+
+  const auto subtype_response_schemas = buildSubtypeResponseSchemas(metadata);
+  if (!subtype_response_schemas.empty()) {
+    nlohmann::json one_of = nlohmann::json::array();
+    for (const auto& [subtype_name, schema] : subtype_response_schemas.items()) {
+      (void)subtype_name;
+      one_of.push_back(schema);
+    }
+    tool["outputSchema"] = {
+        {"oneOf", one_of},
+        {"description", "Subtype-specific response schema. See x-subTypeResponseSchemas for subtype mapping."}
+    };
+    tool["x-subTypeResponseSchemas"] = subtype_response_schemas;
+  }
+
+  return tool;
 }
 
 nlohmann::json makeJsonRpcResult(const nlohmann::json& id, const nlohmann::json& result) {
@@ -171,7 +197,7 @@ nlohmann::json makeJsonRpcError(const nlohmann::json& id, int code, const std::s
 // Fallback: if plugin_name is empty, extract the first dot-segment of the
 // first sub_cmd_type name (e.g. "MATH" from "MATH.ADD").
 // ---------------------------------------------------------------------------
-using PluginInfo = std::map<std::string, std::string>;  // subtype_name -> description
+using PluginInfo = std::map<std::string, cmdsdk::SubCmdTypeMetadata>;  // subtype_name -> metadata
 
 std::string toUpperAscii(std::string value) {
   std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
@@ -277,7 +303,7 @@ std::map<std::string, PluginInfo> buildPluginRegistry(const cmdsdk::CommandRegis
   for (const auto& metadata : registry.listMetadata()) {
     const std::string plugin_name = resolvePluginName(metadata);
     for (const auto& subtype : metadata.sub_cmd_types) {
-      plugins[plugin_name][subtype.sub_type_name] = subtype.description;
+      plugins[plugin_name][subtype.sub_type_name] = subtype;
     }
   }
   return plugins;
@@ -288,8 +314,13 @@ std::string buildPluginsMarkdown(const std::map<std::string, PluginInfo>& plugin
   for (const auto& [plugin_name, subtypes] : plugins) {
     doc += "## Plugin: " + plugin_name + "\n\n";
     doc += "### Available SubCommand Types:\n\n";
-    for (const auto& [subtype_name, description] : subtypes) {
-      doc += "- **" + subtype_name + "**: " + description + "\n";
+    for (const auto& [subtype_name, subtype_metadata] : subtypes) {
+      doc += "- **" + subtype_name + "**: " + subtype_metadata.description + "\n";
+      if (subtype_metadata.response_schema.is_object() &&
+          !subtype_metadata.response_schema.empty()) {
+        doc += "  - Expected response schema:\n";
+        doc += "```json\n" + subtype_metadata.response_schema.dump(2) + "\n```\n";
+      }
     }
     doc += "\n";
   }
@@ -338,8 +369,13 @@ std::string buildPluginDetailsMarkdown(const std::string& plugin_name,
                                         const PluginInfo& plugin_info) {
   std::string doc = "# Plugin: " + plugin_name + "\n\n";
   doc += "## Available SubCommand Types\n\n";
-  for (const auto& [subtype_name, description] : plugin_info) {
-    doc += "- **" + subtype_name + "**: " + description + "\n";
+  for (const auto& [subtype_name, subtype_metadata] : plugin_info) {
+    doc += "- **" + subtype_name + "**: " + subtype_metadata.description + "\n";
+    if (subtype_metadata.response_schema.is_object() &&
+        !subtype_metadata.response_schema.empty()) {
+      doc += "  - Expected response schema:\n";
+      doc += "```json\n" + subtype_metadata.response_schema.dump(2) + "\n```\n";
+    }
   }
   return doc;
 }

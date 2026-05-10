@@ -12,6 +12,26 @@
 #include "cmdsdk/ProviderRegistrar.hpp"
 
 namespace {
+
+nlohmann::json mathResultSchema(const std::string& executed,
+                                 const std::string& operation,
+                                 bool nullable_value = false) {
+  nlohmann::json value_schema = {{"type", "number"}};
+  if (nullable_value) {
+    value_schema = {{"type", nlohmann::json::array({"number", "null"})}};
+  }
+
+  return {
+      {"type", "object"},
+      {"required", nlohmann::json::array({"subTypeExecuted", "operation", "value"})},
+      {"properties", {
+          {"subTypeExecuted", {{"type", "string"}, {"const", executed}}},
+          {"operation", {{"type", "string"}, {"const", operation}}},
+          {"value", value_schema}
+      }}
+  };
+}
+
 class MathCmdProvider final : public cmdsdk::SubCmd {
  public:
   MathCmdProvider() : cmdsdk::SubCmd() {
@@ -38,12 +58,12 @@ class MathCmdProvider final : public cmdsdk::SubCmd {
         {"right", "number", true, "Must be numeric.", "Right operand."},
     };
     metadata.sub_cmd_types = {
-        {"MATH.ADD", "Add left and right."},
-        {"MATH.SUB", "Subtract right from left."},
-        {"MATH.MUL", "Multiply left and right."},
-        {"MATH.DIV", "Divide left by right."},
-        {"MATH.MOD", "Modulo of left by right."},
-        {"MATH.POW", "Raise left to the power of right."},
+      {"MATH.ADD", "Add left and right.", mathResultSchema("add", "addition")},
+      {"MATH.SUB", "Subtract right from left.", mathResultSchema("sub", "subtraction")},
+      {"MATH.MUL", "Multiply left and right.", mathResultSchema("mul", "multiplication")},
+      {"MATH.DIV", "Divide left by right.", mathResultSchema("div", "division", true)},
+      {"MATH.MOD", "Modulo of left by right.", mathResultSchema("mod", "modulo", true)},
+      {"MATH.POW", "Raise left to the power of right.", mathResultSchema("pow", "power")},
     };
     return metadata;
   }

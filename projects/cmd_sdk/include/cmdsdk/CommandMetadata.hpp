@@ -1,5 +1,6 @@
 #pragma once
 
+#include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
 
@@ -16,6 +17,7 @@ struct ParameterMetadata {
 struct SubCmdTypeMetadata {
   std::string sub_type_name;
   std::string description;
+  nlohmann::json response_schema = nlohmann::json::object();
 };
 
 struct CommandMetadata {
