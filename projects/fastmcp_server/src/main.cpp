@@ -26,9 +26,19 @@ constexpr int kDefaultServerPort = CMDSDK_SERVER_PORT;
 // Known SDK libraries that live in lib/ but are NOT plugins.
 // Extend this list if more SDK shared libs are added.
 // ---------------------------------------------------------------------------
+#if defined(_WIN32)
 static const std::set<std::string> kNonPluginLibs = {
-    "libcmd_sdk.so",
+  "cmd_sdk.dll",
 };
+#elif defined(__APPLE__)
+static const std::set<std::string> kNonPluginLibs = {
+  "libcmd_sdk.dylib",
+};
+#else
+static const std::set<std::string> kNonPluginLibs = {
+  "libcmd_sdk.so",
+};
+#endif
 
 // Protocol modes for endpoint support
 enum class ProtocolMode {
@@ -355,26 +365,71 @@ nlohmann::json handleMcpRequest(const nlohmann::json& request,
 std::vector<std::filesystem::path> getAllPluginsInLib(const char* argv0) {
   const auto executable_path      = std::filesystem::absolute(argv0);
   const auto executable_directory = executable_path.parent_path();
-  const auto lib_path             = executable_directory.parent_path() / "lib";
+  const auto parent_directory     = executable_directory.parent_path();
 
+  std::vector<std::filesystem::path> candidate_directories;
+  candidate_directories.push_back(executable_directory);
+  if (!parent_directory.empty()) {
+    candidate_directories.push_back(parent_directory);
+    candidate_directories.push_back(parent_directory / "lib");
+
+    const auto build_root_directory = parent_directory.parent_path();
+    if (!build_root_directory.empty()) {
+      candidate_directories.push_back(build_root_directory / "lib");
+      candidate_directories.push_back(build_root_directory / "bin");
+
+      // Handle multi-config generators (Debug/Release/etc.) by checking
+      // matching config folders under lib/ and bin/.
+      const auto config_directory = executable_directory.filename().string();
+      if (config_directory == "Debug" || config_directory == "Release" ||
+          config_directory == "RelWithDebInfo" || config_directory == "MinSizeRel") {
+        candidate_directories.push_back(build_root_directory / "lib" / config_directory);
+        candidate_directories.push_back(build_root_directory / "bin" / config_directory);
+      }
+    }
+  }
+
+  auto isPluginLibrary = [](const std::filesystem::path& path) {
+    if (!path.has_filename()) return false;
+    const auto filename = path.filename().string();
+#if defined(_WIN32)
+    return path.extension() == ".dll";
+#elif defined(__APPLE__)
+    return filename.starts_with("lib") && path.extension() == ".dylib";
+#else
+    return filename.starts_with("lib") && path.extension() == ".so";
+#endif
+  };
+
+  std::set<std::filesystem::path> seen;
   std::vector<std::filesystem::path> plugins;
-  if (!std::filesystem::exists(lib_path) || !std::filesystem::is_directory(lib_path))
-    return plugins;
 
-  for (const auto& entry : std::filesystem::directory_iterator(lib_path)) {
-    if (!entry.is_regular_file()) continue;
-
-    const auto& path     = entry.path();
-    const auto  filename = path.filename().string();
-
-    if (!filename.starts_with("lib") || !filename.ends_with(".so")) continue;
-    if (kNonPluginLibs.count(filename)) {
-      std::cout << "Skipping SDK library (not a plugin): " << filename << '\n';
+  for (const auto& dir : candidate_directories) {
+    if (!std::filesystem::exists(dir) || !std::filesystem::is_directory(dir)) {
       continue;
     }
 
-    plugins.push_back(path);
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+      if (!entry.is_regular_file()) continue;
+
+      const auto& path = entry.path();
+      if (!isPluginLibrary(path)) continue;
+
+      const auto filename = path.filename().string();
+      if (kNonPluginLibs.count(filename)) {
+        std::cout << "Skipping SDK library (not a plugin): " << filename << '\n';
+        continue;
+      }
+
+      const auto absolute_path = std::filesystem::absolute(path);
+      if (!seen.insert(absolute_path).second) {
+        continue;
+      }
+
+      plugins.push_back(absolute_path);
+    }
   }
+
   return plugins;
 }
 
