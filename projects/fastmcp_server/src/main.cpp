@@ -1258,7 +1258,7 @@ int main(int argc, char** argv) {
   // GET /swagger — Interactive Swagger UI (embedded)
   server.Get("/swagger", [&](const httplib::Request&, httplib::Response& response) {
     addCorsHeaders(response);
-    response.set_content(std::string(cmdsdk::swagger_resources::swagger_minimal_html),
+    response.set_content(std::string(cmdsdk::swagger_resources::swagger_html),
                          "text/html");
   });
 
