@@ -1,5 +1,8 @@
+import type { CSSProperties } from 'react'
+import Add from './math/Add.tsx'
+
 function App() {
-  const containerStyle: React.CSSProperties = {
+  const containerStyle: CSSProperties = {
     padding: '2rem',
     borderRadius: '12px',
     backgroundColor: 'var(--card-bg)',
@@ -10,22 +13,22 @@ function App() {
     width: '90%',
   };
 
-  const titleStyle: React.CSSProperties = {
+  const titleStyle: CSSProperties = {
     margin: '0 0 1rem 0',
     fontSize: '2rem',
     color: 'var(--accent-blue)',
     letterSpacing: '-0.025em',
   };
 
-  const textStyle: React.CSSProperties = {
+  const textStyle: CSSProperties = {
     color: 'var(--text-secondary)',
     fontSize: '1.1rem',
   };
 
   return (
     <div style={containerStyle}>
-      <h1 style={titleStyle}>MCP Dashboard</h1>
-      <p style={textStyle}>UI is successfully running.</p>
+      <h1 style={titleStyle}>MCP Apps</h1>
+      <Add />
       <div style={{ 
         marginTop: '1.5rem', 
         height: '4px', 
