@@ -161,11 +161,25 @@ nlohmann::json commandToMcpTool(const cmdsdk::CommandMetadata& metadata) {
 
   const auto subtype_response_schemas = buildSubtypeResponseSchemas(metadata);
   if (!subtype_response_schemas.empty()) {
+    nlohmann::json one_of_schemas = nlohmann::json::array();
+    nlohmann::json subtype_enum = nlohmann::json::array();
+    for (const auto& [subtype_name, schema] : subtype_response_schemas.items()) {
+      subtype_enum.push_back(subtype_name);
+      one_of_schemas.push_back(schema);
+    }
+
     tool["outputSchema"] = {
         {"type", "object"},
-        {"description", "Subtype-specific response schema. See x-subTypeResponseSchemas for subtype mapping."}
+        {"description", "Subtype-specific response schema. Select branch by subTypeExecuted."},
+        {"properties", {
+            {"subTypeExecuted", {
+                {"type", "string"},
+                {"enum", subtype_enum},
+                {"description", "Indicates which subType produced the response payload."}
+            }}
+        }},
+        {"oneOf", one_of_schemas}
     };
-    tool["x-subTypeResponseSchemas"] = subtype_response_schemas;
   }
 
   return tool;
