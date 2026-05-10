@@ -12,6 +12,26 @@
 #include "cmdsdk/ProviderRegistrar.hpp"
 
 namespace {
+
+nlohmann::json mathResultSchema(const std::string& subtype_name,
+                                 const std::string& operation,
+                                 bool nullable_value = false) {
+  nlohmann::json value_schema = {{"type", "number"}};
+  if (nullable_value) {
+    value_schema = {{"type", nlohmann::json::array({"number", "null"})}};
+  }
+
+  return {
+      {"type", "object"},
+      {"required", nlohmann::json::array({"subTypeExecuted", "operation", "value"})},
+      {"properties", {
+          {"subTypeExecuted", {{"type", "string"}, {"const", subtype_name}}},
+          {"operation", {{"type", "string"}, {"const", operation}}},
+          {"value", value_schema}
+      }}
+  };
+}
+
 class MathCmdProvider final : public cmdsdk::SubCmd {
  public:
   MathCmdProvider() : cmdsdk::SubCmd() {
@@ -38,12 +58,12 @@ class MathCmdProvider final : public cmdsdk::SubCmd {
         {"right", "number", true, "Must be numeric.", "Right operand."},
     };
     metadata.sub_cmd_types = {
-        {"MATH.ADD", "Add left and right."},
-        {"MATH.SUB", "Subtract right from left."},
-        {"MATH.MUL", "Multiply left and right."},
-        {"MATH.DIV", "Divide left by right."},
-        {"MATH.MOD", "Modulo of left by right."},
-        {"MATH.POW", "Raise left to the power of right."},
+      {"MATH.ADD", "Add left and right.", mathResultSchema("MATH.ADD", "addition")},
+      {"MATH.SUB", "Subtract right from left.", mathResultSchema("MATH.SUB", "subtraction")},
+      {"MATH.MUL", "Multiply left and right.", mathResultSchema("MATH.MUL", "multiplication")},
+      {"MATH.DIV", "Divide left by right.", mathResultSchema("MATH.DIV", "division", true)},
+      {"MATH.MOD", "Modulo of left by right.", mathResultSchema("MATH.MOD", "modulo", true)},
+      {"MATH.POW", "Raise left to the power of right.", mathResultSchema("MATH.POW", "power")},
     };
     return metadata;
   }
@@ -105,7 +125,7 @@ class MathCmdProvider final : public cmdsdk::SubCmd {
 
   bool executeAdd(double left, double right) {
     setResult({
-        {"subTypeExecuted", "add"},
+        {"subTypeExecuted", "MATH.ADD"},
         {"operation", "addition"},
         {"value", left + right},
     });
@@ -114,7 +134,7 @@ class MathCmdProvider final : public cmdsdk::SubCmd {
 
   bool executeSub(double left, double right) {
     setResult({
-        {"subTypeExecuted", "sub"},
+        {"subTypeExecuted", "MATH.SUB"},
         {"operation", "subtraction"},
         {"value", left - right},
     });
@@ -123,7 +143,7 @@ class MathCmdProvider final : public cmdsdk::SubCmd {
 
   bool executeMul(double left, double right) {
     setResult({
-        {"subTypeExecuted", "mul"},
+        {"subTypeExecuted", "MATH.MUL"},
         {"operation", "multiplication"},
         {"value", left * right},
     });
@@ -134,14 +154,14 @@ class MathCmdProvider final : public cmdsdk::SubCmd {
     if (right == 0) {
       // Note: In a real implementation, you might want to handle division by zero
       setResult({
-          {"subTypeExecuted", "div"},
+          {"subTypeExecuted", "MATH.DIV"},
           {"operation", "division"},
           {"value", nullptr},  // or some error indicator
       });
       return true;
     }
     setResult({
-        {"subTypeExecuted", "div"},
+        {"subTypeExecuted", "MATH.DIV"},
         {"operation", "division"},
         {"value", left / right},
     });
@@ -151,14 +171,14 @@ class MathCmdProvider final : public cmdsdk::SubCmd {
   bool executeMod(double left, double right) {
     if (right == 0) {
       setResult({
-          {"subTypeExecuted", "mod"},
+          {"subTypeExecuted", "MATH.MOD"},
           {"operation", "modulo"},
           {"value", nullptr},
       });
       return true;
     }
     setResult({
-        {"subTypeExecuted", "mod"},
+        {"subTypeExecuted", "MATH.MOD"},
         {"operation", "modulo"},
         {"value", std::fmod(left, right)},
     });
@@ -167,7 +187,7 @@ class MathCmdProvider final : public cmdsdk::SubCmd {
 
   bool executePow(double left, double right) {
     setResult({
-        {"subTypeExecuted", "pow"},
+        {"subTypeExecuted", "MATH.POW"},
         {"operation", "power"},
         {"value", std::pow(left, right)},
     });

@@ -85,7 +85,12 @@ Each command registration includes:
 - `cmd_name`
 - `description`
 - `parameters` (`name`, `type`, `required`, validation, description)
-- `sub_cmd_types` (`name`, description)
+- `sub_cmd_types` (`name`, description, `response_schema`)
+
+`response_schema` is a JSON Schema object describing the expected result payload
+for that specific `subType`. The server surfaces this in MCP `tools/list`
+metadata so an LLM can decide what subtype to call based on expected output
+shape before invocation.
 
 This metadata is what the server returns in MCP `tools/list` and allows invocation via `tools/call`.
 
@@ -283,8 +288,22 @@ extern "C" CMDSDK_API void RegisterCommands(cmdsdk::CommandRegistry& registry) {
     {"param", "string", true, "non-empty", "Operation parameter"}
   };
   md.sub_cmd_types = {
-    {"MYPLUGIN.TYPE_A", "Subtype A behavior"},
-    {"MYPLUGIN.TYPE_B", "Subtype B behavior"}
+    {"MYPLUGIN.TYPE_A", "Subtype A behavior", {
+      {"type", "object"},
+      {"required", {"subTypeExecuted", "value"}},
+      {"properties", {
+        {"subTypeExecuted", {{"type", "string"}, {"const", "MYPLUGIN.TYPE_A"}}},
+        {"value", {{"type", "number"}}}
+      }}
+    }},
+    {"MYPLUGIN.TYPE_B", "Subtype B behavior", {
+      {"type", "object"},
+      {"required", {"subTypeExecuted", "status"}},
+      {"properties", {
+        {"subTypeExecuted", {{"type", "string"}, {"const", "MYPLUGIN.TYPE_B"}}},
+        {"status", {{"type", "string"}}}
+      }}
+    }}
   };
 
   std::string error;

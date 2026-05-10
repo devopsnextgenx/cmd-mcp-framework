@@ -1,0 +1,9 @@
+{
+	"servers": {
+		"cmd-mcp-framework": {
+			"url": "http://localhost:5432/mcp",
+			"type": "http"
+		}
+	},
+	"inputs": []
+}

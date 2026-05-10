@@ -30,6 +30,23 @@
 namespace {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+static nlohmann::json geoResultSchema(const std::string& subtype_name) {
+  return {
+      {"type", "object"},
+      {"required", nlohmann::json::array({"subTypeExecuted", "operation", "shape", "formula", "value"})},
+      {"properties", {
+          {"subTypeExecuted", {{"type", "string"}, {"const", subtype_name}}},
+          {"operation", {{"type", "string"}}},
+          {"shape", {{"type", "string"}}},
+          {"formula", {{"type", "string"}}},
+          {"value", {{"type", "number"}}},
+          {"semiPerimeter", {{"type", "number"}}},
+          {"baseArea", {{"type", "number"}}},
+          {"lateralArea", {{"type", "number"}}}
+      }}
+  };
+}
+
 // Returns true when the named numeric field is present and positive.
 static bool requirePositive(const nlohmann::json& input,
                              const std::string& field,
@@ -96,22 +113,22 @@ class GeometryCmdProvider final : public cmdsdk::SubCmd {
         {"slant",    "number", false, "Must be numeric (>0).",                              "Slant height for a pyramid lateral face."},
     };
     metadata.sub_cmd_types = {
-        {"GEO.PERIMETER.TRIANGLE",  "Perimeter of a triangle. Params: a, b, c."},
-        {"GEO.PERIMETER.RECTANGLE", "Perimeter of a rectangle. Params: a (length), b (width)."},
-        {"GEO.PERIMETER.CIRCLE",    "Circumference of a circle. Params: radius."},
-        {"GEO.AREA.TRIANGLE",       "Area of a triangle via Heron's formula. Params: a, b, c."},
-        {"GEO.AREA.RECTANGLE",      "Area of a rectangle. Params: a (length), b (width)."},
-        {"GEO.AREA.CIRCLE",         "Area of a circle. Params: radius."},
-        {"GEO.AREA.PYRAMID",        "Total surface area of a square-base pyramid. Params: a, slant."},
-        {"GEO.AREA.TETRAHEDRON",    "Total surface area of a regular tetrahedron. Params: side."},
-        {"GEO.VOLUME.PYRAMID",      "Volume of a square-base pyramid. Params: a, height."},
-        {"GEO.VOLUME.TETRAHEDRON",  "Volume of a regular tetrahedron. Params: side."},
-        {"GEO.VOLUME.CUBE",         "Volume of a cube. Params: side."},
-        {"GEO.VOLUME.CUBOID",       "Volume of a cuboid. Params: a, b, height."},
-        {"GEO.VOLUME.PRISM",        "Volume of a right rectangular prism. Params: a, b, height."},
-        {"GEO.VOLUME.CYLINDER",     "Volume of a cylinder. Params: radius, height."},
-        {"GEO.VOLUME.CONE",         "Volume of a cone. Params: radius, height."},
-        {"GEO.VOLUME.SPHERE",       "Volume of a sphere. Params: radius."},
+      {"GEO.PERIMETER.TRIANGLE",  "Perimeter of a triangle. Params: a, b, c.", geoResultSchema("GEO.PERIMETER.TRIANGLE")},
+      {"GEO.PERIMETER.RECTANGLE", "Perimeter of a rectangle. Params: a (length), b (width).", geoResultSchema("GEO.PERIMETER.RECTANGLE")},
+      {"GEO.PERIMETER.CIRCLE",    "Circumference of a circle. Params: radius.", geoResultSchema("GEO.PERIMETER.CIRCLE")},
+      {"GEO.AREA.TRIANGLE",       "Area of a triangle via Heron's formula. Params: a, b, c.", geoResultSchema("GEO.AREA.TRIANGLE")},
+      {"GEO.AREA.RECTANGLE",      "Area of a rectangle. Params: a (length), b (width).", geoResultSchema("GEO.AREA.RECTANGLE")},
+      {"GEO.AREA.CIRCLE",         "Area of a circle. Params: radius.", geoResultSchema("GEO.AREA.CIRCLE")},
+      {"GEO.AREA.PYRAMID",        "Total surface area of a square-base pyramid. Params: a, slant.", geoResultSchema("GEO.AREA.PYRAMID")},
+      {"GEO.AREA.TETRAHEDRON",    "Total surface area of a regular tetrahedron. Params: side.", geoResultSchema("GEO.AREA.TETRAHEDRON")},
+      {"GEO.VOLUME.PYRAMID",      "Volume of a square-base pyramid. Params: a, height.", geoResultSchema("GEO.VOLUME.PYRAMID")},
+      {"GEO.VOLUME.TETRAHEDRON",  "Volume of a regular tetrahedron. Params: side.", geoResultSchema("GEO.VOLUME.TETRAHEDRON")},
+      {"GEO.VOLUME.CUBE",         "Volume of a cube. Params: side.", geoResultSchema("GEO.VOLUME.CUBE")},
+      {"GEO.VOLUME.CUBOID",       "Volume of a cuboid. Params: a, b, height.", geoResultSchema("GEO.VOLUME.CUBOID")},
+      {"GEO.VOLUME.PRISM",        "Volume of a right rectangular prism. Params: a, b, height.", geoResultSchema("GEO.VOLUME.PRISM")},
+      {"GEO.VOLUME.CYLINDER",     "Volume of a cylinder. Params: radius, height.", geoResultSchema("GEO.VOLUME.CYLINDER")},
+      {"GEO.VOLUME.CONE",         "Volume of a cone. Params: radius, height.", geoResultSchema("GEO.VOLUME.CONE")},
+      {"GEO.VOLUME.SPHERE",       "Volume of a sphere. Params: radius.", geoResultSchema("GEO.VOLUME.SPHERE")},
     };
     return metadata;
   }
