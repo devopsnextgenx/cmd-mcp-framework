@@ -452,8 +452,14 @@ nlohmann::json handleMcpRequest(const nlohmann::json& request,
     if (!command->execute(args, error))
       return makeJsonRpcError(id, -32001, "Execution failed: " + error);
 
+    const auto raw_result = command->getResult();
+    const auto structured_result = raw_result.is_object()
+                       ? raw_result
+                       : nlohmann::json{{"result", raw_result}};
+
     return makeJsonRpcResult(id, {
-        {"content", {{{"type", "text"}, {"text", command->getResult().dump()}}}}
+      {"content", {{{"type", "text"}, {"text", raw_result.dump()}}}},
+      {"structuredContent", structured_result}
     });
   }
 
