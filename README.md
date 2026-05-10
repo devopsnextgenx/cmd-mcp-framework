@@ -63,11 +63,20 @@ Defined in `projects/cmd_sdk/include/cmdsdk/SubCmd.hpp`.
 `SubCmd` supports:
 - registering subtype labels via `registerSubCmdType(...)`
 - resolving subtype strings via `resolveSubCmdType(...)`
+- validation of subtype format: `<PluginName>.<SubCmdType>` with max length 128
+- duplicate detection and warning logging
 
 Typical pattern:
-1. register subtype docs in constructor
-2. parse `"subType"` in `execute`
-3. dispatch with `switch` to `executeSubTypeA/B/C`
+1. Set plugin name in constructor using `setPluginName("PLUGIN_NAME")`
+2. Register subtypes with format "PLUGIN_NAME.SUBTYPE" in constructor
+3. Parse `"subType"` in `execute` (input should be "PLUGIN_NAME.SUBTYPE")
+4. Dispatch with `if-else` chain to `executeSubTypeA/B/C`
+
+Plugin naming constraints:
+- Plugin name must be consistent across all subtypes for a plugin
+- Subtype format: `<PluginName>.<PreferredSubCmdType>`
+- Max length: 128 characters
+- Duplicates or conflicts logged as warnings during initialization
 
 ### 4) Command metadata for docs/resources
 Defined in `projects/cmd_sdk/include/cmdsdk/CommandMetadata.hpp`.
@@ -170,7 +179,7 @@ curl -s -X POST http://127.0.0.1:5432/mcp \
     "params":{
       "name":"math.calculate",
       "arguments":{
-        "subType":"mul",
+        "subType":"MATH.MUL",
         "left":6,
         "right":7
       }
@@ -219,12 +228,19 @@ Use this when you do not need internal subtype dispatch.
 Use this when one command exposes multiple internal business actions (`SubCmdType`).
 
 1. Derive from `cmdsdk::SubCmd`
-2. In constructor, call `registerSubCmdType(...)` for each subtype
-3. In `execute(...)`, resolve `subType` and dispatch with `switch`
-4. Keep subtype-specific business logic in helpers like:
+2. In constructor, set plugin name with `setPluginName("YOUR_PLUGIN_NAME")`
+3. Register subtypes with `registerSubCmdType("YOUR_PLUGIN_NAME.SUBTYPE", ...)` for each subtype
+4. In `execute(...)`, resolve `subType` and dispatch with `if-else` chain
+5. Keep subtype-specific business logic in helpers like:
    - `executeSubTypeA(...)`
    - `executeSubTypeB(...)`
    - `executeSubTypeC(...)`
+
+Subtype naming constraints:
+- Must follow format: `<PluginName>.<SubCmdType>`
+- PluginName must be consistent for all subtypes in the plugin
+- Max length: 128 characters
+- Input `subType` parameter should use the full "PLUGIN_NAME.SUBTYPE" format
 
 This pattern is demonstrated by:
 - `projects/plugins/math_cmd_provider/src/MathCmdProvider.cpp`
@@ -236,25 +252,44 @@ Inside plugin `RegisterCommands(...)`, provide `CommandMetadata` with:
 - parameter definitions + validation semantics
 - subtype documentation (if applicable)
 
-Example registration pattern:
+Example registration pattern for SubCmd:
 
 ```cpp
+class MySubCmdProvider : public cmdsdk::SubCmd {
+ public:
+  MySubCmdProvider() {
+    setPluginName("MYPLUGIN");
+    registerSubCmdType("MYPLUGIN.TYPE_A", {"MYPLUGIN.TYPE_A", "Subtype A behavior"});
+    registerSubCmdType("MYPLUGIN.TYPE_B", {"MYPLUGIN.TYPE_B", "Subtype B behavior"});
+  }
+
+  bool execute(const nlohmann::json& input, std::string& error) override {
+    const auto sub_type = resolveSubCmdType(input.at("subType").get<std::string>());
+    if (sub_type == "MYPLUGIN.TYPE_A") {
+      // execute type A logic
+    } else if (sub_type == "MYPLUGIN.TYPE_B") {
+      // execute type B logic
+    }
+    return true;
+  }
+};
+
 extern "C" CMDSDK_API void RegisterCommands(cmdsdk::CommandRegistry& registry) {
   cmdsdk::CommandMetadata md;
   md.cmd_name = "my.command";
   md.description = "Does business operation X";
   md.parameters = {
-    {"tenantId", "string", true, "non-empty", "Tenant identifier"},
-    {"dryRun", "boolean", false, "default=false", "Preview without applying changes"}
+    {"subType", "string", true, "Allowed values: MYPLUGIN.TYPE_A, MYPLUGIN.TYPE_B", "Selects operation type"},
+    {"param", "string", true, "non-empty", "Operation parameter"}
   };
   md.sub_cmd_types = {
-    {"type_a", "Subtype A behavior"},
-    {"type_b", "Subtype B behavior"}
+    {"MYPLUGIN.TYPE_A", "Subtype A behavior"},
+    {"MYPLUGIN.TYPE_B", "Subtype B behavior"}
   };
 
   std::string error;
   registry.registerCommand(md, []() -> std::unique_ptr<cmdsdk::ICmd> {
-    return std::make_unique<MyCommand>();
+    return std::make_unique<MySubCmdProvider>();
   }, error);
 }
 ```
@@ -291,14 +326,14 @@ After loading succeeds, verify:
 ## Current sample command
 The sample plugin currently publishes:
 - `math.calculate`
-  - `subType`: `add | sub | mul | div | mod | pow`
+  - `subType`: `MATH.ADD | MATH.SUB | MATH.MUL | MATH.DIV | MATH.MOD | MATH.POW`
   - `left`, `right`: numeric operands
   - subtype behaviors:
-    - `add` -> addition
-    - `sub` -> subtraction
-    - `mul` -> multiplication
-    - `div` -> division
-    - `mod` -> modulo
-    - `pow` -> power
+    - `MATH.ADD` -> addition
+    - `MATH.SUB` -> subtraction
+    - `MATH.MUL` -> multiplication
+    - `MATH.DIV` -> division
+    - `MATH.MOD` -> modulo
+    - `MATH.POW` -> power
 
-Use this as a template for your own domain-specific commands.
+Use this as a template for your own domain-specific commands. Plugin developers should define a consistent plugin name (e.g., "MATH") and use the format `<PluginName>.<SubCmdType>` for all subtypes.

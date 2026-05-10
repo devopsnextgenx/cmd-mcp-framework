@@ -17,18 +17,18 @@ cmdsdk::CommandMetadata buildMathMetadata() {
   metadata.description =
       "Math command provider extending abstract Cmd. Demonstrates subtype registration with switch-case execution.";
   metadata.parameters = {
-      {"subType", "string", true, "Allowed values: add, sub, mul, div, mod, pow.",
+      {"subType", "string", true, "Allowed values: MATH.ADD, MATH.SUB, MATH.MUL, MATH.DIV, MATH.MOD, MATH.POW.",
        "Selects which mathematical operation to perform."},
       {"left", "number", true, "Must be numeric.", "Left operand."},
       {"right", "number", true, "Must be numeric.", "Right operand."},
   };
   metadata.sub_cmd_types = {
-      {"add", "Add left and right."},
-      {"sub", "Subtract right from left."},
-      {"mul", "Multiply left and right."},
-      {"div", "Divide left by right."},
-      {"mod", "Modulo of left by right."},
-      {"pow", "Raise left to the power of right."},
+      {"MATH.ADD", "Add left and right."},
+      {"MATH.SUB", "Subtract right from left."},
+      {"MATH.MUL", "Multiply left and right."},
+      {"MATH.DIV", "Divide left by right."},
+      {"MATH.MOD", "Modulo of left by right."},
+      {"MATH.POW", "Raise left to the power of right."},
   };
   return metadata;
 }
@@ -36,12 +36,13 @@ cmdsdk::CommandMetadata buildMathMetadata() {
 class MathCmdProvider final : public cmdsdk::SubCmd {
  public:
   MathCmdProvider() : cmdsdk::SubCmd() {
-    registerSubCmdType(cmdsdk::SubCmdType::TypeA, {"add", "Add left and right."});
-    registerSubCmdType(cmdsdk::SubCmdType::TypeB, {"sub", "Subtract right from left."});
-    registerSubCmdType(cmdsdk::SubCmdType::TypeC, {"mul", "Multiply left and right."});
-    registerSubCmdType(cmdsdk::SubCmdType::TypeD, {"div", "Divide left by right."});
-    registerSubCmdType(cmdsdk::SubCmdType::TypeE, {"mod", "Modulo of left by right."});
-    registerSubCmdType(cmdsdk::SubCmdType::TypeF, {"pow", "Raise left to the power of right."});
+    setPluginName("MATH");
+    registerSubCmdType("MATH.ADD", {"MATH.ADD", "Add left and right."});
+    registerSubCmdType("MATH.SUB", {"MATH.SUB", "Subtract right from left."});
+    registerSubCmdType("MATH.MUL", {"MATH.MUL", "Multiply left and right."});
+    registerSubCmdType("MATH.DIV", {"MATH.DIV", "Divide left by right."});
+    registerSubCmdType("MATH.MOD", {"MATH.MOD", "Modulo of left by right."});
+    registerSubCmdType("MATH.POW", {"MATH.POW", "Raise left to the power of right."});
   }
 
   bool validate(const nlohmann::json& input, std::string& error) override {
@@ -66,8 +67,8 @@ class MathCmdProvider final : public cmdsdk::SubCmd {
     }
 
     const auto sub_type = resolveSubCmdType(input.at("subType").get<std::string>());
-    if (sub_type == cmdsdk::SubCmdType::Unknown) {
-      error = "subType must be one of: add, sub, mul, div, mod, pow.";
+    if (sub_type == cmdsdk::UNKNOWN_SUBCMD_TYPE) {
+      error = "subType must be one of: MATH.ADD, MATH.SUB, MATH.MUL, MATH.DIV, MATH.MOD, MATH.POW.";
       return false;
     }
 
@@ -79,22 +80,21 @@ class MathCmdProvider final : public cmdsdk::SubCmd {
     const double left = input.at("left").get<double>();
     const double right = input.at("right").get<double>();
 
-    switch (sub_type) {
-      case cmdsdk::SubCmdType::TypeA:
-        return executeAdd(left, right);
-      case cmdsdk::SubCmdType::TypeB:
-        return executeSub(left, right);
-      case cmdsdk::SubCmdType::TypeC:
-        return executeMul(left, right);
-      case cmdsdk::SubCmdType::TypeD:
-        return executeDiv(left, right);
-      case cmdsdk::SubCmdType::TypeE:
-        return executeMod(left, right);
-      case cmdsdk::SubCmdType::TypeF:
-        return executePow(left, right);
-      default:
-        error = "Unsupported subtype requested.";
-        return false;
+    if (sub_type == "MATH.ADD") {
+      return executeAdd(left, right);
+    } else if (sub_type == "MATH.SUB") {
+      return executeSub(left, right);
+    } else if (sub_type == "MATH.MUL") {
+      return executeMul(left, right);
+    } else if (sub_type == "MATH.DIV") {
+      return executeDiv(left, right);
+    } else if (sub_type == "MATH.MOD") {
+      return executeMod(left, right);
+    } else if (sub_type == "MATH.POW") {
+      return executePow(left, right);
+    } else {
+      error = "Unsupported subtype requested.";
+      return false;
     }
   }
 

@@ -9,20 +9,25 @@
 
 namespace cmdsdk {
 
-enum class SubCmdType { TypeA, TypeB, TypeC, TypeD, TypeE, TypeF, Unknown };
+using SubCmdType = std::string;
+
+const std::string UNKNOWN_SUBCMD_TYPE = "";
+const size_t MAX_SUBCMD_TYPE_LENGTH = 128;
 
 class SubCmd : public Cmd {
  public:
   SubCmd();
   ~SubCmd() override = default;
 
-  void registerSubCmdType(SubCmdType type, SubCmdTypeMetadata metadata);
+  void registerSubCmdType(const SubCmdType& type, SubCmdTypeMetadata metadata);
 
  protected:
+  void setPluginName(const std::string& name);
   SubCmdType resolveSubCmdType(const std::string& subtype_name) const;
   const std::vector<std::pair<SubCmdType, SubCmdTypeMetadata>>& registeredSubCmdTypes() const;
 
  private:
+  std::string plugin_name_;
   std::vector<std::pair<SubCmdType, SubCmdTypeMetadata>> sub_cmd_types_;
 };
 
