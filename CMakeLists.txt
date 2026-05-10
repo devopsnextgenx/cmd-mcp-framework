@@ -29,3 +29,18 @@ FetchContent_MakeAvailable(cpp_httplib)
 add_subdirectory(projects/cmd_sdk)
 add_subdirectory(projects/plugins/math_cmd_provider)
 add_subdirectory(projects/fastmcp_server)
+
+find_program(NPM_EXECUTABLE npm)
+
+if(NPM_EXECUTABLE)
+    add_custom_command(
+        OUTPUT "${CMAKE_SOURCE_DIR}/mcp-apps/dashboard-ui/dist/index.html"
+        COMMAND ${NPM_EXECUTABLE} install
+        COMMAND ${NPM_EXECUTABLE} run build
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/mcp-apps/dashboard-ui"
+        COMMENT "Building React MCP App..."
+    )
+    add_custom_target(build_ui ALL DEPENDS "${CMAKE_SOURCE_DIR}/mcp-apps/dashboard-ui/dist/index.html")
+    # Ensure the server builds after the UI is ready
+    add_dependencies(fastmcp_server build_ui)
+endif()
