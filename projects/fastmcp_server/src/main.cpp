@@ -5,6 +5,8 @@
 #include <sstream>
 #include <set>
 #include <map>
+#include <algorithm>
+#include <cctype>
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -169,6 +171,13 @@ nlohmann::json makeJsonRpcError(const nlohmann::json& id, int code, const std::s
 // ---------------------------------------------------------------------------
 using PluginInfo = std::map<std::string, std::string>;  // subtype_name -> description
 
+std::string toUpperAscii(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+    return static_cast<char>(std::toupper(ch));
+  });
+  return value;
+}
+
 std::string resolvePluginName(const cmdsdk::CommandMetadata& metadata) {
   // Prefer the explicit plugin_name field populated by setPluginName().
   if (!metadata.plugin_name.empty()) {
@@ -265,6 +274,26 @@ std::string buildPluginsMarkdown(const std::map<std::string, PluginInfo>& plugin
     doc += "\n";
   }
   return doc;
+}
+
+const PluginInfo* findPluginInfo(const std::map<std::string, PluginInfo>& plugins,
+                                 const std::string& requested_name,
+                                 std::string& resolved_name) {
+  const auto exact = plugins.find(requested_name);
+  if (exact != plugins.end()) {
+    resolved_name = exact->first;
+    return &exact->second;
+  }
+
+  const auto requested_upper = toUpperAscii(requested_name);
+  for (const auto& [plugin_name, plugin_info] : plugins) {
+    if (toUpperAscii(plugin_name) == requested_upper) {
+      resolved_name = plugin_name;
+      return &plugin_info;
+    }
+  }
+
+  return nullptr;
 }
 
 std::string buildPluginDetailsMarkdown(const std::string& plugin_name,
@@ -393,13 +422,14 @@ nlohmann::json handleMcpRequest(const nlohmann::json& request,
 
     if (uri.starts_with("plugin://")) {
       const std::string plugin_name = uri.substr(9);
-      auto it = plugins.find(plugin_name);
-      if (it != plugins.end()) {
+      std::string resolved_name;
+      const auto* plugin_info = findPluginInfo(plugins, plugin_name, resolved_name);
+      if (plugin_info != nullptr) {
         return makeJsonRpcResult(id, {
             {"contents", {{
                 {"uri",      uri},
                 {"mimeType", "text/markdown"},
-                {"text",     buildPluginDetailsMarkdown(plugin_name, it->second)}
+                {"text",     buildPluginDetailsMarkdown(resolved_name, *plugin_info)}
             }}}
         });
       }
@@ -457,7 +487,7 @@ std::vector<std::filesystem::path> getAllPluginsInLib(const char* argv0) {
 #endif
   };
 
-  std::set<std::filesystem::path> seen;
+  std::set<std::string> seen_filenames;
   std::vector<std::filesystem::path> plugins;
 
   for (const auto& dir : candidate_directories) {
@@ -465,6 +495,7 @@ std::vector<std::filesystem::path> getAllPluginsInLib(const char* argv0) {
       continue;
     }
 
+    std::vector<std::filesystem::path> directory_entries;
     for (const auto& entry : std::filesystem::directory_iterator(dir)) {
       if (!entry.is_regular_file()) continue;
 
@@ -477,12 +508,30 @@ std::vector<std::filesystem::path> getAllPluginsInLib(const char* argv0) {
         continue;
       }
 
-      const auto absolute_path = std::filesystem::absolute(path);
-      if (!seen.insert(absolute_path).second) {
+      directory_entries.push_back(std::filesystem::absolute(path));
+    }
+
+    std::sort(directory_entries.begin(), directory_entries.end(),
+              [](const std::filesystem::path& lhs, const std::filesystem::path& rhs) {
+                const auto lhs_name = lhs.filename().string();
+                const auto rhs_name = rhs.filename().string();
+                if (lhs_name != rhs_name) {
+                  return lhs_name < rhs_name;
+                }
+                return lhs.string() < rhs.string();
+              });
+
+    for (const auto& path : directory_entries) {
+      std::string filename = path.filename().string();
+#if defined(_WIN32)
+      filename = toUpperAscii(filename);
+#endif
+      if (!seen_filenames.insert(filename).second) {
+        std::cout << "Skipping duplicate plugin library: " << path.filename().string() << '\n';
         continue;
       }
 
-      plugins.push_back(absolute_path);
+      plugins.push_back(path);
     }
   }
 
