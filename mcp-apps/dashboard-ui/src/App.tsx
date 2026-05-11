@@ -148,7 +148,6 @@ function App() {
       transport.close().catch(() => undefined);
     };
   }, [client]);
-
   const invokeServerMath = async (a: number, b: number): Promise<number> => {
     try {
       const result = await client.callTool({
@@ -160,13 +159,12 @@ function App() {
         throw new Error(JSON.stringify(result.content));
       }
 
-      const output = (result as any).content;
-      if (typeof output === 'number') {
-        return output;
-      }
+      // Handle MCP-style structured output or direct result
+      const output = (result as any).structuredContent || (result as any).content;
+      
       if (output && typeof output === 'object') {
-        if (typeof output.result === 'number') return output.result;
         if (typeof output.value === 'number') return output.value;
+        if (typeof output.result === 'number') return output.result;
       }
     } catch {
       // Fall back to direct HTTP JSON-RPC if the managed transport fails.
@@ -189,27 +187,28 @@ function App() {
       throw new Error(JSON.stringify(body.error ?? body));
     }
 
-    // Check for structuredContent (MCP tool result with typed output)
-    const structured = body.result?.structuredContent;
-    if (structured && typeof structured === 'object' && typeof structured.value === 'number') {
-      return structured.value;
+    const resultData = body.result;
+
+    // 1. Primary: Check structuredContent (matches your provided log)
+    if (resultData?.structuredContent && typeof resultData.structuredContent.value === 'number') {
+      return resultData.structuredContent.value;
     }
 
-    // Fallback to content array if available
-    const payload = body.result?.content;
-    if (Array.isArray(payload) && payload.length > 0) {
-      const firstContent = payload[0];
-      if (typeof firstContent === 'object' && typeof firstContent.text === 'string') {
+    // 2. Secondary: Parse the stringified JSON inside the content array
+    const contentArray = resultData?.content;
+    if (Array.isArray(contentArray) && contentArray.length > 0) {
+      const firstItem = contentArray[0];
+      if (firstItem && typeof firstItem.text === 'string') {
         try {
-          const parsed = JSON.parse(firstContent.text);
+          const parsed = JSON.parse(firstItem.text);
           if (typeof parsed.value === 'number') return parsed.value;
-        } catch {
-          // Continue to error
+        } catch (e) {
+          // Parsing failed, move to final error
         }
       }
     }
 
-    throw new Error('Unexpected server response');
+    throw new Error('Unexpected server response format: Missing numeric value');
   };
 
   const pushDashboardState = async (nextState: DashboardState) => {
