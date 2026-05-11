@@ -428,6 +428,7 @@ nlohmann::json handleMcpRequest(const nlohmann::json& request,
 
   // ── tools/call ────────────────────────────────────────────────────────────
   if (method == "tools/call") {
+    std::cout << "Received tools/call request: " << request.dump() << std::endl;
     if (!request.contains("params") || !request.at("params").is_object())
       return makeJsonRpcError(id, -32602, "Invalid params: params must be an object.");
 
@@ -466,6 +467,8 @@ nlohmann::json handleMcpRequest(const nlohmann::json& request,
       structured_result["subTypeExecuted"] = subtype_executed;
     }
 
+    std::cout << "Command execution successful. Raw result: " << raw_result.dump() << std::endl;
+    
     return makeJsonRpcResult(id, {
       {"content", {{{"type", "text"}, {"text", raw_result.dump()}}}},
       {"structuredContent", structured_result}

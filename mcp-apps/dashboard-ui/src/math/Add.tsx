@@ -1,61 +1,38 @@
-import { useState } from 'react'
+import { useState } from 'react';
 
-const Add = () => {
-  const [firstValue, setFirstValue] = useState('')
-  const [secondValue, setSecondValue] = useState('')
-  const [result, setResult] = useState<number | null>(null)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+type AddProps = {
+  invokeMath: (a: number, b: number) => Promise<number>;
+};
 
-  const invokeAddTool = async (a: number, b: number) => {
-    try {
-      const response = await fetch('/api/tools/math/add', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ a, b }),
-      })
-
-      if (!response.ok) {
-        throw new Error(`Tool call failed: ${response.status} ${response.statusText}`)
-      }
-
-      const data = await response.json()
-      if (typeof data.result === 'number') {
-        return data.result
-      }
-      if (typeof data.value === 'number') {
-        return data.value
-      }
-
-      throw new Error('Invalid tool response format')
-    } catch {
-      // Fallback to a local sum when no real tool endpoint is available.
-      return a + b
-    }
-  }
+const Add = ({ invokeMath }: AddProps) => {
+  const [firstValue, setFirstValue] = useState('');
+  const [secondValue, setSecondValue] = useState('');
+  const [result, setResult] = useState<number | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const handleAdd = async () => {
-    setError(null)
-    setResult(null)
+    setError(null);
+    setResult(null);
 
-    const a = parseInt(firstValue, 10)
-    const b = parseInt(secondValue, 10)
+    const a = parseInt(firstValue, 10);
+    const b = parseInt(secondValue, 10);
 
     if (Number.isNaN(a) || Number.isNaN(b)) {
-      setError('Please enter two valid integers.')
-      return
+      setError('Please enter two valid integers.');
+      return;
     }
 
-    setLoading(true)
+    setLoading(true);
     try {
-      const sum = await invokeAddTool(a, b)
-      setResult(sum)
+      const sum = await invokeMath(a, b);
+      setResult(sum);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unexpected error')
+      setError(err instanceof Error ? err.message : 'Unexpected error');
     } finally {
-      setLoading(false)
+      setLoading(false);
     }
-  }
+  };
 
   return (
     <div style={{ marginTop: '2rem', textAlign: 'left' }}>
@@ -138,7 +115,7 @@ const Add = () => {
         )}
       </div>
     </div>
-  )
-}
+  );
+};
 
 export default Add;

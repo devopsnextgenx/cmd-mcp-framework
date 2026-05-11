@@ -35,13 +35,15 @@ The server publishes command metadata (name, description, parameters, validation
 - `CMakeLists.txt`
   - top-level super-build and dependency fetch (`nlohmann/json`, `cpp-httplib`)
 - `projects/cmd_sdk/`
-  - SDK shared library with command abstractions and registry
+  - c/c++ SDK shared library with command abstractions and registry
   - headers under `projects/cmd_sdk/include/cmdsdk/`
 - `projects/plugins/math_cmd_provider/`
-  - sample plugin shared library with one `SubCmd` implementation (`math.calculate`)
+  - c/c++ sample plugin shared library with one `SubCmd` implementation (`math.calculate`)
 - `projects/fastmcp_server/`
-  - server executable that loads plugins and exposes endpoints
-
+  - c/c++ server executable that loads plugins and exposes endpoints on port `5432`
+- `mcp-apps/dashboard-ui`
+  - React based `@modelcontextprotocol/ext-apps` components for exposing apps as resources on port `6543` in mcp-server running using `fastmcp_server`
+  
 ## Core abstractions
 
 ### 1) `ICmd` interface
