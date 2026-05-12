@@ -57,13 +57,27 @@ struct ServerConfig {
   ProtocolMode protocol_mode = ProtocolMode::ALL;
 };
 
+bool beginsWith(const std::string& value, const std::string& prefix) {
+  if (value.size() < prefix.size()) {
+    return false;
+  }
+  return value.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool endsWith(const std::string& value, const std::string& suffix) {
+  if (value.size() < suffix.size()) {
+    return false;
+  }
+  return value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 ServerConfig parseArguments(int argc, char** argv) {
   ServerConfig config;
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
-    if (arg.starts_with("--port=")) {
+    if (beginsWith(arg, "--port=")) {
       config.port = std::stoi(arg.substr(7));
-    } else if (arg.starts_with("--plugins=")) {
+    } else if (beginsWith(arg, "--plugins=")) {
       std::string plugins_str = arg.substr(10);
       std::stringstream ss(plugins_str);
       std::string plugin;
@@ -72,7 +86,7 @@ ServerConfig parseArguments(int argc, char** argv) {
           config.plugin_paths.emplace_back(plugin);
         }
       }
-    } else if (arg.starts_with("--protocol=")) {
+    } else if (beginsWith(arg, "--protocol=")) {
       std::string mode_str = arg.substr(11);
       if (mode_str == "mcp") {
         config.protocol_mode = ProtocolMode::MCP_ONLY;
@@ -389,6 +403,161 @@ std::string buildPluginDetailsMarkdown(const std::string& plugin_name,
   return doc;
 }
 
+struct ExternalResourceInfo {
+  std::string uri;
+  std::string name;
+  std::string description;
+  std::string mime_type;
+};
+
+constexpr const char* kMcpAppsHost = "localhost";
+constexpr int kMcpAppsPort = 6543;
+constexpr const char* kMcpAppsManifestPath = "/resource-manifest.json";
+
+std::string contentTypeFromResponse(const httplib::Result& result,
+                                    const std::string& fallback) {
+  if (!result || !result->has_header("Content-Type")) {
+    return fallback;
+  }
+
+  std::string value = result->get_header_value("Content-Type");
+  const auto separator = value.find(';');
+  if (separator != std::string::npos) {
+    value = value.substr(0, separator);
+  }
+  if (value.empty()) {
+    return fallback;
+  }
+  return value;
+}
+
+bool uriToMcpAppsPath(const std::string& uri, std::string& path) {
+  if (uri.empty()) {
+    return false;
+  }
+
+  if (uri == "app://dashboard-ui") {
+    path = "/";
+    return true;
+  }
+
+  if (beginsWith(uri, "app://")) {
+    const std::string app_path = uri.substr(6);
+    if (app_path.empty()) {
+      path = "/";
+      return true;
+    }
+    path = (!app_path.empty() && app_path[0] == '/') ? app_path : "/" + app_path;
+    return true;
+  }
+
+  const std::string http_prefix = "http://localhost:6543";
+  if (beginsWith(uri, http_prefix)) {
+    const std::string suffix = uri.substr(http_prefix.size());
+    path = suffix.empty() ? "/" : suffix;
+    return true;
+  }
+
+  if (!uri.empty() && uri[0] == '/') {
+    path = uri;
+    return true;
+  }
+
+  return false;
+}
+
+std::string toMcpAppUri(const std::string& uri) {
+  std::string path;
+  if (!uriToMcpAppsPath(uri, path)) {
+    return uri;
+  }
+  if (path == "/") {
+    return "app://dashboard-ui";
+  }
+  return "app://" + path.substr(1);
+}
+
+std::vector<ExternalResourceInfo> fetchExternalAppResources() {
+  std::vector<ExternalResourceInfo> resources;
+  httplib::Client client(kMcpAppsHost, kMcpAppsPort);
+  client.set_connection_timeout(2, 0);
+  client.set_read_timeout(2, 0);
+
+  const auto result = client.Get(kMcpAppsManifestPath);
+  if (!result || result->status != 200) {
+    return resources;
+  }
+
+  try {
+    const auto manifest = nlohmann::json::parse(result->body);
+    if (!manifest.is_object() || !manifest.contains("resources") ||
+        !manifest.at("resources").is_array()) {
+      return resources;
+    }
+
+    for (const auto& entry : manifest.at("resources")) {
+      if (!entry.is_object() || !entry.contains("uri") || !entry.at("uri").is_string()) {
+        continue;
+      }
+
+      const std::string remote_uri = entry.at("uri").get<std::string>();
+      std::string app_path;
+      if (!uriToMcpAppsPath(remote_uri, app_path)) {
+        continue;
+      }
+
+      ExternalResourceInfo info;
+      info.uri = toMcpAppUri(remote_uri);
+      info.name = entry.contains("name") && entry.at("name").is_string()
+                      ? entry.at("name").get<std::string>()
+                      : ("App Resource: " + app_path);
+      info.description =
+          entry.contains("description") && entry.at("description").is_string()
+              ? entry.at("description").get<std::string>()
+              : "Resource exposed from local mcp-apps instance";
+      info.mime_type = entry.contains("mimeType") && entry.at("mimeType").is_string()
+                           ? entry.at("mimeType").get<std::string>()
+                           : "application/json";
+
+      resources.push_back(std::move(info));
+    }
+  } catch (const std::exception&) {
+    return {};
+  }
+
+  return resources;
+}
+
+bool readMcpAppResource(const std::string& uri,
+                        std::string& canonical_uri,
+                        std::string& mime_type,
+                        std::string& content,
+                        std::string& error) {
+  std::string app_path;
+  if (!uriToMcpAppsPath(uri, app_path)) {
+    return false;
+  }
+
+  httplib::Client client(kMcpAppsHost, kMcpAppsPort);
+  client.set_connection_timeout(2, 0);
+  client.set_read_timeout(5, 0);
+
+  const auto result = client.Get(app_path.c_str());
+  if (!result) {
+    error = "Unable to connect to mcp-apps at http://localhost:6543";
+    return false;
+  }
+  if (result->status < 200 || result->status >= 300) {
+    error = "mcp-apps returned HTTP " + std::to_string(result->status) + " for " + app_path;
+    return false;
+  }
+
+  canonical_uri = toMcpAppUri(uri);
+  mime_type = contentTypeFromResponse(result, "text/plain");
+  content = result->body;
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // MCP request dispatcher
 // ---------------------------------------------------------------------------
@@ -497,6 +666,22 @@ nlohmann::json handleMcpRequest(const nlohmann::json& request,
       });
     }
 
+    resources.push_back({
+        {"uri",         "app://dashboard-ui"},
+        {"name",        "Dashboard UI"},
+        {"description", "Dashboard UI shell proxied from mcp-apps"},
+        {"mimeType",    "text/html"}
+    });
+
+    for (const auto& app_resource : fetchExternalAppResources()) {
+      resources.push_back({
+          {"uri",         app_resource.uri},
+          {"name",        app_resource.name},
+          {"description", app_resource.description},
+          {"mimeType",    app_resource.mime_type}
+      });
+    }
+
     return makeJsonRpcResult(id, {{"resources", resources}});
   }
 
@@ -512,6 +697,27 @@ nlohmann::json handleMcpRequest(const nlohmann::json& request,
     const std::string uri = params.at("uri").get<std::string>();
     auto plugins = buildPluginRegistry(registry);
 
+    {
+      std::string canonical_uri;
+      std::string mime_type;
+      std::string body;
+      std::string read_error;
+      if (readMcpAppResource(uri, canonical_uri, mime_type, body, read_error)) {
+        return makeJsonRpcResult(id, {
+            {"contents", {{
+                {"uri",      canonical_uri},
+                {"mimeType", mime_type},
+                {"text",     body}
+            }}}
+        });
+      }
+
+      if (beginsWith(uri, "app://") || beginsWith(uri, "http://localhost:6543") ||
+          (!uri.empty() && uri[0] == '/')) {
+        return makeJsonRpcError(id, -32001, read_error.empty() ? "App resource not found" : read_error);
+      }
+    }
+
     if (uri == "plugins://overview") {
       return makeJsonRpcResult(id, {
           {"contents", {{
@@ -523,7 +729,7 @@ nlohmann::json handleMcpRequest(const nlohmann::json& request,
     }
 
     std::string requested_resource = uri;
-    if (uri.starts_with("plugin://")) {
+    if (beginsWith(uri, "plugin://")) {
       requested_resource = uri.substr(9);
     }
 
@@ -588,9 +794,9 @@ std::vector<std::filesystem::path> getAllPluginsInLib(const char* argv0) {
 #if defined(_WIN32)
     return path.extension() == ".dll";
 #elif defined(__APPLE__)
-    return filename.starts_with("lib") && path.extension() == ".dylib";
+  return beginsWith(filename, "lib") && path.extension() == ".dylib";
 #else
-    return filename.starts_with("lib") && path.extension() == ".so";
+  return beginsWith(filename, "lib") && path.extension() == ".so";
 #endif
   };
 
@@ -1267,6 +1473,38 @@ int main(int argc, char** argv) {
                          "text/html");
   });
 
+  // GET /mcp-apps and /mcp-apps/{path} — Proxy local app UI/resources via this server
+  auto proxy_mcp_app = [&](const std::string& app_path, httplib::Response& response) {
+    httplib::Client client(kMcpAppsHost, kMcpAppsPort);
+    client.set_connection_timeout(2, 0);
+    client.set_read_timeout(5, 0);
+
+    const auto result = client.Get(app_path.c_str());
+    if (!result) {
+      response.status = 502;
+      response.set_content(
+          nlohmann::json({{"error", "Unable to connect to mcp-apps at http://localhost:6543"}})
+              .dump(),
+          "application/json");
+      return;
+    }
+
+    response.status = result->status;
+    response.set_content(result->body, contentTypeFromResponse(result, "text/plain"));
+  };
+
+  server.Get("/mcp-apps", [&](const httplib::Request&, httplib::Response& response) {
+    addCorsHeaders(response);
+    proxy_mcp_app("/", response);
+  });
+
+  server.Get("/mcp-apps/:path", [&](const httplib::Request& request,
+                                     httplib::Response& response) {
+    addCorsHeaders(response);
+    const auto path = request.path_params.at("path");
+    proxy_mcp_app("/" + path, response);
+  });
+
   // ─────────────────────────────────────────────────────────────────────────
   // OpenAPI Endpoints
   // ─────────────────────────────────────────────────────────────────────────
@@ -1294,9 +1532,9 @@ int main(int argc, char** argv) {
     const auto plugin_name_with_ext = request.path_params.at("plugin");
     // Strip extension (.json or .yaml)
     std::string plugin_name = plugin_name_with_ext;
-    if (plugin_name.ends_with(".json")) {
+    if (endsWith(plugin_name, ".json")) {
       plugin_name = plugin_name.substr(0, plugin_name.length() - 5);
-    } else if (plugin_name.ends_with(".yaml") || plugin_name.ends_with(".yml")) {
+    } else if (endsWith(plugin_name, ".yaml") || endsWith(plugin_name, ".yml")) {
       size_t pos = plugin_name.rfind('.');
       if (pos != std::string::npos) {
         plugin_name = plugin_name.substr(0, pos);
@@ -1305,7 +1543,7 @@ int main(int argc, char** argv) {
 
     const auto spec = api_aggregator.getPluginSpec(plugin_name);
     if (spec.is_object() && !spec.empty()) {
-      if (plugin_name_with_ext.ends_with(".json")) {
+      if (endsWith(plugin_name_with_ext, ".json")) {
         response.set_content(spec.dump(2), "application/json");
       } else {
         response.set_content(spec.dump(2), "application/yaml");
@@ -1408,6 +1646,8 @@ int main(int argc, char** argv) {
   std::cout << "  GET  /openapi.json      — Combined OpenAPI spec\n";
   std::cout << "  GET  /openapi.yaml      — Combined OpenAPI spec (YAML)\n";
   std::cout << "  GET  /openapi/{plugin}  — Individual plugin specs\n";
+  std::cout << "  GET  /mcp-apps          — Proxied dashboard UI shell (localhost:6543)\n";
+  std::cout << "  GET  /mcp-apps/{path}   — Proxied mcp-app resource path\n";
 
   if (config.protocol_mode == ProtocolMode::REST_ONLY || config.protocol_mode == ProtocolMode::ALL) {
     std::cout << "  POST /api/{command}     — REST API endpoint\n";
