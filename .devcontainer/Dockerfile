@@ -10,3 +10,6 @@ RUN apt-get update \
         curl \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Expose ports for MCP server and dashboard
+EXPOSE 6543 5432

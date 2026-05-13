@@ -620,6 +620,20 @@ int main(int argc, char** argv) {
             if (param.required)
                 required.push_back(param.parameter_name);
         }
+
+        // Add subType as enum if this command has sub_cmd_types
+        if (!meta.sub_cmd_types.empty()) {
+            json enum_values = json::array();
+            for (const auto& st : meta.sub_cmd_types)
+                enum_values.push_back(st.sub_type_name);
+            input_schema["properties"]["subType"] = {
+                {"type", "string"},
+                {"enum", enum_values},
+                {"description", "SubCommand type to execute"}
+            };
+            required.push_back("subType");
+        }
+
         if (!required.empty())
             input_schema["required"] = required;
 
@@ -659,6 +673,31 @@ int main(int argc, char** argv) {
             });
     }
 
+    // ── Register a tool for dashboard-ui invocation ──────────────────────
+    mcp::server::ToolDefinition dashboard_tool;
+    dashboard_tool.name = "open-dashboard-ui";
+    dashboard_tool.description = "Open or invoke the dashboard UI from mcp-apps at localhost:6543";
+    json dashboard_schema = {
+        {"type", "object"},
+        {"properties", json::object()}
+    };
+    dashboard_tool.inputSchema = toMcpJson(dashboard_schema);
+    mcp_server->registerTool(
+        std::move(dashboard_tool),
+        [](const mcp::server::ToolCallContext&) -> mcp::server::CallToolResult {
+            mcp::server::CallToolResult result;
+            const json response = {
+                {"status", "success"},
+                {"message", "Dashboard UI available at http://localhost:6543/"},
+                {"url", "app://dashboard-ui"}
+            };
+            result.structuredContent = toMcpJson(response);
+            result.content = McpJson::array();
+            result.content.push_back(makeTextContent(response.dump()));
+            result.isError = false;
+            return result;
+        });
+
     // ── Register MCP resources (plugins + apps) ──────────────────────────
     std::vector<RuntimeResource> resources;
     resources.push_back(RuntimeResource{
@@ -685,6 +724,20 @@ int main(int argc, char** argv) {
             }
         });
     }
+
+    // Add apps overview resource
+    resources.push_back(RuntimeResource{
+        "apps://overview",
+        "apps-overview",
+        "Available MCP apps and UI resources from local mcp-apps service",
+        "text/markdown",
+        []() {
+            std::string doc = "# Available MCP Apps\n\n";
+            doc += "Dashboard: [app://dashboard-ui](app://dashboard-ui)\n\n";
+            doc += "Access the dashboard at http://localhost:6543/\n";
+            return doc;
+        }
+    });
 
     resources.push_back(RuntimeResource{
         "ui://mcp-apps/dashboard",
