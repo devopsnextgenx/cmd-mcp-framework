@@ -1,20 +1,12 @@
 // ---------------------------------------------------------------------------
 // fastmcp_server/src/main.cpp
 //
-// MCP protocol layer  → cpp-mcp (hkr04/cpp-mcp, MIT, C++17)
-//   Correct headers (flat under include/):
-//     #include "mcp_server.h"    — mcp::server, mcp::server::configuration
-//     #include "mcp_tool.h"      — mcp::tool, mcp::tool_builder
-//     #include "mcp_resource.h"  — mcp::file_resource
-//
-//   Key API facts (verified from server_example.cpp):
-//     • mcp::tool_builder("name").with_description(…).with_string_param(…).build()
-//     • with_number_param / with_boolean_param   (NOT with_bool_param)
-//     • server.register_tool(tool, handler_fn)
-//     • server.register_resource(uri_string, shared_ptr<resource>)
-//     • handler signature: mcp::json(const mcp::json& params, const std::string& session_id)
-//     • server.start(true)  — blocks; start(false) returns immediately
-//     • mcp::json == nlohmann::json
+// MCP protocol layer  → cpp-mcp-sdk (itcv-GmbH/cpp-mcp-sdk, C++17)
+//   Key APIs:
+//     • mcp::server::Server::create(configuration)
+//     • server->registerTool(definition, handler)
+//     • server->registerResource(definition, handler)
+//     • mcp::server::StreamableHttpServerRunner for /mcp transport
 //
 // Auxiliary REST layer → cpp-httplib (kept for non-MCP routes)
 //   GET  /             — homepage
@@ -26,10 +18,11 @@
 //   GET  /mcp-apps*    — reverse-proxy to mcp-apps at :6543
 //
 // Port layout:
-//   MCP  → port N   (e.g. 5432) — cpp-mcp library (handles /mcp internally)
+//   MCP  → port N   (e.g. 5432) — cpp-mcp-sdk streamable HTTP runner
 //   REST → port N+1 (e.g. 5433) — httplib on a detached thread
 // ---------------------------------------------------------------------------
 
+#include <chrono>
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -41,11 +34,17 @@
 #include <cctype>
 #include <thread>
 #include <memory>
+#include <atomic>
+#include <csignal>
+#include <cstdint>
+#include <optional>
 
-// ── cpp-mcp (flat headers, NOT mcp/server.h) ─────────────────────────────
-#include "mcp_server.h"       // mcp::server, mcp::server::configuration, mcp::json
-#include "mcp_tool.h"         // mcp::tool, mcp::tool_builder
-#include "mcp_resource.h"     // mcp::file_resource, mcp::text_resource (if available)
+// ── cpp-mcp-sdk ───────────────────────────────────────────────────────────
+#include <mcp/lifecycle/session/implementation.hpp>
+#include <mcp/lifecycle/session/resources_capability.hpp>
+#include <mcp/lifecycle/session/server_capabilities.hpp>
+#include <mcp/lifecycle/session/tools_capability.hpp>
+#include <mcp/server/all.hpp>
 
 // ── Auxiliary HTTP for non-MCP routes ────────────────────────────────────
 #include <httplib.h>
@@ -62,8 +61,9 @@
 
 namespace {
 
-// mcp::json IS nlohmann::json — alias for the rest of this file
 using json = nlohmann::json;
+
+using McpJson = mcp::jsonrpc::JsonValue;
 
 constexpr int kDefaultServerPort = CMDSDK_SERVER_PORT;
 
@@ -82,6 +82,27 @@ struct ServerConfig {
     std::vector<std::filesystem::path> plugin_paths;
     ProtocolMode protocol_mode = ProtocolMode::ALL;
 };
+
+std::atomic_bool gStopRequested{false};
+
+void handleSignal(int) {
+    gStopRequested.store(true);
+}
+
+McpJson toMcpJson(const json& value) {
+    return McpJson::parse(value.dump());
+}
+
+json fromMcpJson(const McpJson& value) {
+    return json::parse(value.dump());
+}
+
+McpJson makeTextContent(const std::string& text) {
+    McpJson block = McpJson::object();
+    block["type"] = "text";
+    block["text"] = text;
+    return block;
+}
 
 // ── small string helpers ──────────────────────────────────────────────────
 bool beginsWith(const std::string& v, const std::string& p) {
@@ -415,7 +436,7 @@ std::string defaultHtmlPage(int mcp_port, int rest_port) {
 <body>
 <div class="container">
   <h1 class="mb-1">🔌 FastMCP <span>Command Server</span></h1>
-  <p class="text-secondary mb-4">Powered by <strong>cpp-mcp</strong> (hkr04) · MCP 2024-11-05 · C++17</p>
+    <p class="text-secondary mb-4">Powered by <strong>cpp-mcp-sdk</strong> (itcv-GmbH) · MCP 2025-11-25 · C++17</p>
 
   <div class="row g-3 mb-4">
     <div class="col-md-6">
@@ -449,7 +470,7 @@ std::string defaultHtmlPage(int mcp_port, int rest_port) {
   </div>
   <p class="text-secondary small">MCP port <strong>)HTML" + std::to_string(mcp_port) + R"HTML(</strong>
      &nbsp;·&nbsp; REST port <strong>)HTML" + std::to_string(rest_port) + R"HTML(</strong>
-     &nbsp;·&nbsp; cpp-mcp library (hkr04/cpp-mcp)</p>
+    &nbsp;·&nbsp; cpp-mcp-sdk library (itcv-GmbH/cpp-mcp-sdk)</p>
 </div>
 </body>
 </html>)HTML";
@@ -463,51 +484,12 @@ std::string protocolModeToString(ProtocolMode m) {
     }
 }
 
-// =========================================================================
-// A thin mcp::resource subclass that serves dynamic text content.
-//
-// cpp-mcp provides mcp::file_resource for files on disk.  For dynamic
-// content (markdown, proxied HTML) we subclass mcp::resource directly.
-//
-// The base class interface (from mcp_resource.h) requires:
-//   std::string read() const override;
-// =========================================================================
-class DynamicTextResource : public mcp::resource {
-public:
-    using Provider = std::function<std::string()>;
-
-    explicit DynamicTextResource(std::string uri, std::string mime_type, Provider provider)
-        : uri_(std::move(uri)), mime_type_(std::move(mime_type)), provider_(std::move(provider)) {}
-
-    mcp::json get_metadata() const override {
-        return {
-            {"uri", uri_},
-            {"name", uri_},  // Use URI as name for simplicity
-            {"mimeType", mime_type_},
-            {"description", ""}
-        };
-    }
-
-    mcp::json read() const override {
-        return {
-            {"uri", uri_},
-            {"mimeType", mime_type_},
-            {"text", provider_()}
-        };
-    }
-
-    bool is_modified() const override {
-        return false;  // Dynamic content is always considered up-to-date
-    }
-
-    std::string get_uri() const override {
-        return uri_;
-    }
-
-private:
-    std::string uri_;
-    std::string mime_type_;
-    Provider provider_;
+struct RuntimeResource {
+    std::string uri;
+    std::string name;
+    std::string description;
+    std::string mime_type;
+    std::function<std::string()> body_provider;
 };
 
 } // namespace
@@ -582,150 +564,177 @@ int main(int argc, char** argv) {
     auto plugins = buildPluginRegistry(registry);
 
     // =========================================================================
-    // cpp-mcp SERVER
-    //
-    // cpp-mcp handles the /mcp endpoint entirely — initialize, tools/list,
-    // tools/call, resources/list, resources/read — all JSON-RPC 2.0 over
-    // HTTP with SSE for streaming responses.
+    // cpp-mcp-sdk SERVER
     // =========================================================================
 
-    mcp::server::configuration srv_conf;
-    srv_conf.host = "0.0.0.0";
-    srv_conf.port = config.port;
+    mcp::lifecycle::session::ToolsCapability tools_capability;
+    tools_capability.listChanged = true;
 
-    mcp::server mcp_server(srv_conf);
-    mcp_server.set_server_info("fastmcp_server", "0.2.0");
+    mcp::lifecycle::session::ResourcesCapability resources_capability;
+    resources_capability.listChanged = true;
 
-    // Announce capabilities (tools only; add resources if you want resources/subscribe)
-    mcp_server.set_capabilities({
-        {"tools",     mcp::json::object()},
-        {"resources", {{"listChanged", true}}}
-    });
+    mcp::server::ServerConfiguration server_config;
+    server_config.capabilities = mcp::lifecycle::session::ServerCapabilities(
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        resources_capability,
+        tools_capability,
+        std::nullopt,
+        std::nullopt);
+    server_config.serverInfo = mcp::lifecycle::session::Implementation("fastmcp_server", "0.3.0");
+    server_config.instructions = "Use tools for command execution and resources for plugin/app metadata.";
+
+    const auto mcp_server = mcp::server::Server::create(std::move(server_config));
 
     // ── Register one tool per plugin command ──────────────────────────────
     for (const auto& meta : registry.listMetadata()) {
-        // Collect subType enum values for description enrichment
         std::string subtype_list;
         for (const auto& st : meta.sub_cmd_types) {
             if (!subtype_list.empty()) subtype_list += ", ";
             subtype_list += st.sub_type_name;
         }
 
-        // Start building the tool
         std::string full_desc = meta.description;
         if (!subtype_list.empty())
             full_desc += " [subType: " + subtype_list + "]";
 
-        auto builder = mcp::tool_builder(meta.cmd_name)
-                           .with_description(full_desc);
+        json input_schema = {
+            {"type", "object"},
+            {"properties", json::object()},
+            {"additionalProperties", true}
+        };
+        json required = json::array();
 
         for (const auto& param : meta.parameters) {
-            const auto& name  = param.parameter_name;
-            const auto& desc  = param.description;
-            const auto& ptype = param.parameter_type;
-            const bool  req   = param.required;
+            std::string json_type = "string";
+            if (param.parameter_type == "number") json_type = "number";
+            else if (param.parameter_type == "boolean") json_type = "boolean";
+            else if (param.parameter_type == "object") json_type = "object";
+            else if (param.parameter_type == "array") json_type = "array";
 
-            // with_string_param(name, description, default_value="")
-            // with_number_param(name, description, required=true)
-            // with_boolean_param(name, description, required=true)  ← NOT with_bool_param
-            if (ptype == "number") {
-                builder.with_number_param(name, desc, req);
-            } else if (ptype == "boolean") {
-                builder.with_boolean_param(name, desc, req);
-            } else {
-                // string / object / array / subType all registered as string params
-                if (req) {
-                    builder.with_string_param(name, desc);
-                } else {
-                    builder.with_string_param(name, desc, "");
-                }
-            }
+            input_schema["properties"][param.parameter_name] = {
+                {"type", json_type},
+                {"description", param.description}
+            };
+            if (param.required)
+                required.push_back(param.parameter_name);
         }
+        if (!required.empty())
+            input_schema["required"] = required;
 
-        mcp::tool tool = builder.build();
+        mcp::server::ToolDefinition tool;
+        tool.name = meta.cmd_name;
+        tool.description = full_desc;
+        tool.inputSchema = toMcpJson(input_schema);
 
-        // Handler: captures cmd_name by value; registry and meta by ref (stable lifetime)
-        mcp_server.register_tool(tool,
-            [&registry, cmd_name = meta.cmd_name]
-            (const mcp::json& args, const std::string& /*session_id*/) -> mcp::json {
+        mcp_server->registerTool(
+            std::move(tool),
+            [&registry, cmd_name = meta.cmd_name](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult {
+                const json args = fromMcpJson(context.arguments);
 
                 auto command = registry.create(cmd_name);
                 if (!command)
-                    throw mcp::mcp_exception(mcp::error_code::internal_error,
-                                             "Tool not found: " + cmd_name);
+                    throw std::runtime_error("Tool not found: " + cmd_name);
 
                 std::string error;
                 if (!command->validate(args, error))
-                    throw mcp::mcp_exception(mcp::error_code::invalid_params,
-                                             "Validation failed: " + error);
+                    throw std::invalid_argument("Validation failed: " + error);
                 if (!command->execute(args, error))
-                    throw mcp::mcp_exception(mcp::error_code::internal_error,
-                                             "Execution failed: " + error);
+                    throw std::runtime_error("Execution failed: " + error);
 
-                json raw = command->getResult();
-
-                // Annotate with subTypeExecuted (MCP structured content convention)
+                const json raw = command->getResult();
                 json structured = raw.is_object() ? raw : json{{"result", raw}};
                 if (args.contains("subType") && args["subType"].is_string())
                     structured["subTypeExecuted"] = args["subType"].get<std::string>();
 
-                std::cout << "[tools/call] " << cmd_name << " → " << raw.dump() << '\n';
+                std::cout << "[tools/call] " << cmd_name << " -> " << raw.dump() << '\n';
 
-                // MCP tool result must be a JSON array of content blocks
-                return mcp::json::array({
-                    { {"type", "text"}, {"text", raw.dump()} }
-                });
+                mcp::server::CallToolResult result;
+                result.structuredContent = toMcpJson(structured);
+                result.content = McpJson::array();
+                result.content.push_back(makeTextContent(raw.dump()));
+                result.isError = false;
+                return result;
             });
     }
 
-    // ── Register MCP resources ────────────────────────────────────────────
-    //
-    // cpp-mcp's register_resource takes: (uri_string, shared_ptr<mcp::resource>)
-    // mcp::file_resource wraps a file path.
-    // For dynamic content we use our DynamicTextResource helper above.
-
-    // plugins://overview — aggregated plugin markdown
-    mcp_server.register_resource(
+    // ── Register MCP resources (plugins + apps) ──────────────────────────
+    std::vector<RuntimeResource> resources;
+    resources.push_back(RuntimeResource{
         "plugins://overview",
-        std::make_shared<DynamicTextResource>("plugins://overview", "text/markdown", [&plugins]() {
-            return buildPluginsMarkdown(plugins);
-        }));
+        "plugins-overview",
+        "Available plugins and subtype docs",
+        "text/markdown",
+        [&plugins]() { return buildPluginsMarkdown(plugins); }
+    });
 
-    // plugin://<name> — one resource per plugin
     for (const auto& [pname, _] : plugins) {
         const auto rname = canonicalResourceName(pname);
         const auto uri = "plugin://" + rname;
-        mcp_server.register_resource(
+        resources.push_back(RuntimeResource{
             uri,
-            std::make_shared<DynamicTextResource>(uri, "text/markdown", [&plugins, pname]() {
+            rname,
+            "Plugin details for " + pname,
+            "text/markdown",
+            [&plugins, pname]() {
                 std::string resolved;
                 const auto* pi = findPluginInfo(plugins, pname, resolved);
                 if (!pi) return std::string("Plugin not found: " + pname);
                 return buildPluginDetailsMarkdown(resolved, *pi);
-            }));
+            }
+        });
     }
 
-    // ui://mcp-apps/dashboard — proxied HTML from localhost:6543
-    mcp_server.register_resource(
+    resources.push_back(RuntimeResource{
         "ui://mcp-apps/dashboard",
-        std::make_shared<DynamicTextResource>("ui://mcp-apps/dashboard", "text/html", []() {
+        "dashboard-ui",
+        "Dashboard HTML proxied from local mcp-apps server",
+        "text/html",
+        []() {
             std::string canon, mime, body, err;
             if (readMcpAppResource("app://dashboard-ui", canon, mime, body, err))
                 return body;
-            return std::string(
-                "<h1>Dashboard</h1><p>mcp-apps not reachable at localhost:6543</p>");
-        }));
+            return std::string("<h1>Dashboard</h1><p>mcp-apps not reachable at localhost:6543</p>");
+        }
+    });
 
-    // External app resources from localhost:6543/resource-manifest.json
     for (const auto& ext : fetchExternalAppResources()) {
-        mcp_server.register_resource(
+        resources.push_back(RuntimeResource{
             ext.uri,
-            std::make_shared<DynamicTextResource>(ext.uri, ext.mime_type, [uri = ext.uri]() {
+            ext.name,
+            ext.description,
+            ext.mime_type,
+            [uri = ext.uri]() {
                 std::string canon, mime, body, err;
                 if (readMcpAppResource(uri, canon, mime, body, err))
                     return body;
                 return std::string("Error: " + err);
-            }));
+            }
+        });
+    }
+
+    mcp::server::ResourceTemplateDefinition app_template;
+    app_template.uriTemplate = "app://{path}";
+    app_template.name = "app-resource-template";
+    app_template.description = "Template URI for resources exposed by local mcp-apps service";
+    app_template.mimeType = "text/plain";
+    mcp_server->registerResourceTemplate(std::move(app_template));
+
+    for (const auto& resource : resources) {
+        mcp::server::ResourceDefinition definition;
+        definition.uri = resource.uri;
+        definition.name = resource.name;
+        definition.description = resource.description;
+        definition.mimeType = resource.mime_type;
+
+        mcp_server->registerResource(
+            std::move(definition),
+            [resource](const mcp::server::ResourceReadContext&) -> std::vector<mcp::server::ResourceContent> {
+                return {
+                    mcp::server::ResourceContent::text(resource.uri, resource.body_provider(), resource.mime_type)
+                };
+            });
     }
 
     // =========================================================================
@@ -856,10 +865,10 @@ int main(int argc, char** argv) {
     // Banner
     // =========================================================================
     std::cout << "\n========================================\n"
-              << "FastMCP Server  (cpp-mcp by hkr04)\n"
+              << "FastMCP Server  (cpp-mcp-sdk by itcv-GmbH)\n"
               << "========================================\n"
               << "Protocol mode : " << protocolModeToString(config.protocol_mode) << "\n\n"
-              << "MCP  (cpp-mcp)  → http://0.0.0.0:" << config.port << "/mcp\n"
+              << "MCP  (cpp-mcp-sdk)  → http://0.0.0.0:" << config.port << "/mcp\n"
               << "REST (httplib)  → http://0.0.0.0:" << rest_port   << "/\n\n"
               << "REST routes:\n"
               << "  GET  /              — Homepage\n"
@@ -876,17 +885,44 @@ int main(int argc, char** argv) {
     // Start servers
     // =========================================================================
 
-    // REST on a background thread (detached — lives for the process lifetime)
-    std::thread([&rest_server, rest_port]() {
-        std::cout << "REST server listening on http://0.0.0.0:" << rest_port << '\n';
-        if (!rest_server.listen("0.0.0.0", rest_port))
-            std::cerr << "ERROR: failed to bind REST server on port " << rest_port << '\n';
-    }).detach();
+    std::signal(SIGINT, handleSignal);
+    std::signal(SIGTERM, handleSignal);
 
-    // cpp-mcp server blocks on the main thread
-    // Call mcp_server.stop() from a signal handler (SIGINT/SIGTERM) to exit cleanly.
-    std::cout << "MCP  server listening on http://0.0.0.0:" << config.port << '\n';
-    mcp_server.start(true);  // true = blocking
+    std::unique_ptr<mcp::server::StreamableHttpServerRunner> mcp_runner;
+    if (config.protocol_mode != ProtocolMode::REST_ONLY) {
+        const mcp::server::ServerFactory server_factory = [mcp_server]() {
+            return mcp_server;
+        };
+
+        mcp::server::StreamableHttpServerRunnerOptions mcp_options;
+        mcp_options.transportOptions.http.endpoint.bindAddress = "0.0.0.0";
+        mcp_options.transportOptions.http.endpoint.bindLocalhostOnly = false;
+        mcp_options.transportOptions.http.endpoint.port = static_cast<std::uint16_t>(config.port);
+        mcp_options.transportOptions.http.endpoint.path = "/mcp";
+        mcp_options.transportOptions.http.requireSessionId = false;
+
+        mcp_runner = std::make_unique<mcp::server::StreamableHttpServerRunner>(server_factory, mcp_options);
+        mcp_runner->start();
+        std::cout << "MCP  server listening on http://0.0.0.0:" << config.port << "\n";
+    }
+
+    // REST on a background thread (detached — lives for the process lifetime)
+    if (config.protocol_mode != ProtocolMode::MCP_ONLY) {
+        std::thread([&rest_server, rest_port]() {
+            std::cout << "REST server listening on http://0.0.0.0:" << rest_port << '\n';
+            if (!rest_server.listen("0.0.0.0", rest_port))
+                std::cerr << "ERROR: failed to bind REST server on port " << rest_port << '\n';
+        }).detach();
+    }
+
+    while (!gStopRequested.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    if (mcp_runner) {
+        mcp_runner->stop();
+    }
+    rest_server.stop();
 
     return 0;
 }
