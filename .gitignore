@@ -9,3 +9,4 @@ graphify-out/
 **/package-lock.json
 **/yarn.lock
 **/.DS_Stores
+.tmp_cpp_mcp_sdk/

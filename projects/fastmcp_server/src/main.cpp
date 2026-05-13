@@ -94,7 +94,7 @@ McpJson toMcpJson(const json& value) {
 }
 
 json fromMcpJson(const McpJson& value) {
-    return json::parse(value.dump());
+    return json::parse(value.to_string());
 }
 
 McpJson makeTextContent(const std::string& text) {
