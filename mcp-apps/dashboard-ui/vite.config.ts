@@ -16,6 +16,17 @@ const dashboardResource = {
 const resourceManifest = {
   resources: [
     {
+      uri: 'app://dashboard-ui',
+      name: 'Dashboard UI',
+      description: 'Dashboard UI shell with command and resource inspection',
+      mimeType: 'text/html',
+      _meta: {
+        ui: {
+          resourceUri: 'http://localhost:6543/',
+        },
+      },
+    },
+    {
       uri: 'http://localhost:6543/dashboard-state',
       name: 'Dashboard UI State',
       description: 'Live dashboard UI state exposed as an MCP resource',

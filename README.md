@@ -7,6 +7,7 @@
 
 ```bash
 npx @modelcontextprotocol/inspector --url http://localhost:5432/mcp --transport http
+npx @modelcontextprotocol/inspector@0.15.0 -- --url http://localhost:5432/mcp --transport http
 ```
 
 ## Implementation
