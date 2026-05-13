@@ -117,6 +117,20 @@ The server exposes these as MCP tools via the `/mcp` endpoint.
 - C++20-capable compiler (GCC/Clang/MSVC)
 - network access during initial configure (for FetchContent dependencies)
 
+### Build in VS Code Dev Container (Linux/Docker)
+This repository includes a ready-to-use dev container at `.devcontainer/`.
+
+1. In VS Code, run: `Dev Containers: Reopen in Container`
+2. Wait for the container build and `postCreateCommand` to finish
+3. Build from repository root:
+
+```bash
+cmake -S . -B build
+cmake --build build -j
+```
+
+The dev container installs CMake, Ninja, GCC toolchain, and Node.js dependencies needed for `mcp-apps/dashboard-ui`.
+
 ### Configure and compile
 From repository root:
 
