@@ -191,6 +191,37 @@ std::string toLowerAscii(std::string v) {
     return v;
 }
 
+std::string sanitizeToolName(std::string name) {
+    std::string out;
+    out.reserve(name.size());
+
+    bool last_was_sep = false;
+    for (const unsigned char c : name) {
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+            out.push_back(static_cast<char>(c));
+            last_was_sep = false;
+            continue;
+        }
+
+        if (c >= 'A' && c <= 'Z') {
+            out.push_back(static_cast<char>(std::tolower(c)));
+            last_was_sep = false;
+            continue;
+        }
+
+        if (c == '.' || c == '/' || std::isspace(c)) {
+            if (!last_was_sep && !out.empty()) {
+                out.push_back('_');
+                last_was_sep = true;
+            }
+        }
+    }
+
+    while (!out.empty() && (out.back() == '_' || out.back() == '-')) out.pop_back();
+    if (out.empty()) return "tool";
+    return out;
+}
+
 // ── argument parsing ──────────────────────────────────────────────────────
 ServerConfig parseArguments(int argc, char** argv) {
     ServerConfig cfg;
@@ -769,9 +800,12 @@ int main(int argc, char** argv) {
                 std::nullopt,
                 std::nullopt);
             server_config.serverInfo = mcp::lifecycle::session::Implementation("fastmcp_server", "0.3.0");
-            server_config.instructions = "Use tools for command execution and resources for plugin/app metadata.";
+            server_config.instructions = "Use tools for command execution and resources for plugin/app metadata. For dashboard UI, call open-dashboard-ui and then open app://dashboard-ui.";
 
             auto mcp_server = mcp::server::Server::create(std::move(server_config));
+
+            std::set<std::string> used_tool_names;
+            std::map<std::string, int> tool_name_suffixes;
 
             for (const auto& meta : registry.listMetadata()) {
             std::string subtype_list;
@@ -789,7 +823,7 @@ int main(int argc, char** argv) {
                 {"properties", json::object()},
                 {"additionalProperties", true}
             };
-            json required = json::array();
+            std::set<std::string> required_fields;
 
             for (const auto& param : meta.parameters) {
                 std::string json_type = "string";
@@ -803,7 +837,7 @@ int main(int argc, char** argv) {
                     {"description", param.description}
                 };
                 if (param.required)
-                    required.push_back(param.parameter_name);
+                    required_fields.insert(param.parameter_name);
             }
 
             if (!meta.sub_cmd_types.empty()) {
@@ -815,27 +849,49 @@ int main(int argc, char** argv) {
                     {"enum", enum_values},
                     {"description", "SubCommand type to execute"}
                 };
-                required.push_back("subType");
+                required_fields.insert("subType");
             }
 
-            if (!required.empty())
+            if (!required_fields.empty()) {
+                json required = json::array();
+                for (const auto& field : required_fields) {
+                    required.push_back(field);
+                }
                 input_schema["required"] = required;
+            }
+
+                const std::string original_cmd_name = meta.cmd_name;
+                std::string tool_name = sanitizeToolName(original_cmd_name);
+                if (used_tool_names.count(tool_name) > 0) {
+                    int& suffix = tool_name_suffixes[tool_name];
+                    do {
+                        ++suffix;
+                    } while (used_tool_names.count(tool_name + "_" + std::to_string(suffix)) > 0);
+                    tool_name = tool_name + "_" + std::to_string(suffix);
+                }
+                used_tool_names.insert(tool_name);
 
                 mcp::server::ToolDefinition tool;
-                tool.name = meta.cmd_name;
+                tool.name = tool_name;
                 tool.description = full_desc;
+                if (tool_name != original_cmd_name) {
+                    tool.description += " [original: " + original_cmd_name + "]";
+                }
                 tool.inputSchema = toMcpJson(input_schema);
 
                 if (mcp_debug) {
-                    logDiag("MCP-REGISTER", "Registering tool " + meta.cmd_name);
+                    logDiag("MCP-REGISTER",
+                            "Registering tool " + tool_name + " (command=" + original_cmd_name + ")");
                 }
 
                 mcp_server->registerTool(
                     std::move(tool),
-                        [&registry, cmd_name = meta.cmd_name, mcp_debug](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult {
+                        [&registry, cmd_name = original_cmd_name, tool_name, mcp_debug](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult {
                         try {
                             if (mcp_debug) {
-                                logRequestContext("MCP-TOOL-CALL", context.requestContext, "tool=" + cmd_name);
+                                logRequestContext("MCP-TOOL-CALL",
+                                                  context.requestContext,
+                                                  "tool=" + tool_name + " command=" + cmd_name);
                             }
 
                             const json args = fromMcpJson(context.arguments);
@@ -874,7 +930,7 @@ int main(int argc, char** argv) {
 
             mcp::server::ToolDefinition dashboard_tool;
             dashboard_tool.name = "open-dashboard-ui";
-            dashboard_tool.description = "Open the dashboard UI";
+            dashboard_tool.description = "Open the dashboard UI and confirm dashboard-ui availability";
 
             json dashboard_schema = {
                 {"type", "object"},
@@ -901,12 +957,17 @@ int main(int argc, char** argv) {
 
                     const json response = {
                         {"status", "success"},
+                        {"availability", "dashboard-ui available"},
                         {"message", "Dashboard UI available at http://localhost:6543/"},
                         {"resourceUri", "app://dashboard-ui"}
                     };
 
                     result.structuredContent = toMcpJson(response);
                     result.content = McpJson::array();
+                    result.content.push_back(makeTextContent(
+                        "dashboard-ui available\n"
+                        "resource: app://dashboard-ui\n"
+                        "url: http://localhost:6543/"));
                     result.content.push_back(makeResourceLinkContent(
                         "app://dashboard-ui",
                         "dashboard-ui",
