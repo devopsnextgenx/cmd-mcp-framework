@@ -563,141 +563,7 @@ int main(int argc, char** argv) {
 
     auto plugins = buildPluginRegistry(registry);
 
-    // =========================================================================
-    // cpp-mcp-sdk SERVER
-    // =========================================================================
-
-    mcp::lifecycle::session::ToolsCapability tools_capability;
-    tools_capability.listChanged = true;
-
-    mcp::lifecycle::session::ResourcesCapability resources_capability;
-    resources_capability.listChanged = true;
-
-    mcp::server::ServerConfiguration server_config;
-    server_config.capabilities = mcp::lifecycle::session::ServerCapabilities(
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        resources_capability,
-        tools_capability,
-        std::nullopt,
-        std::nullopt);
-    server_config.serverInfo = mcp::lifecycle::session::Implementation("fastmcp_server", "0.3.0");
-    server_config.instructions = "Use tools for command execution and resources for plugin/app metadata.";
-
-    const auto mcp_server = mcp::server::Server::create(std::move(server_config));
-
-    // ── Register one tool per plugin command ──────────────────────────────
-    for (const auto& meta : registry.listMetadata()) {
-        std::string subtype_list;
-        for (const auto& st : meta.sub_cmd_types) {
-            if (!subtype_list.empty()) subtype_list += ", ";
-            subtype_list += st.sub_type_name;
-        }
-
-        std::string full_desc = meta.description;
-        if (!subtype_list.empty())
-            full_desc += " [subType: " + subtype_list + "]";
-
-        json input_schema = {
-            {"type", "object"},
-            {"properties", json::object()},
-            {"additionalProperties", true}
-        };
-        json required = json::array();
-
-        for (const auto& param : meta.parameters) {
-            std::string json_type = "string";
-            if (param.parameter_type == "number") json_type = "number";
-            else if (param.parameter_type == "boolean") json_type = "boolean";
-            else if (param.parameter_type == "object") json_type = "object";
-            else if (param.parameter_type == "array") json_type = "array";
-
-            input_schema["properties"][param.parameter_name] = {
-                {"type", json_type},
-                {"description", param.description}
-            };
-            if (param.required)
-                required.push_back(param.parameter_name);
-        }
-
-        // Add subType as enum if this command has sub_cmd_types
-        if (!meta.sub_cmd_types.empty()) {
-            json enum_values = json::array();
-            for (const auto& st : meta.sub_cmd_types)
-                enum_values.push_back(st.sub_type_name);
-            input_schema["properties"]["subType"] = {
-                {"type", "string"},
-                {"enum", enum_values},
-                {"description", "SubCommand type to execute"}
-            };
-            required.push_back("subType");
-        }
-
-        if (!required.empty())
-            input_schema["required"] = required;
-
-        mcp::server::ToolDefinition tool;
-        tool.name = meta.cmd_name;
-        tool.description = full_desc;
-        tool.inputSchema = toMcpJson(input_schema);
-
-        mcp_server->registerTool(
-            std::move(tool),
-            [&registry, cmd_name = meta.cmd_name](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult {
-                const json args = fromMcpJson(context.arguments);
-
-                auto command = registry.create(cmd_name);
-                if (!command)
-                    throw std::runtime_error("Tool not found: " + cmd_name);
-
-                std::string error;
-                if (!command->validate(args, error))
-                    throw std::invalid_argument("Validation failed: " + error);
-                if (!command->execute(args, error))
-                    throw std::runtime_error("Execution failed: " + error);
-
-                const json raw = command->getResult();
-                json structured = raw.is_object() ? raw : json{{"result", raw}};
-                if (args.contains("subType") && args["subType"].is_string())
-                    structured["subTypeExecuted"] = args["subType"].get<std::string>();
-
-                std::cout << "[tools/call] " << cmd_name << " -> " << raw.dump() << '\n';
-
-                mcp::server::CallToolResult result;
-                result.structuredContent = toMcpJson(structured);
-                result.content = McpJson::array();
-                result.content.push_back(makeTextContent(raw.dump()));
-                result.isError = false;
-                return result;
-            });
-    }
-
-    // ── Register a tool for dashboard-ui invocation ──────────────────────
-    mcp::server::ToolDefinition dashboard_tool;
-    dashboard_tool.name = "open-dashboard-ui";
-    dashboard_tool.description = "Open or invoke the dashboard UI from mcp-apps at localhost:6543";
-    json dashboard_schema = {
-        {"type", "object"},
-        {"properties", json::object()}
-    };
-    dashboard_tool.inputSchema = toMcpJson(dashboard_schema);
-    mcp_server->registerTool(
-        std::move(dashboard_tool),
-        [](const mcp::server::ToolCallContext&) -> mcp::server::CallToolResult {            std::cout << "[tools/call] open-dashboard-ui\n";            mcp::server::CallToolResult result;
-            const json response = {
-                {"status", "success"},
-                {"message", "Dashboard UI available at http://localhost:6543/"},
-                {"url", "app://dashboard-ui"}
-            };
-            result.structuredContent = toMcpJson(response);
-            result.content = McpJson::array();
-            result.content.push_back(makeTextContent(response.dump()));
-            result.isError = false;
-            return result;
-        });
-
-    // ── Register MCP resources (plugins + apps) ──────────────────────────
+    // ── Build MCP resources (plugins + apps) ─────────────────────────────
     std::vector<RuntimeResource> resources;
     resources.push_back(RuntimeResource{
         "plugins://overview",
@@ -766,29 +632,162 @@ int main(int argc, char** argv) {
         });
     }
 
-    mcp::server::ResourceTemplateDefinition app_template;
-    app_template.uriTemplate = "app://{path}";
-    app_template.name = "app-resource-template";
-    app_template.description = "Template URI for resources exposed by local mcp-apps service";
-    app_template.mimeType = "text/plain";
-    mcp_server->registerResourceTemplate(std::move(app_template));
+    auto createConfiguredMcpServer = [&registry, &resources]() {
+        mcp::lifecycle::session::ToolsCapability tools_capability;
+        tools_capability.listChanged = true;
 
-    for (const auto& resource : resources) {
-        mcp::server::ResourceDefinition definition;
-        definition.uri = resource.uri;
-        definition.name = resource.name;
-        definition.description = resource.description;
-        definition.mimeType = resource.mime_type;
+        mcp::lifecycle::session::ResourcesCapability resources_capability;
+        resources_capability.listChanged = true;
 
-        mcp_server->registerResource(
-            std::move(definition),
-            [resource](const mcp::server::ResourceReadContext&) -> std::vector<mcp::server::ResourceContent> {
-                std::cout << "[resources/read] " << resource.uri << '\n';
-                return {
-                    mcp::server::ResourceContent::text(resource.uri, resource.body_provider(), resource.mime_type)
+        mcp::server::ServerConfiguration server_config;
+        server_config.capabilities = mcp::lifecycle::session::ServerCapabilities(
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            resources_capability,
+            tools_capability,
+            std::nullopt,
+            std::nullopt);
+        server_config.serverInfo = mcp::lifecycle::session::Implementation("fastmcp_server", "0.3.0");
+        server_config.instructions = "Use tools for command execution and resources for plugin/app metadata.";
+
+        auto mcp_server = mcp::server::Server::create(std::move(server_config));
+
+        for (const auto& meta : registry.listMetadata()) {
+            std::string subtype_list;
+            for (const auto& st : meta.sub_cmd_types) {
+                if (!subtype_list.empty()) subtype_list += ", ";
+                subtype_list += st.sub_type_name;
+            }
+
+            std::string full_desc = meta.description;
+            if (!subtype_list.empty())
+                full_desc += " [subType: " + subtype_list + "]";
+
+            json input_schema = {
+                {"type", "object"},
+                {"properties", json::object()},
+                {"additionalProperties", true}
+            };
+            json required = json::array();
+
+            for (const auto& param : meta.parameters) {
+                std::string json_type = "string";
+                if (param.parameter_type == "number") json_type = "number";
+                else if (param.parameter_type == "boolean") json_type = "boolean";
+                else if (param.parameter_type == "object") json_type = "object";
+                else if (param.parameter_type == "array") json_type = "array";
+
+                input_schema["properties"][param.parameter_name] = {
+                    {"type", json_type},
+                    {"description", param.description}
                 };
+                if (param.required)
+                    required.push_back(param.parameter_name);
+            }
+
+            if (!meta.sub_cmd_types.empty()) {
+                json enum_values = json::array();
+                for (const auto& st : meta.sub_cmd_types)
+                    enum_values.push_back(st.sub_type_name);
+                input_schema["properties"]["subType"] = {
+                    {"type", "string"},
+                    {"enum", enum_values},
+                    {"description", "SubCommand type to execute"}
+                };
+                required.push_back("subType");
+            }
+
+            if (!required.empty())
+                input_schema["required"] = required;
+
+            mcp::server::ToolDefinition tool;
+            tool.name = meta.cmd_name;
+            tool.description = full_desc;
+            tool.inputSchema = toMcpJson(input_schema);
+
+            mcp_server->registerTool(
+                std::move(tool),
+                [&registry, cmd_name = meta.cmd_name](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult {
+                    const json args = fromMcpJson(context.arguments);
+
+                    auto command = registry.create(cmd_name);
+                    if (!command)
+                        throw std::runtime_error("Tool not found: " + cmd_name);
+
+                    std::string error;
+                    if (!command->validate(args, error))
+                        throw std::invalid_argument("Validation failed: " + error);
+                    if (!command->execute(args, error))
+                        throw std::runtime_error("Execution failed: " + error);
+
+                    const json raw = command->getResult();
+                    json structured = raw.is_object() ? raw : json{{"result", raw}};
+                    if (args.contains("subType") && args["subType"].is_string())
+                        structured["subTypeExecuted"] = args["subType"].get<std::string>();
+
+                    std::cout << "[tools/call] " << cmd_name << " -> " << raw.dump() << '\n';
+
+                    mcp::server::CallToolResult result;
+                    result.structuredContent = toMcpJson(structured);
+                    result.content = McpJson::array();
+                    result.content.push_back(makeTextContent(raw.dump()));
+                    result.isError = false;
+                    return result;
+                });
+        }
+
+        mcp::server::ToolDefinition dashboard_tool;
+        dashboard_tool.name = "open-dashboard-ui";
+        dashboard_tool.description = "Open or invoke the dashboard UI from mcp-apps at localhost:6543";
+        json dashboard_schema = {
+            {"type", "object"},
+            {"properties", json::object()}
+        };
+        dashboard_tool.inputSchema = toMcpJson(dashboard_schema);
+        mcp_server->registerTool(
+            std::move(dashboard_tool),
+            [](const mcp::server::ToolCallContext&) -> mcp::server::CallToolResult {
+                std::cout << "[tools/call] open-dashboard-ui\n";
+                mcp::server::CallToolResult result;
+                const json response = {
+                    {"status", "success"},
+                    {"message", "Dashboard UI available at http://localhost:6543/"},
+                    {"url", "app://dashboard-ui"}
+                };
+                result.structuredContent = toMcpJson(response);
+                result.content = McpJson::array();
+                result.content.push_back(makeTextContent(response.dump()));
+                result.isError = false;
+                return result;
             });
-    }
+
+        mcp::server::ResourceTemplateDefinition app_template;
+        app_template.uriTemplate = "app://{path}";
+        app_template.name = "app-resource-template";
+        app_template.description = "Template URI for resources exposed by local mcp-apps service";
+        app_template.mimeType = "text/plain";
+        mcp_server->registerResourceTemplate(std::move(app_template));
+
+        for (const auto& resource : resources) {
+            mcp::server::ResourceDefinition definition;
+            definition.uri = resource.uri;
+            definition.name = resource.name;
+            definition.description = resource.description;
+            definition.mimeType = resource.mime_type;
+
+            mcp_server->registerResource(
+                std::move(definition),
+                [resource](const mcp::server::ResourceReadContext&) -> std::vector<mcp::server::ResourceContent> {
+                    std::cout << "[resources/read] " << resource.uri << '\n';
+                    return {
+                        mcp::server::ResourceContent::text(resource.uri, resource.body_provider(), resource.mime_type)
+                    };
+                });
+        }
+
+        return mcp_server;
+    };
 
     // =========================================================================
     // Auxiliary httplib REST server (non-MCP routes)
@@ -947,8 +946,8 @@ int main(int argc, char** argv) {
 
     std::unique_ptr<mcp::server::StreamableHttpServerRunner> mcp_runner;
     if (config.protocol_mode != ProtocolMode::REST_ONLY) {
-        const mcp::server::ServerFactory server_factory = [mcp_server]() {
-            return mcp_server;
+        const mcp::server::ServerFactory server_factory = [createConfiguredMcpServer]() {
+            return createConfiguredMcpServer();
         };
 
         mcp::server::StreamableHttpServerRunnerOptions mcp_options;
@@ -956,7 +955,7 @@ int main(int argc, char** argv) {
         mcp_options.transportOptions.http.endpoint.bindLocalhostOnly = false;
         mcp_options.transportOptions.http.endpoint.port = static_cast<std::uint16_t>(config.port);
         mcp_options.transportOptions.http.endpoint.path = "/mcp";
-        mcp_options.transportOptions.http.requireSessionId = false;
+        mcp_options.transportOptions.http.requireSessionId = true;
 
         mcp_runner = std::make_unique<mcp::server::StreamableHttpServerRunner>(server_factory, mcp_options);
         mcp_runner->start();
