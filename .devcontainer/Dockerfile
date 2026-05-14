@@ -12,4 +12,4 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Expose ports for MCP server and dashboard
-EXPOSE 6543 5432
+EXPOSE 4173 6543 5432 5433

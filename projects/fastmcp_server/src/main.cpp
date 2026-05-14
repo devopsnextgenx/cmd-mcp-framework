@@ -684,8 +684,7 @@ int main(int argc, char** argv) {
     dashboard_tool.inputSchema = toMcpJson(dashboard_schema);
     mcp_server->registerTool(
         std::move(dashboard_tool),
-        [](const mcp::server::ToolCallContext&) -> mcp::server::CallToolResult {
-            mcp::server::CallToolResult result;
+        [](const mcp::server::ToolCallContext&) -> mcp::server::CallToolResult {            std::cout << "[tools/call] open-dashboard-ui\n";            mcp::server::CallToolResult result;
             const json response = {
                 {"status", "success"},
                 {"message", "Dashboard UI available at http://localhost:6543/"},
@@ -784,6 +783,7 @@ int main(int argc, char** argv) {
         mcp_server->registerResource(
             std::move(definition),
             [resource](const mcp::server::ResourceReadContext&) -> std::vector<mcp::server::ResourceContent> {
+                std::cout << "[resources/read] " << resource.uri << '\n';
                 return {
                     mcp::server::ResourceContent::text(resource.uri, resource.body_provider(), resource.mime_type)
                 };
@@ -855,6 +855,7 @@ int main(int argc, char** argv) {
                                               httplib::Response& res) {
             addCorsHeaders(res);
             const auto cmd_name = req.path_params.at("command");
+            std::cout << "[REST POST] /api/" << cmd_name << " body=" << req.body << '\n';
             json body;
             try { body = json::parse(req.body); }
             catch (const std::exception& e) {
@@ -898,12 +899,15 @@ int main(int argc, char** argv) {
 
     rest_server.Get("/mcp-apps", [&](const httplib::Request&, httplib::Response& res) {
         addCorsHeaders(res);
+        std::cout << "[REST GET] /mcp-apps (proxy -> :6543/)\n";
         proxy_mcp_app("/", res);
     });
     rest_server.Get("/mcp-apps/:path", [&](const httplib::Request& req,
                                             httplib::Response& res) {
         addCorsHeaders(res);
-        proxy_mcp_app("/" + req.path_params.at("path"), res);
+        const auto app_path = "/" + req.path_params.at("path");
+        std::cout << "[REST GET] /mcp-apps" << app_path << " (proxy -> :6543" << app_path << ")\n";
+        proxy_mcp_app(app_path, res);
     });
 
     // CORS preflight

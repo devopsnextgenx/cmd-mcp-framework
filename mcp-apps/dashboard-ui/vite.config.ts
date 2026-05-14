@@ -38,22 +38,10 @@ const resourceManifest = {
   ],
 };
 
-export default defineConfig({
-  plugins: [react()],
-  base: './',
-  build: {
-    outDir: 'dist',
-    assetsDir: 'assets',
-    minify: 'esbuild',
-    sourcemap: false,
-  },
-  server: {
-    cors: true,
-    port: 6543,
-    strictPort: true,
-  },
-  configureServer(server) {
-    server.middlewares.use((req, res, next) => {
+const mcpMiddlewarePlugin = {
+  name: 'mcp-middleware',
+  configureServer(server: import('vite').ViteDevServer) {
+    server.middlewares.use((req: import('http').IncomingMessage, res: import('http').ServerResponse, next: () => void) => {
       if (!req.url) {
         next();
         return;
@@ -98,5 +86,21 @@ export default defineConfig({
 
       next();
     });
+  },
+};
+
+export default defineConfig({
+  plugins: [react(), mcpMiddlewarePlugin],
+  base: './',
+  build: {
+    outDir: 'dist',
+    assetsDir: 'assets',
+    minify: 'esbuild',
+    sourcemap: false,
+  },
+  server: {
+    cors: true,
+    port: 6543,
+    strictPort: true,
   },
 });

@@ -22,7 +22,7 @@
       }
     }
   },
-  "forwardPorts": [5432, 6543],
+  "forwardPorts": [4173, 5432, 5433, 6543],
   "postCreateCommand": "bash .devcontainer/post-create.sh",
   "remoteUser": "vscode"
 }
