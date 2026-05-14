@@ -445,8 +445,12 @@ bool readMcpAppResource(const std::string& uri,
                         std::string& mime_type,
                         std::string& content,
                         std::string& error) {
+    const bool mcp_debug = envFlagEnabled("FASTMCP_MCP_DEBUG");
     std::string path;
     if (!uriToMcpAppsPath(uri, path)) {
+        if (mcp_debug) {
+            logDiag("MCP-APP-READ", "Rejected URI mapping for " + uri);
+        }
         error = "Invalid URI scheme mapping";
         return false;
     }
@@ -460,24 +464,38 @@ bool readMcpAppResource(const std::string& uri,
     cl.set_connection_timeout(1, 0); // 1s is plenty for localhost
     cl.set_read_timeout(2, 0);
 
+    if (mcp_debug) {
+        logDiag("MCP-APP-READ", "Fetching " + uri + " via " + path);
+    }
+
     const auto r = cl.Get(path.c_str());
     
     if (!r) { 
+        if (mcp_debug) {
+            logDiag("MCP-APP-READ", "Connection failed for " + uri);
+        }
         error = "mcp-apps connection failed at " + std::string(kMcpAppsHost); 
         return false; 
     }
 
     if (r->status != 200) {
+        if (mcp_debug) {
+            logDiag("MCP-APP-READ", "Non-200 for " + uri + ": " + std::to_string(r->status));
+        }
         error = "mcp-apps error: " + std::to_string(r->status);
         return false;
     }
 
-    // CRITICAL: This must match dashboard_tool.annotations.ui.resourceUri
+    // Echo back the caller URI; resource handlers currently publish their registered URI.
     canonical_uri = uri; 
     
     // Force HTML if we are proxying a Dashboard UI
     mime_type = contentTypeFromResponse(r, "text/html");
     content   = r->body;
+
+    if (mcp_debug) {
+        logDiag("MCP-APP-READ", "Success for " + uri + " mime=" + mime_type);
+    }
 
     return true;
 }
@@ -800,7 +818,7 @@ int main(int argc, char** argv) {
                 std::nullopt,
                 std::nullopt);
             server_config.serverInfo = mcp::lifecycle::session::Implementation("fastmcp_server", "0.3.0");
-            server_config.instructions = "Use tools for command execution and resources for plugin/app metadata. For dashboard UI, call open-dashboard-ui and then open app://dashboard-ui.";
+            server_config.instructions = "Use tools for command execution and resources for plugin/app metadata. For dashboard UI, call open-dashboard-ui and open http://localhost:6543/ in a browser.";
 
             auto mcp_server = mcp::server::Server::create(std::move(server_config));
 
@@ -942,7 +960,7 @@ int main(int argc, char** argv) {
 
             dashboard_tool.annotations = mcp::jsonrpc::JsonValue::object({
                 {"ui", mcp::jsonrpc::JsonValue::object({
-                    {"resourceUri", "app://dashboard-ui"}
+                    {"resourceUri", "http://localhost:6543/"}
                 })}
             });
             if (mcp_debug) {
@@ -960,7 +978,8 @@ int main(int argc, char** argv) {
                         {"status", "success"},
                         {"availability", "dashboard-ui available"},
                         {"message", "Dashboard UI available at http://localhost:6543/"},
-                        {"resourceUri", "app://dashboard-ui"}
+                        {"resourceUri", "app://dashboard-ui"},
+                        {"uiResourceUri", "http://localhost:6543/"}
                     };
 
                     result.structuredContent = toMcpJson(response);
@@ -970,9 +989,14 @@ int main(int argc, char** argv) {
                         "resource: app://dashboard-ui\n"
                         "url: http://localhost:6543/"));
                     result.content.push_back(makeResourceLinkContent(
-                        "app://dashboard-ui",
+                        "http://localhost:6543/",
                         "dashboard-ui",
                         "Dashboard UI",
+                        "text/html"));
+                    result.content.push_back(makeResourceLinkContent(
+                        "app://dashboard-ui",
+                        "dashboard-ui-resource",
+                        "Dashboard UI MCP Resource",
                         "text/html"));
                     result.content.push_back(makeTextContent(response.dump()));
                     result.isError = false;
