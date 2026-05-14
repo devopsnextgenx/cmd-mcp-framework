@@ -652,6 +652,7 @@ bool addRuntimeResource(std::vector<RuntimeResource>& resources,
 int main(int argc, char** argv) {
     ServerConfig config = parseArguments(argc, argv);
     const bool mcp_debug = envFlagEnabled("FASTMCP_MCP_DEBUG");
+    const bool require_session_id = envFlagEnabled("FASTMCP_REQUIRE_SESSION_ID");
 
     if (config.plugin_paths.empty())
         config.plugin_paths = getAllPluginsInLib(argv[0]);
@@ -1221,13 +1222,20 @@ int main(int argc, char** argv) {
         mcp_options.transportOptions.http.endpoint.bindLocalhostOnly = false;
         mcp_options.transportOptions.http.endpoint.port = static_cast<std::uint16_t>(config.port);
         mcp_options.transportOptions.http.endpoint.path = "/mcp";
-        mcp_options.transportOptions.http.requireSessionId = true;
+        mcp_options.transportOptions.http.requireSessionId = require_session_id;
 
         if (mcp_debug) {
-            logDiag("MCP-CONNECT",
-                "Streamable HTTP policy requireSessionId=true. "
-                "Clients must NOT send MCP-Session-Id on initialize; "
-                "server mints MCP-Session-Id on successful initialize response.");
+            if (require_session_id) {
+                logDiag("MCP-CONNECT",
+                    "Streamable HTTP policy requireSessionId=true (strict multi-session mode). "
+                    "Clients must NOT send MCP-Session-Id on initialize; "
+                    "server mints MCP-Session-Id on successful initialize response.");
+            } else {
+                logDiag("MCP-CONNECT",
+                    "Streamable HTTP policy requireSessionId=false (compat mode). "
+                    "All HTTP clients share one MCP session; this improves compatibility "
+                    "with proxies that do not replay MCP-Session-Id consistently.");
+            }
         }
 
         mcp_runner = std::make_unique<mcp::server::StreamableHttpServerRunner>(server_factory, mcp_options);
