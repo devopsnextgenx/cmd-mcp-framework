@@ -7,6 +7,8 @@ VCPKG_REPO_URL="${VCPKG_REPO_URL:-https://github.com/microsoft/vcpkg.git}"
 BUILD_DIR="${BUILD_DIR:-build}"
 VCPKG_MANIFEST_DIR="${VCPKG_MANIFEST_DIR:-$PWD}"
 JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}"
+VCPKG_UPDATE="${VCPKG_UPDATE:-0}"
+CLEAN_BUILD="${CLEAN_BUILD:-0}"
 
 require_cmd() {
 	if ! command -v "$1" >/dev/null 2>&1; then
@@ -32,8 +34,12 @@ prepare_vcpkg_repo() {
 		fi
 	fi
 
-	# Keep metadata current so baseline commits can be resolved.
-	git -C "$VCPKG_ROOT" fetch --tags --prune || true
+	if [ "$VCPKG_UPDATE" = "1" ]; then
+		echo "-- Updating vcpkg metadata (VCPKG_UPDATE=1)"
+		git -C "$VCPKG_ROOT" fetch --tags --prune || true
+	else
+		echo "-- Skipping vcpkg metadata update (set VCPKG_UPDATE=1 to refresh)"
+	fi
 }
 
 bootstrap_vcpkg() {
@@ -57,7 +63,10 @@ if [ ! -f "$CMAKE_TOOLCHAIN_FILE" ]; then
 	exit 1
 fi
 
-rm -rf "$BUILD_DIR"
+if [ "$CLEAN_BUILD" = "1" ]; then
+	echo "-- CLEAN_BUILD=1, removing $BUILD_DIR"
+	rm -rf "$BUILD_DIR"
+fi
 
 if command -v ninja >/dev/null 2>&1; then
 	echo "-- Configuring with Ninja generator"

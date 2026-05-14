@@ -38,6 +38,9 @@
 #include <csignal>
 #include <cstdint>
 #include <optional>
+#include <mutex>
+#include <iomanip>
+#include <cstdlib>
 
 // ── cpp-mcp-sdk ───────────────────────────────────────────────────────────
 #include <mcp/lifecycle/session/implementation.hpp>
@@ -84,6 +87,49 @@ struct ServerConfig {
 };
 
 std::atomic_bool gStopRequested{false};
+std::atomic_uint64_t gMcpServerInstanceCounter{0};
+std::mutex gLogMutex;
+
+std::string nowUtcIso8601() {
+    const auto now = std::chrono::system_clock::now();
+    const auto t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+#if defined(_WIN32)
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
+    return oss.str();
+}
+
+std::string safeSessionId(const std::optional<std::string>& session_id) {
+    return session_id.has_value() ? *session_id : "<none>";
+}
+
+void logDiag(const std::string& area, const std::string& message) {
+    std::lock_guard<std::mutex> lock(gLogMutex);
+    std::cout << "[" << nowUtcIso8601() << "] [" << area << "] " << message << '\n';
+}
+
+void logRequestContext(const std::string& area,
+                       const mcp::jsonrpc::RequestContext& request_context,
+                       const std::string& method_or_target) {
+    logDiag(area,
+            method_or_target +
+            " session=" + safeSessionId(request_context.sessionId) +
+            " protocol=" + request_context.protocolVersion);
+}
+
+bool envFlagEnabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (!value) return false;
+    std::string v = value;
+    std::transform(v.begin(), v.end(), v.begin(),
+                   [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+    return !(v == "0" || v == "false" || v == "off" || v == "no");
+}
 
 void handleSignal(int) {
     gStopRequested.store(true);
@@ -518,6 +564,7 @@ struct RuntimeResource {
 // ===========================================================================
 int main(int argc, char** argv) {
     ServerConfig config = parseArguments(argc, argv);
+    const bool mcp_debug = envFlagEnabled("FASTMCP_MCP_DEBUG");
 
     if (config.plugin_paths.empty())
         config.plugin_paths = getAllPluginsInLib(argv[0]);
@@ -651,7 +698,20 @@ int main(int argc, char** argv) {
         });
     }
 
-    auto createConfiguredMcpServer = [&registry, &resources]() {
+    auto createConfiguredMcpServer = [&registry, &resources, mcp_debug]() {
+        const auto server_instance_id = ++gMcpServerInstanceCounter;
+        if (mcp_debug) {
+            logDiag("MCP-CONNECT",
+                    "Creating MCP server instance #" + std::to_string(server_instance_id) +
+                    " (new initialize attempt/session)");
+        }
+
+        const mcp::ErrorReporter sdk_error_reporter = [mcp_debug](const mcp::ErrorEvent& event) {
+            if (!mcp_debug) return;
+            logDiag("MCP-SDK-ERROR",
+                    std::string(event.component()) + ": " + std::string(event.message()));
+        };
+
         mcp::lifecycle::session::ToolsCapability tools_capability;
         tools_capability.listChanged = true;
 
@@ -659,6 +719,7 @@ int main(int argc, char** argv) {
         resources_capability.listChanged = true;
 
         mcp::server::ServerConfiguration server_config;
+        server_config.sessionOptions.errorReporter = sdk_error_reporter;
         server_config.capabilities = mcp::lifecycle::session::ServerCapabilities(
             std::nullopt,
             std::nullopt,
@@ -727,32 +788,43 @@ int main(int argc, char** argv) {
 
             mcp_server->registerTool(
                 std::move(tool),
-                [&registry, cmd_name = meta.cmd_name](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult {
-                    const json args = fromMcpJson(context.arguments);
+                    [&registry, cmd_name = meta.cmd_name, mcp_debug](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult {
+                        try {
+                            if (mcp_debug) {
+                                logRequestContext("MCP-TOOL-CALL", context.requestContext, "tool=" + cmd_name);
+                            }
 
-                    auto command = registry.create(cmd_name);
-                    if (!command)
-                        throw std::runtime_error("Tool not found: " + cmd_name);
+                            const json args = fromMcpJson(context.arguments);
 
-                    std::string error;
-                    if (!command->validate(args, error))
-                        throw std::invalid_argument("Validation failed: " + error);
-                    if (!command->execute(args, error))
-                        throw std::runtime_error("Execution failed: " + error);
+                            auto command = registry.create(cmd_name);
+                            if (!command)
+                                throw std::runtime_error("Tool not found: " + cmd_name);
 
-                    const json raw = command->getResult();
-                    json structured = raw.is_object() ? raw : json{{"result", raw}};
-                    if (args.contains("subType") && args["subType"].is_string())
-                        structured["subTypeExecuted"] = args["subType"].get<std::string>();
+                            std::string error;
+                            if (!command->validate(args, error))
+                                throw std::invalid_argument("Validation failed: " + error);
+                            if (!command->execute(args, error))
+                                throw std::runtime_error("Execution failed: " + error);
 
-                    std::cout << "[tools/call] " << cmd_name << " -> " << raw.dump() << '\n';
+                            const json raw = command->getResult();
+                            json structured = raw.is_object() ? raw : json{{"result", raw}};
+                            if (args.contains("subType") && args["subType"].is_string())
+                                structured["subTypeExecuted"] = args["subType"].get<std::string>();
 
-                    mcp::server::CallToolResult result;
-                    result.structuredContent = toMcpJson(structured);
-                    result.content = McpJson::array();
-                    result.content.push_back(makeTextContent(raw.dump()));
-                    result.isError = false;
-                    return result;
+                            std::cout << "[tools/call] " << cmd_name << " -> " << raw.dump() << '\n';
+
+                            mcp::server::CallToolResult result;
+                            result.structuredContent = toMcpJson(structured);
+                            result.content = McpJson::array();
+                            result.content.push_back(makeTextContent(raw.dump()));
+                            result.isError = false;
+                            return result;
+                        } catch (const std::exception& e) {
+                            if (mcp_debug) {
+                                logDiag("MCP-TOOL-ERROR", cmd_name + " failed: " + e.what());
+                            }
+                            throw;
+                        }
                 });
         }
 
@@ -776,7 +848,10 @@ int main(int argc, char** argv) {
         });
         mcp_server->registerTool(
             std::move(dashboard_tool),
-            [](const mcp::server::ToolCallContext& ctx) -> mcp::server::CallToolResult {
+            [mcp_debug](const mcp::server::ToolCallContext& ctx) -> mcp::server::CallToolResult {
+                if (mcp_debug) {
+                    logRequestContext("MCP-TOOL-CALL", ctx.requestContext, "tool=open-dashboard-ui");
+                }
                 mcp::server::CallToolResult result;
                 
                 const json response = {
@@ -813,7 +888,10 @@ int main(int argc, char** argv) {
 
             mcp_server->registerResource(
                 std::move(definition),
-                [resource](const mcp::server::ResourceReadContext& ctx) -> std::vector<mcp::server::ResourceContent> {
+                [resource, mcp_debug](const mcp::server::ResourceReadContext& ctx) -> std::vector<mcp::server::ResourceContent> {
+                    if (mcp_debug) {
+                        logRequestContext("MCP-RESOURCE-READ", ctx.requestContext, "uri=" + resource.uri);
+                    }
                     // This lambda executes when the inspector "opens" the app
                     std::string content = resource.body_provider(); 
                     
@@ -991,11 +1069,23 @@ int main(int argc, char** argv) {
         };
 
         mcp::server::StreamableHttpServerRunnerOptions mcp_options;
+        mcp_options.transportOptions.http.errorReporter = [mcp_debug](const mcp::ErrorEvent& event) {
+            if (!mcp_debug) return;
+            logDiag("MCP-HTTP-ERROR",
+                std::string(event.component()) + ": " + std::string(event.message()));
+        };
         mcp_options.transportOptions.http.endpoint.bindAddress = "0.0.0.0";
         mcp_options.transportOptions.http.endpoint.bindLocalhostOnly = false;
         mcp_options.transportOptions.http.endpoint.port = static_cast<std::uint16_t>(config.port);
         mcp_options.transportOptions.http.endpoint.path = "/mcp";
         mcp_options.transportOptions.http.requireSessionId = true;
+
+        if (mcp_debug) {
+            logDiag("MCP-CONNECT",
+                "Streamable HTTP policy requireSessionId=true. "
+                "Clients must NOT send MCP-Session-Id on initialize; "
+                "server mints MCP-Session-Id on successful initialize response.");
+        }
 
         mcp_runner = std::make_unique<mcp::server::StreamableHttpServerRunner>(server_factory, mcp_options);
         mcp_runner->start();
