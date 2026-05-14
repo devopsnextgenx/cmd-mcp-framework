@@ -184,7 +184,7 @@ namespace {
             .description = description,
             .inputSchema = toMcpJson(input_schema),
         };
-        
+        return true;
     }
     
     bool registerToolWithUI(
@@ -195,8 +195,8 @@ namespace {
         const std::string& resourceFileName,
         const json& input_schema,
         const std::function<mcp::server::CallToolResult(const json&)>& handler) {
-        // const resourceUri = `ui://${name}/${resourceFileName}`;
         const std::string resourceUri = "ui://" + toolName + "/" + resourceFileName;
+        return true;
     }
 
     // ── small string helpers ──────────────────────────────────────────────────
