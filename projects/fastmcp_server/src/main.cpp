@@ -873,10 +873,11 @@ int main(int argc, char** argv) {
 
                 mcp::server::ToolDefinition tool;
                 tool.name = tool_name;
-                tool.description = full_desc;
+                std::string tool_description = full_desc;
                 if (tool_name != original_cmd_name) {
-                    tool.description += " [original: " + original_cmd_name + "]";
+                    tool_description += " [original: " + original_cmd_name + "]";
                 }
+                tool.description = std::move(tool_description);
                 tool.inputSchema = toMcpJson(input_schema);
 
                 if (mcp_debug) {
