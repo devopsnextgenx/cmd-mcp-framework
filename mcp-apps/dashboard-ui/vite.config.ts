@@ -1,38 +1,32 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import { viteSingleFile } from 'vite-plugin-singlefile';
 
-const dashboardResource = {
-  timestamp: new Date().toISOString(),
-  status: 'idle',
-  metrics: {
-    requestCount: 0,
-    errorCount: 0,
-  },
-  ui: {
-    activePanel: 'home',
-  },
-};
+// When INPUT is set, build-ui.mjs drives a single-file bundle for that HTML entry.
+const INPUT = process.env.INPUT;
 
 const resourceManifest = {
   resources: [
     {
-      uri: 'app://dashboard-ui',
-      name: 'Dashboard UI',
-      description: 'Dashboard UI shell with command and resource inspection',
+      uri: 'app://math-form',
+      name: 'Math Form UI',
+      description: 'Math operation form with subtype enum and two numeric inputs',
       mimeType: 'text/html',
       _meta: {
         ui: {
-          resourceUri: 'http://localhost:6543/',
+          resourceUri: 'http://localhost:6543/ui/math-form.html',
         },
       },
     },
     {
-      uri: 'http://localhost:6543/dashboard-state',
-      name: 'Dashboard UI State',
-      description: 'Live dashboard UI state exposed as an MCP resource',
-      mimeType: 'application/json',
+      uri: 'http://localhost:6543/ui/math-form.html',
+      name: 'Math Calculator Form',
+      description: 'Math calculator form UI for arithmetic operations via MCP tool',
+      mimeType: 'text/html',
       _meta: {
-        source: 'dashboard-ui',
+        ui: {
+          resourceUri: 'http://localhost:6543/ui/math-form.html',
+        },
       },
     },
   ],
@@ -53,54 +47,38 @@ const mcpMiddlewarePlugin = {
         return;
       }
 
-      if (req.url === '/dashboard-state') {
-        if (req.method === 'GET') {
-          dashboardResource.metrics.requestCount += 1;
-          res.setHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify(dashboardResource, null, 2));
-          return;
-        }
-
-        if (req.method === 'POST') {
-          let body = '';
-          req.on('data', (chunk) => {
-            body += chunk;
-          });
-          req.on('end', () => {
-            try {
-              const payload = JSON.parse(body || '{}');
-              Object.assign(dashboardResource, payload, {
-                timestamp: new Date().toISOString(),
-              });
-              res.setHeader('Content-Type', 'application/json');
-              res.end(JSON.stringify({ ok: true, state: dashboardResource }, null, 2));
-            } catch (error) {
-              dashboardResource.metrics.errorCount += 1;
-              res.statusCode = 400;
-              res.end(JSON.stringify({ error: 'Invalid JSON body' }, null, 2));
-            }
-          });
-          return;
-        }
-      }
-
       next();
     });
   },
 };
 
-export default defineConfig({
-  plugins: [react(), mcpMiddlewarePlugin],
-  base: './',
-  build: {
-    outDir: 'dist',
-    assetsDir: 'assets',
-    minify: 'esbuild',
-    sourcemap: false,
-  },
-  server: {
-    cors: true,
-    port: 6543,
-    strictPort: true,
-  },
-});
+export default defineConfig(
+  INPUT
+    ? // ── Single-file build mode (invoked by build-ui.mjs with INPUT env var) ──
+      {
+        plugins: [react(), viteSingleFile()],
+        build: {
+          rollupOptions: { input: INPUT },
+          outDir: 'dist/ui',
+          emptyOutDir: false,
+          minify: true,
+          sourcemap: false,
+        },
+      }
+    : // ── Normal dashboard dev/build mode ───────────────────────────────────
+      {
+        plugins: [react(), mcpMiddlewarePlugin],
+        base: './',
+        build: {
+          outDir: 'dist',
+          assetsDir: 'assets',
+          minify: 'esbuild',
+          sourcemap: false,
+        },
+        server: {
+          cors: true,
+          port: 6543,
+          strictPort: true,
+        },
+      },
+);

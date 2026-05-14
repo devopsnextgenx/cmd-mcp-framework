@@ -1,4 +1,4 @@
-// ---------------------------------------------------------------------------
+﻿// ---------------------------------------------------------------------------
 // fastmcp_server/src/main.cpp
 //
 // MCP protocol layer  → cpp-mcp-sdk (itcv-GmbH/cpp-mcp-sdk, C++17)
@@ -377,6 +377,7 @@ std::vector<std::filesystem::path> getAllPluginsInLib(const char* argv0) {
 // ── mcp-apps reverse-proxy helpers ────────────────────────────────────────
 constexpr const char* kMcpAppsHost = "localhost";
 constexpr int         kMcpAppsPort = 6543;
+constexpr const char* kMathFormPath = "/ui/math-form.html";
 
 std::string contentTypeFromResponse(const httplib::Result& r, const std::string& fb) {
     if (!r || !r->has_header("Content-Type")) return fb;
@@ -387,6 +388,7 @@ std::string contentTypeFromResponse(const httplib::Result& r, const std::string&
 
 bool uriToMcpAppsPath(const std::string& uri, std::string& path) {
     if (uri.empty()) return false;
+    if (uri == "app://math-form") { path = kMathFormPath; return true; }
     if (uri == "app://dashboard-ui") { path = "/"; return true; }
     if (beginsWith(uri, "app://")) {
         const std::string s = uri.substr(6);
@@ -406,6 +408,7 @@ bool uriToMcpAppsPath(const std::string& uri, std::string& path) {
 std::string toMcpAppUri(const std::string& uri) {
     std::string path;
     if (!uriToMcpAppsPath(uri, path)) return uri;
+    if (path == kMathFormPath) return "app://math-form";
     return (path == "/") ? "app://dashboard-ui" : "app://" + path.substr(1);
 }
 
@@ -753,22 +756,22 @@ int main(int argc, char** argv) {
         "text/markdown",
         []() {
             std::string doc = "# Available MCP Apps\n\n";
-            doc += "Dashboard: [app://dashboard-ui](app://dashboard-ui)\n\n";
-            doc += "Access the dashboard at http://localhost:6543/\n";
+            doc += "Math Form: [app://math-form](app://math-form)\n\n";
+            doc += "Access the form at http://localhost:6543/ui/math-form.html\n";
             return doc;
         }
     }, mcp_debug);
 
     addRuntimeResource(resources, seen_resource_uris, RuntimeResource{
-        "app://dashboard-ui",
-        "dashboard-ui",
-        "Dashboard HTML proxied from local mcp-apps server",
+        "app://math-form",
+        "math-form",
+        "Math form HTML proxied from local mcp-apps server",
         "text/html",
         []() {
             std::string canon, mime, body, err;
-            if (readMcpAppResource("app://dashboard-ui", canon, mime, body, err))
+            if (readMcpAppResource("app://math-form", canon, mime, body, err))
                 return body;
-            return std::string("<h1>Dashboard</h1><p>mcp-apps not reachable at localhost:6543</p>");
+            return std::string("<h1>Math Form</h1><p>mcp-apps not reachable at localhost:6543</p>");
         }
     }, mcp_debug);
 
@@ -819,12 +822,13 @@ int main(int argc, char** argv) {
                 std::nullopt,
                 std::nullopt);
             server_config.serverInfo = mcp::lifecycle::session::Implementation("fastmcp_server", "0.3.0");
-            server_config.instructions = "Use tools for command execution and resources for plugin/app metadata. For dashboard UI, call open-dashboard-ui and open http://localhost:6543/ in a browser.";
+            server_config.instructions = "Use tools for command execution and resources for plugin/app metadata. For the math form UI, call open-math-form and open http://localhost:6543/ui/math-form.html in a browser.";
 
             auto mcp_server = mcp::server::Server::create(std::move(server_config));
 
             std::set<std::string> used_tool_names;
             std::map<std::string, int> tool_name_suffixes;
+            std::map<std::string, std::string> command_tool_names;
 
             for (const auto& meta : registry.listMetadata()) {
             std::string subtype_list;
@@ -889,6 +893,7 @@ int main(int argc, char** argv) {
                     tool_name = tool_name + "_" + std::to_string(suffix);
                 }
                 used_tool_names.insert(tool_name);
+                command_tool_names[original_cmd_name] = tool_name;
 
                 mcp::server::ToolDefinition tool;
                 tool.name = tool_name;
@@ -948,56 +953,81 @@ int main(int argc, char** argv) {
                     });
             }
 
-            mcp::server::ToolDefinition dashboard_tool;
-            dashboard_tool.name = "open-dashboard-ui";
-            dashboard_tool.description = "Open the dashboard UI and confirm dashboard-ui availability";
+            std::vector<std::string> math_subtypes;
+            std::map<std::string, std::string> math_labels;
+            for (const auto& meta : registry.listMetadata()) {
+                const auto plugin_name = resolvePluginName(meta);
+                const bool is_math_command =
+                    (meta.cmd_name == "math.calculate") ||
+                    (toUpperAscii(plugin_name) == "MATH");
+                if (!is_math_command || meta.sub_cmd_types.empty()) continue;
 
-            json dashboard_schema = {
+                for (const auto& st : meta.sub_cmd_types) {
+                    math_subtypes.push_back(st.sub_type_name);
+                    math_labels[st.sub_type_name] = st.description;
+                }
+                break;
+            }
+
+            std::string math_tool_name = "math_calculate";
+            if (const auto it = command_tool_names.find("math.calculate"); it != command_tool_names.end()) {
+                math_tool_name = it->second;
+            }
+
+            mcp::server::ToolDefinition math_form_tool;
+            math_form_tool.name = "open-math-form";
+            math_form_tool.description = "Open a math form UI and configure operation subtypes for the math MCP tool.";
+
+            json math_form_schema = {
                 {"type", "object"},
                 {"properties", json::object()},
                 {"required", json::array()}
             };
-            dashboard_tool.inputSchema = toMcpJson(dashboard_schema);
+            math_form_tool.inputSchema = toMcpJson(math_form_schema);
 
-            dashboard_tool.annotations = mcp::jsonrpc::JsonValue::object({
+            math_form_tool.annotations = mcp::jsonrpc::JsonValue::object({
                 {"ui", mcp::jsonrpc::JsonValue::object({
-                    {"resourceUri", "http://localhost:6543/"}
+                    {"resourceUri", "http://localhost:6543/ui/math-form.html"}
                 })}
             });
             if (mcp_debug) {
-                logDiag("MCP-REGISTER", "Registering tool open-dashboard-ui");
+                logDiag("MCP-REGISTER", "Registering tool open-math-form");
             }
             mcp_server->registerTool(
-                std::move(dashboard_tool),
-                [mcp_debug](const mcp::server::ToolCallContext& ctx) -> mcp::server::CallToolResult {
+                std::move(math_form_tool),
+                [mcp_debug, math_subtypes, math_labels, math_tool_name](const mcp::server::ToolCallContext& ctx) -> mcp::server::CallToolResult {
                     if (mcp_debug) {
-                        logRequestContext("MCP-TOOL-CALL", ctx.requestContext, "tool=open-dashboard-ui");
+                        logRequestContext("MCP-TOOL-CALL", ctx.requestContext, "tool=open-math-form");
                     }
                     mcp::server::CallToolResult result;
 
                     const json response = {
                         {"status", "success"},
-                        {"availability", "dashboard-ui available"},
-                        {"message", "Dashboard UI available at http://localhost:6543/"},
-                        {"resourceUri", "app://dashboard-ui"},
-                        {"uiResourceUri", "http://localhost:6543/"}
+                        {"availability", "math-form available"},
+                        {"message", "Math form UI available at http://localhost:6543/ui/math-form.html"},
+                        {"resourceUri", "app://math-form"},
+                        {"uiResourceUri", "http://localhost:6543/ui/math-form.html"},
+                        {"toolName", math_tool_name},
+                        {"subTypes", math_subtypes},
+                        {"labels", math_labels}
                     };
 
                     result.structuredContent = toMcpJson(response);
                     result.content = McpJson::array();
                     result.content.push_back(makeTextContent(
-                        "dashboard-ui available\n"
-                        "resource: app://dashboard-ui\n"
-                        "url: http://localhost:6543/"));
+                        "math-form available\n"
+                        "resource: app://math-form\n"
+                        "url: http://localhost:6543/ui/math-form.html\n"
+                        "tool: " + math_tool_name));
                     result.content.push_back(makeResourceLinkContent(
-                        "http://localhost:6543/",
-                        "dashboard-ui",
-                        "Dashboard UI",
+                        "http://localhost:6543/ui/math-form.html",
+                        "math-form-ui",
+                        "Math Form UI",
                         "text/html"));
                     result.content.push_back(makeResourceLinkContent(
-                        "app://dashboard-ui",
-                        "dashboard-ui-resource",
-                        "Dashboard UI MCP Resource",
+                        "app://math-form",
+                        "math-form-resource",
+                        "Math Form MCP Resource",
                         "text/html"));
                     result.content.push_back(makeTextContent(response.dump()));
                     result.isError = false;
