@@ -984,11 +984,18 @@ int main(int argc, char** argv) {
                 {"required", json::array()}
             };
             math_form_tool.inputSchema = toMcpJson(math_form_schema);
-
             math_form_tool.annotations = mcp::jsonrpc::JsonValue::object({
-                {"ui", mcp::jsonrpc::JsonValue::object({
+                {"readOnlyHint", true}
+            });
+            math_form_tool.metadata = mcp::jsonrpc::JsonValue::object({
+                {
+                    "ui", mcp::jsonrpc::JsonValue::object({
                     {"resourceUri", "http://localhost:6543/ui/math-form.html"}
-                })}
+                    })
+                },
+                {
+                    "ui/resourceUri", "http://localhost:6543/ui/math-form.html"
+                }
             });
             if (mcp_debug) {
                 logDiag("MCP-REGISTER", "Registering tool open-math-form");
