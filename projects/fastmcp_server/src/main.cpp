@@ -113,6 +113,16 @@ void logDiag(const std::string& area, const std::string& message) {
     std::cout << "[" << nowUtcIso8601() << "] [" << area << "] " << message << '\n';
 }
 
+std::string currentExceptionMessage() {
+    try {
+        throw;
+    } catch (const std::exception& ex) {
+        return ex.what();
+    } catch (...) {
+        return "non-std exception";
+    }
+}
+
 void logRequestContext(const std::string& area,
                        const mcp::jsonrpc::RequestContext& request_context,
                        const std::string& method_or_target) {
@@ -557,6 +567,21 @@ struct RuntimeResource {
     std::function<std::string()> body_provider;
 };
 
+bool addRuntimeResource(std::vector<RuntimeResource>& resources,
+                        std::set<std::string>& seen_resource_uris,
+                        RuntimeResource resource,
+                        bool mcp_debug) {
+    if (!seen_resource_uris.insert(resource.uri).second) {
+        if (mcp_debug) {
+            logDiag("MCP-RESOURCE", "Skipping duplicate resource URI " + resource.uri);
+        }
+        return false;
+    }
+
+    resources.push_back(std::move(resource));
+    return true;
+}
+
 } // namespace
 
 // ===========================================================================
@@ -631,18 +656,19 @@ int main(int argc, char** argv) {
 
     // ── Build MCP resources (plugins + apps) ─────────────────────────────
     std::vector<RuntimeResource> resources;
-    resources.push_back(RuntimeResource{
+    std::set<std::string> seen_resource_uris;
+    addRuntimeResource(resources, seen_resource_uris, RuntimeResource{
         "plugins://overview",
         "plugins-overview",
         "Available plugins and subtype docs",
         "text/markdown",
         [&plugins]() { return buildPluginsMarkdown(plugins); }
-    });
+    }, mcp_debug);
 
     for (const auto& [pname, _] : plugins) {
         const auto rname = canonicalResourceName(pname);
         const auto uri = "plugin://" + rname;
-        resources.push_back(RuntimeResource{
+        addRuntimeResource(resources, seen_resource_uris, RuntimeResource{
             uri,
             rname,
             "Plugin details for " + pname,
@@ -653,11 +679,11 @@ int main(int argc, char** argv) {
                 if (!pi) return std::string("Plugin not found: " + pname);
                 return buildPluginDetailsMarkdown(resolved, *pi);
             }
-        });
+        }, mcp_debug);
     }
 
     // Add apps overview resource
-    resources.push_back(RuntimeResource{
+    addRuntimeResource(resources, seen_resource_uris, RuntimeResource{
         "apps://overview",
         "apps-overview",
         "Available MCP apps and UI resources from local mcp-apps service",
@@ -668,9 +694,9 @@ int main(int argc, char** argv) {
             doc += "Access the dashboard at http://localhost:6543/\n";
             return doc;
         }
-    });
+    }, mcp_debug);
 
-    resources.push_back(RuntimeResource{
+    addRuntimeResource(resources, seen_resource_uris, RuntimeResource{
         "app://dashboard-ui",
         "dashboard-ui",
         "Dashboard HTML proxied from local mcp-apps server",
@@ -681,10 +707,10 @@ int main(int argc, char** argv) {
                 return body;
             return std::string("<h1>Dashboard</h1><p>mcp-apps not reachable at localhost:6543</p>");
         }
-    });
+    }, mcp_debug);
 
     for (const auto& ext : fetchExternalAppResources()) {
-        resources.push_back(RuntimeResource{
+        addRuntimeResource(resources, seen_resource_uris, RuntimeResource{
             ext.uri,
             ext.name,
             ext.description,
@@ -695,7 +721,7 @@ int main(int argc, char** argv) {
                     return body;
                 return std::string("Error: " + err);
             }
-        });
+        }, mcp_debug);
     }
 
     auto createConfiguredMcpServer = [&registry, &resources, mcp_debug]() {
@@ -706,34 +732,35 @@ int main(int argc, char** argv) {
                     " (new initialize attempt/session)");
         }
 
-        const mcp::ErrorReporter sdk_error_reporter = [mcp_debug](const mcp::ErrorEvent& event) {
-            if (!mcp_debug) return;
-            logDiag("MCP-SDK-ERROR",
-                    std::string(event.component()) + ": " + std::string(event.message()));
-        };
+        try {
+            const mcp::ErrorReporter sdk_error_reporter = [mcp_debug](const mcp::ErrorEvent& event) {
+                if (!mcp_debug) return;
+                logDiag("MCP-SDK-ERROR",
+                        std::string(event.component()) + ": " + std::string(event.message()));
+            };
 
-        mcp::lifecycle::session::ToolsCapability tools_capability;
-        tools_capability.listChanged = true;
+            mcp::lifecycle::session::ToolsCapability tools_capability;
+            tools_capability.listChanged = true;
 
-        mcp::lifecycle::session::ResourcesCapability resources_capability;
-        resources_capability.listChanged = true;
+            mcp::lifecycle::session::ResourcesCapability resources_capability;
+            resources_capability.listChanged = true;
 
-        mcp::server::ServerConfiguration server_config;
-        server_config.sessionOptions.errorReporter = sdk_error_reporter;
-        server_config.capabilities = mcp::lifecycle::session::ServerCapabilities(
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            resources_capability,
-            tools_capability,
-            std::nullopt,
-            std::nullopt);
-        server_config.serverInfo = mcp::lifecycle::session::Implementation("fastmcp_server", "0.3.0");
-        server_config.instructions = "Use tools for command execution and resources for plugin/app metadata.";
+            mcp::server::ServerConfiguration server_config;
+            server_config.sessionOptions.errorReporter = sdk_error_reporter;
+            server_config.capabilities = mcp::lifecycle::session::ServerCapabilities(
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                resources_capability,
+                tools_capability,
+                std::nullopt,
+                std::nullopt);
+            server_config.serverInfo = mcp::lifecycle::session::Implementation("fastmcp_server", "0.3.0");
+            server_config.instructions = "Use tools for command execution and resources for plugin/app metadata.";
 
-        auto mcp_server = mcp::server::Server::create(std::move(server_config));
+            auto mcp_server = mcp::server::Server::create(std::move(server_config));
 
-        for (const auto& meta : registry.listMetadata()) {
+            for (const auto& meta : registry.listMetadata()) {
             std::string subtype_list;
             for (const auto& st : meta.sub_cmd_types) {
                 if (!subtype_list.empty()) subtype_list += ", ";
@@ -781,14 +808,18 @@ int main(int argc, char** argv) {
             if (!required.empty())
                 input_schema["required"] = required;
 
-            mcp::server::ToolDefinition tool;
-            tool.name = meta.cmd_name;
-            tool.description = full_desc;
-            tool.inputSchema = toMcpJson(input_schema);
+                mcp::server::ToolDefinition tool;
+                tool.name = meta.cmd_name;
+                tool.description = full_desc;
+                tool.inputSchema = toMcpJson(input_schema);
 
-            mcp_server->registerTool(
-                std::move(tool),
-                    [&registry, cmd_name = meta.cmd_name, mcp_debug](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult {
+                if (mcp_debug) {
+                    logDiag("MCP-REGISTER", "Registering tool " + meta.cmd_name);
+                }
+
+                mcp_server->registerTool(
+                    std::move(tool),
+                        [&registry, cmd_name = meta.cmd_name, mcp_debug](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult {
                         try {
                             if (mcp_debug) {
                                 logRequestContext("MCP-TOOL-CALL", context.requestContext, "tool=" + cmd_name);
@@ -825,86 +856,91 @@ int main(int argc, char** argv) {
                             }
                             throw;
                         }
-                });
-        }
+                    });
+            }
 
-        mcp::server::ToolDefinition dashboard_tool;
-        dashboard_tool.name = "open-dashboard-ui";
-        dashboard_tool.description = "Open the dashboard UI";
+            mcp::server::ToolDefinition dashboard_tool;
+            dashboard_tool.name = "open-dashboard-ui";
+            dashboard_tool.description = "Open the dashboard UI";
 
-        // Use toMcpJson for the schema as you were doing
-        json dashboard_schema = {
-            {"type", "object"},
-            {"properties", json::object()},
-            {"required", json::array()}
-        };
-        dashboard_tool.inputSchema = toMcpJson(dashboard_schema);
+            json dashboard_schema = {
+                {"type", "object"},
+                {"properties", json::object()},
+                {"required", json::array()}
+            };
+            dashboard_tool.inputSchema = toMcpJson(dashboard_schema);
 
-        // FIX: Use mcp::jsonrpc::JsonValue and the explicit object constructor
-        dashboard_tool.annotations = mcp::jsonrpc::JsonValue::object({
-            {"ui", mcp::jsonrpc::JsonValue::object({
-                {"resourceUri", "app://dashboard-ui"}
-            })}
-        });
-        mcp_server->registerTool(
-            std::move(dashboard_tool),
-            [mcp_debug](const mcp::server::ToolCallContext& ctx) -> mcp::server::CallToolResult {
-                if (mcp_debug) {
-                    logRequestContext("MCP-TOOL-CALL", ctx.requestContext, "tool=open-dashboard-ui");
-                }
-                mcp::server::CallToolResult result;
-                
-                const json response = {
-                    {"status", "success"},
-                    {"message", "Dashboard UI available at http://localhost:6543/"}
-                };
-
-                // FIX: Use the local makeTextContent and wrap in a vector/array properly
-                // Your SDK expects result.content to be a specific container type
-                result.content.push_back(makeTextContent(response.dump()));
-
-                // FIX: Since result.annotations doesn't exist, use result.metadata 
-                // if you want the tool response to also signal the UI.
-                // If your SDK doesn't support metadata in result, omit this.
-                // result.metadata = ... (only if the struct has this member)
-
-                result.isError = false;
-                return result;
+            dashboard_tool.annotations = mcp::jsonrpc::JsonValue::object({
+                {"ui", mcp::jsonrpc::JsonValue::object({
+                    {"resourceUri", "app://dashboard-ui"}
+                })}
             });
-
-        mcp::server::ResourceTemplateDefinition app_template;
-        app_template.uriTemplate = "app://{path}";
-        app_template.name = "app-resource-template";
-        app_template.description = "Template URI for resources exposed by local mcp-apps service";
-        app_template.mimeType = "text/plain";
-        mcp_server->registerResourceTemplate(std::move(app_template));
-
-        for (const auto& resource : resources) {
-            mcp::server::ResourceDefinition definition;
-            definition.uri = resource.uri;
-            definition.name = resource.name;
-            definition.description = resource.description;
-            definition.mimeType = "text/html"; // CRITICAL: Must be html for App rendering
-
-            mcp_server->registerResource(
-                std::move(definition),
-                [resource, mcp_debug](const mcp::server::ResourceReadContext& ctx) -> std::vector<mcp::server::ResourceContent> {
+            if (mcp_debug) {
+                logDiag("MCP-REGISTER", "Registering tool open-dashboard-ui");
+            }
+            mcp_server->registerTool(
+                std::move(dashboard_tool),
+                [mcp_debug](const mcp::server::ToolCallContext& ctx) -> mcp::server::CallToolResult {
                     if (mcp_debug) {
-                        logRequestContext("MCP-RESOURCE-READ", ctx.requestContext, "uri=" + resource.uri);
+                        logRequestContext("MCP-TOOL-CALL", ctx.requestContext, "tool=open-dashboard-ui");
                     }
-                    // This lambda executes when the inspector "opens" the app
-                    std::string content = resource.body_provider(); 
-                    
-                    auto item = mcp::server::ResourceContent::text(
-                        resource.uri, 
-                        content, 
-                        "text/html"
-                    );
-                    return { item };
-                });
-        }
+                    mcp::server::CallToolResult result;
 
-        return mcp_server;
+                    const json response = {
+                        {"status", "success"},
+                        {"message", "Dashboard UI available at http://localhost:6543/"}
+                    };
+
+                    result.content.push_back(makeTextContent(response.dump()));
+                    result.isError = false;
+                    return result;
+                });
+
+            mcp::server::ResourceTemplateDefinition app_template;
+            app_template.uriTemplate = "app://{path}";
+            app_template.name = "app-resource-template";
+            app_template.description = "Template URI for resources exposed by local mcp-apps service";
+            app_template.mimeType = "text/plain";
+            if (mcp_debug) {
+                logDiag("MCP-REGISTER", "Registering resource template app://{path}");
+            }
+            mcp_server->registerResourceTemplate(std::move(app_template));
+
+            for (const auto& resource : resources) {
+                mcp::server::ResourceDefinition definition;
+                definition.uri = resource.uri;
+                definition.name = resource.name;
+                definition.description = resource.description;
+                definition.mimeType = "text/html";
+
+                if (mcp_debug) {
+                    logDiag("MCP-REGISTER", "Registering resource " + resource.uri);
+                }
+
+                mcp_server->registerResource(
+                    std::move(definition),
+                    [resource, mcp_debug](const mcp::server::ResourceReadContext& ctx) -> std::vector<mcp::server::ResourceContent> {
+                        if (mcp_debug) {
+                            logRequestContext("MCP-RESOURCE-READ", ctx.requestContext, "uri=" + resource.uri);
+                        }
+                        std::string content = resource.body_provider();
+
+                        auto item = mcp::server::ResourceContent::text(
+                            resource.uri,
+                            content,
+                            "text/html"
+                        );
+                        return { item };
+                    });
+            }
+
+            return mcp_server;
+        } catch (...) {
+            logDiag("MCP-CONNECT",
+                    "Failed to construct MCP server instance #" + std::to_string(server_instance_id) +
+                    ": " + currentExceptionMessage());
+            throw;
+        }
     };
 
     // =========================================================================
