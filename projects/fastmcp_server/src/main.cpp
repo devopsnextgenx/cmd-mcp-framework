@@ -739,25 +739,41 @@ int main(int argc, char** argv) {
 
         mcp::server::ToolDefinition dashboard_tool;
         dashboard_tool.name = "open-dashboard-ui";
-        dashboard_tool.description = "Open or invoke the dashboard UI from mcp-apps at localhost:6543";
+        dashboard_tool.description = "Open the dashboard UI";
+
+        // Use toMcpJson for the schema as you were doing
         json dashboard_schema = {
             {"type", "object"},
-            {"properties", json::object()}
+            {"properties", json::object()},
+            {"required", json::array()}
         };
         dashboard_tool.inputSchema = toMcpJson(dashboard_schema);
+
+        // FIX: Use mcp::jsonrpc::JsonValue and the explicit object constructor
+        dashboard_tool.annotations = mcp::jsonrpc::JsonValue::object({
+            {"ui", mcp::jsonrpc::JsonValue::object({
+                {"resourceUri", "app://dashboard-ui"}
+            })}
+        });
         mcp_server->registerTool(
             std::move(dashboard_tool),
-            [](const mcp::server::ToolCallContext&) -> mcp::server::CallToolResult {
-                std::cout << "[tools/call] open-dashboard-ui\n";
+            [](const mcp::server::ToolCallContext& ctx) -> mcp::server::CallToolResult {
                 mcp::server::CallToolResult result;
+                
                 const json response = {
                     {"status", "success"},
-                    {"message", "Dashboard UI available at http://localhost:6543/"},
-                    {"url", "app://dashboard-ui"}
+                    {"message", "Dashboard UI available at http://localhost:6543/"}
                 };
-                result.structuredContent = toMcpJson(response);
-                result.content = McpJson::array();
+
+                // FIX: Use the local makeTextContent and wrap in a vector/array properly
+                // Your SDK expects result.content to be a specific container type
                 result.content.push_back(makeTextContent(response.dump()));
+
+                // FIX: Since result.annotations doesn't exist, use result.metadata 
+                // if you want the tool response to also signal the UI.
+                // If your SDK doesn't support metadata in result, omit this.
+                // result.metadata = ... (only if the struct has this member)
+
                 result.isError = false;
                 return result;
             });
