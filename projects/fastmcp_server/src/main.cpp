@@ -340,26 +340,45 @@ std::vector<ExternalResourceInfo> fetchExternalAppResources() {
     } catch (...) {}
     return res;
 }
-
 bool readMcpAppResource(const std::string& uri,
                         std::string& canonical_uri,
                         std::string& mime_type,
                         std::string& content,
                         std::string& error) {
     std::string path;
-    if (!uriToMcpAppsPath(uri, path)) return false;
-    httplib::Client cl(kMcpAppsHost, kMcpAppsPort);
-    cl.set_connection_timeout(2, 0);
-    cl.set_read_timeout(5, 0);
-    const auto r = cl.Get(path.c_str());
-    if (!r) { error = "Unable to connect to mcp-apps at http://localhost:6543"; return false; }
-    if (r->status < 200 || r->status >= 300) {
-        error = "mcp-apps returned HTTP " + std::to_string(r->status);
+    if (!uriToMcpAppsPath(uri, path)) {
+        error = "Invalid URI scheme mapping";
         return false;
     }
-    canonical_uri = toMcpAppUri(uri);
-    mime_type     = contentTypeFromResponse(r, "text/plain");
-    content       = r->body;
+
+    // Ensure path starts with / for httplib
+    if (path.empty() || path[0] != '/') {
+        path = "/" + path;
+    }
+
+    httplib::Client cl(kMcpAppsHost, kMcpAppsPort);
+    cl.set_connection_timeout(1, 0); // 1s is plenty for localhost
+    cl.set_read_timeout(2, 0);
+
+    const auto r = cl.Get(path.c_str());
+    
+    if (!r) { 
+        error = "mcp-apps connection failed at " + std::string(kMcpAppsHost); 
+        return false; 
+    }
+
+    if (r->status != 200) {
+        error = "mcp-apps error: " + std::to_string(r->status);
+        return false;
+    }
+
+    // CRITICAL: This must match dashboard_tool.annotations.ui.resourceUri
+    canonical_uri = uri; 
+    
+    // Force HTML if we are proxying a Dashboard UI
+    mime_type = contentTypeFromResponse(r, "text/html");
+    content   = r->body;
+
     return true;
 }
 
@@ -605,7 +624,7 @@ int main(int argc, char** argv) {
     });
 
     resources.push_back(RuntimeResource{
-        "ui://mcp-apps/dashboard",
+        "app://dashboard-ui",
         "dashboard-ui",
         "Dashboard HTML proxied from local mcp-apps server",
         "text/html",
@@ -790,15 +809,20 @@ int main(int argc, char** argv) {
             definition.uri = resource.uri;
             definition.name = resource.name;
             definition.description = resource.description;
-            definition.mimeType = resource.mime_type;
+            definition.mimeType = "text/html"; // CRITICAL: Must be html for App rendering
 
             mcp_server->registerResource(
                 std::move(definition),
-                [resource](const mcp::server::ResourceReadContext&) -> std::vector<mcp::server::ResourceContent> {
-                    std::cout << "[resources/read] " << resource.uri << '\n';
-                    return {
-                        mcp::server::ResourceContent::text(resource.uri, resource.body_provider(), resource.mime_type)
-                    };
+                [resource](const mcp::server::ResourceReadContext& ctx) -> std::vector<mcp::server::ResourceContent> {
+                    // This lambda executes when the inspector "opens" the app
+                    std::string content = resource.body_provider(); 
+                    
+                    auto item = mcp::server::ResourceContent::text(
+                        resource.uri, 
+                        content, 
+                        "text/html"
+                    );
+                    return { item };
                 });
         }
 
