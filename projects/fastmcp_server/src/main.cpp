@@ -160,6 +160,19 @@ McpJson makeTextContent(const std::string& text) {
     return block;
 }
 
+McpJson makeResourceLinkContent(const std::string& uri,
+                                const std::string& name,
+                                const std::string& description,
+                                const std::string& mime_type) {
+    McpJson block = McpJson::object();
+    block["type"] = "resource_link";
+    block["uri"] = uri;
+    block["name"] = name;
+    block["description"] = description;
+    block["mimeType"] = mime_type;
+    return block;
+}
+
 // ── small string helpers ──────────────────────────────────────────────────
 bool beginsWith(const std::string& v, const std::string& p) {
     return v.size() >= p.size() && v.compare(0, p.size(), p) == 0;
@@ -888,9 +901,17 @@ int main(int argc, char** argv) {
 
                     const json response = {
                         {"status", "success"},
-                        {"message", "Dashboard UI available at http://localhost:6543/"}
+                        {"message", "Dashboard UI available at http://localhost:6543/"},
+                        {"resourceUri", "app://dashboard-ui"}
                     };
 
+                    result.structuredContent = toMcpJson(response);
+                    result.content = McpJson::array();
+                    result.content.push_back(makeResourceLinkContent(
+                        "app://dashboard-ui",
+                        "dashboard-ui",
+                        "Dashboard UI",
+                        "text/html"));
                     result.content.push_back(makeTextContent(response.dump()));
                     result.isError = false;
                     return result;
@@ -911,7 +932,7 @@ int main(int argc, char** argv) {
                 definition.uri = resource.uri;
                 definition.name = resource.name;
                 definition.description = resource.description;
-                definition.mimeType = "text/html";
+                definition.mimeType = resource.mime_type;
 
                 if (mcp_debug) {
                     logDiag("MCP-REGISTER", "Registering resource " + resource.uri);
@@ -928,7 +949,7 @@ int main(int argc, char** argv) {
                         auto item = mcp::server::ResourceContent::text(
                             resource.uri,
                             content,
-                            "text/html"
+                            resource.mime_type
                         );
                         return { item };
                     });
