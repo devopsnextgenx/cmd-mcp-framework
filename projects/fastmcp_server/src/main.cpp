@@ -53,6 +53,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include "FastMcpStringUtils.hpp"
 #include "PluginLoader.hpp"
 #include "cmdsdk/CommandRegistry.hpp"
 #include "cmdsdk/OpenApiGenerator.hpp"
@@ -66,6 +67,7 @@ namespace
 {
 
     using json = nlohmann::json;
+    using StringUtils = fastmcp::FastMcpStringUtils;
 
     using McpJson = mcp::jsonrpc::JsonValue;
 
@@ -89,6 +91,7 @@ namespace
     };
 
     std::atomic_bool gStopRequested{ false };
+    std::atomic_bool gMcpDebug{ false };
     std::atomic_uint64_t gMcpServerInstanceCounter{ 0 };
     std::mutex gLogMutex;
 
@@ -191,47 +194,234 @@ namespace
         return block;
     }
 
-    bool registerTool(mcp::server::Server& server,
-        const std::string& toolName,
+    struct ToolRegistrationState
+    {
+        std::set<std::string> used_tool_names;
+        std::map<std::string, int> tool_name_suffixes;
+        std::map<std::string, std::vector<std::string>> command_tool_names;
+    };
+
+    std::string allocateUniqueToolName(const std::string& base_name,
+        ToolRegistrationState& state)
+    {
+        std::string tool_name = base_name;
+        if (state.used_tool_names.count(tool_name) > 0)
+        {
+            int& suffix = state.tool_name_suffixes[tool_name];
+            do
+            {
+                ++suffix;
+            } while (state.used_tool_names.count(tool_name + "_" + std::to_string(suffix)) > 0);
+            tool_name = tool_name + "_" + std::to_string(suffix);
+        }
+        state.used_tool_names.insert(tool_name);
+        return tool_name;
+    }
+
+    json buildInputSchema(const cmdsdk::CommandMetadata& cmd_meta,
+        const std::optional<std::string>& fixed_subtype)
+    {
+        json input_schema = {
+            {"type", "object"},
+            {"properties", json::object()},
+            {"additionalProperties", true}
+        };
+        std::set<std::string> required_fields;
+
+        for (const auto& param : cmd_meta.parameters)
+        {
+            std::string json_type = "string";
+            if (param.parameter_type == "number") json_type = "number";
+            else if (param.parameter_type == "boolean") json_type = "boolean";
+            else if (param.parameter_type == "object") json_type = "object";
+            else if (param.parameter_type == "array") json_type = "array";
+
+            input_schema["properties"][param.parameter_name] = {
+                {"type", json_type},
+                {"description", param.description}
+            };
+            if (param.required)
+            {
+                required_fields.insert(param.parameter_name);
+            }
+        }
+
+        if (fixed_subtype.has_value())
+        {
+            input_schema["properties"]["subType"] = {
+                {"type", "string"},
+                {"enum", json::array({ *fixed_subtype })},
+                {"description", "Injected subType for this tool"}
+            };
+        }
+        else if (!cmd_meta.sub_cmd_types.empty())
+        {
+            json enum_values = json::array();
+            for (const auto& st : cmd_meta.sub_cmd_types)
+            {
+                enum_values.push_back(st.sub_type_name);
+            }
+            input_schema["properties"]["subType"] = {
+                {"type", "string"},
+                {"enum", enum_values},
+                {"description", "SubCommand type to execute"}
+            };
+            required_fields.insert("subType");
+        }
+
+        if (!required_fields.empty())
+        {
+            json required = json::array();
+            for (const auto& field : required_fields)
+            {
+                required.push_back(field);
+            }
+            input_schema["required"] = required;
+        }
+
+        return input_schema;
+    }
+
+
+    bool registerTool(const cmdsdk::CommandRegistry& registry, mcp::server::Server& server,
+        const std::string& tool_name,
         const std::string& title,
         const std::string& description,
-        const json& input_schema)
+        const json& input_schema,
+        const std::string& original_cmd_name,
+        const std::function<json(const json&)>& handler)
     {
+        static_cast<void>(registry);
+        const bool mcp_debug = gMcpDebug.load();
         const mcp::server::ToolDefinition toolDef{
-            .name = toolName,
+            .name = tool_name,
             .title = title,
             .description = description,
             .inputSchema = toMcpJson(input_schema),
         };
 
-        // server->registerTool(
-        //     std::move(toolDef),
-        //     [handler](const json& input)
-        //     {
-        //         try
-        //         {
-        //             return handler(input);
-        //         }
-        //         catch (const std::exception& ex)
-        //         {
-        //             logDiag("ToolHandler", std::string("Exception: ") + ex.what());
-        //             mcp::server::CallToolResult result;
-        //             result.isError = true;
-        //             result.content = makeTextContent(std::string("Error: ") + ex.what());
-        //             return result;
-        //         }
-        //         catch (...)
-        //         {
-        //             logDiag("ToolHandler", "Unknown exception");
-        //             mcp::server::CallToolResult result;
-        //             result.isError = true;
-        //             result.content = makeTextContent("Error: unknown exception");
-        //             return result;
-        //         }
-        //     });
+        if (mcp_debug)
+        {
+            logDiag("MCP-REGISTER",
+                "Registering tool " + tool_name + " (command=" + original_cmd_name + ")");
+        }
+
+        server.registerTool(
+            toolDef,
+            [handler, tool_name, original_cmd_name](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult
+            {
+                try
+                {
+                    if (gMcpDebug.load())
+                    {
+                        logRequestContext("MCP-TOOL-CALL",
+                            context.requestContext,
+                            "tool=" + tool_name + " command=" + original_cmd_name);
+                    }
+
+                    const json args = fromMcpJson(context.arguments);
+                    const json raw = handler(args);
+
+                    json structured = raw.is_object() ? raw : json{ {"result", raw} };
+                    if (args.contains("subType") && args["subType"].is_string())
+                    {
+                        structured["subTypeExecuted"] = args["subType"].get<std::string>();
+                    }
+
+                    std::cout << "[tools/call] " << original_cmd_name << " -> " << raw.dump() << '\n';
+
+                    mcp::server::CallToolResult result;
+                    result.structuredContent = toMcpJson(structured);
+                    result.content = McpJson::array();
+                    result.content.push_back(makeTextContent(raw.dump()));
+                    result.isError = false;
+                    return result;
+                }
+                catch (const std::exception& e)
+                {
+                    if (gMcpDebug.load())
+                    {
+                        logDiag("MCP-TOOL-ERROR", original_cmd_name + " failed: " + e.what());
+                    }
+                    throw;
+                }
+            });
+
         return true;
     }
 
+    bool registerCmdAsTool(const cmdsdk::CommandRegistry& registry, mcp::server::Server& server,
+        const cmdsdk::CommandMetadata& cmd_meta,
+        const std::function<json(const json&)>& handler,
+        ToolRegistrationState& registration_state)
+    {
+        const std::string original_cmd_name = cmd_meta.cmd_name;
+
+        const auto register_one = [&](const std::string& base_tool_name,
+            const std::string& description,
+            const json& input_schema,
+            const std::function<json(const json&)>& wrapped_handler) -> bool
+            {
+                const auto tool_name = allocateUniqueToolName(base_tool_name, registration_state);
+                registration_state.command_tool_names[original_cmd_name].push_back(tool_name);
+
+                std::string tool_description = description;
+                if (tool_name != original_cmd_name)
+                {
+                    tool_description += " [original: " + original_cmd_name + "]";
+                }
+
+                return registerTool(registry,
+                    server,
+                    tool_name,
+                    original_cmd_name,
+                    tool_description,
+                    input_schema,
+                    original_cmd_name,
+                        wrapped_handler);
+            };
+
+        if (cmd_meta.sub_cmd_types.empty())
+        {
+            return register_one(
+                StringUtils::sanitizeToolName(original_cmd_name),
+                cmd_meta.description,
+                buildInputSchema(cmd_meta, std::nullopt),
+                handler);
+        }
+
+        bool all_registered = true;
+        for (const auto& subtype_meta : cmd_meta.sub_cmd_types)
+        {
+            const std::string subtype = subtype_meta.sub_type_name;
+            const std::string tool_base = StringUtils::sanitizeToolName(original_cmd_name + "-" + subtype);
+            std::string subtype_description = cmd_meta.description;
+            if (!subtype_meta.description.empty())
+            {
+                subtype_description += " [subType=" + subtype + ": " + subtype_meta.description + "]";
+            }
+            else
+            {
+                subtype_description += " [subType=" + subtype + "]";
+            }
+
+            const auto wrapped_handler = [handler, subtype](const json& args) -> json
+                {
+                    json injected = args;
+                    injected["subType"] = subtype;
+                    return handler(injected);
+                };
+
+            all_registered = register_one(
+                tool_base,
+                subtype_description,
+                buildInputSchema(cmd_meta, subtype),
+                wrapped_handler) && all_registered;
+        }
+
+        return all_registered;
+    }
+    
     bool registerToolWithUI(
         mcp::server::Server& server,
         const std::string& toolName,
@@ -245,65 +435,6 @@ namespace
         return true;
     }
 
-    // ── small string helpers ──────────────────────────────────────────────────
-    bool beginsWith(const std::string& v, const std::string& p)
-    {
-        return v.size() >= p.size() && v.compare(0, p.size(), p) == 0;
-    }
-    bool endsWith(const std::string& v, const std::string& s)
-    {
-        return v.size() >= s.size() && v.compare(v.size() - s.size(), s.size(), s) == 0;
-    }
-    std::string toUpperAscii(std::string v)
-    {
-        std::transform(v.begin(), v.end(), v.begin(),
-            [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-        return v;
-    }
-    std::string toLowerAscii(std::string v)
-    {
-        std::transform(v.begin(), v.end(), v.begin(),
-            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        return v;
-    }
-
-    std::string sanitizeToolName(std::string name)
-    {
-        std::string out;
-        out.reserve(name.size());
-
-        bool last_was_sep = false;
-        for (const unsigned char c : name)
-        {
-            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-')
-            {
-                out.push_back(static_cast<char>(c));
-                last_was_sep = false;
-                continue;
-            }
-
-            if (c >= 'A' && c <= 'Z')
-            {
-                out.push_back(static_cast<char>(std::tolower(c)));
-                last_was_sep = false;
-                continue;
-            }
-
-            if (c == '.' || c == '/' || std::isspace(c))
-            {
-                if (!last_was_sep && !out.empty())
-                {
-                    out.push_back('_');
-                    last_was_sep = true;
-                }
-            }
-        }
-
-        while (!out.empty() && (out.back() == '_' || out.back() == '-')) out.pop_back();
-        if (out.empty()) return "tool";
-        return out;
-    }
-
     // ── argument parsing ──────────────────────────────────────────────────────
     ServerConfig parseArguments(int argc, char** argv)
     {
@@ -311,18 +442,18 @@ namespace
         for (int i = 1; i < argc; ++i)
         {
             std::string arg = argv[i];
-            if (beginsWith(arg, "--port="))
+            if (StringUtils::beginsWith(arg, "--port="))
             {
                 cfg.port = std::stoi(arg.substr(7));
             }
-            else if (beginsWith(arg, "--plugins="))
+            else if (StringUtils::beginsWith(arg, "--plugins="))
             {
                 std::stringstream ss(arg.substr(10));
                 std::string p;
                 while (std::getline(ss, p, ','))
                     if (!p.empty()) cfg.plugin_paths.emplace_back(p);
             }
-            else if (beginsWith(arg, "--protocol="))
+            else if (StringUtils::beginsWith(arg, "--protocol="))
             {
                 std::string m = arg.substr(11);
                 if (m == "mcp")       cfg.protocol_mode = ProtocolMode::MCP_ONLY;
@@ -346,10 +477,10 @@ namespace
 
     std::string canonicalResourceName(const std::string& plugin_name)
     {
-        const auto u = toUpperAscii(plugin_name);
+        const auto u = StringUtils::toUpperAscii(plugin_name);
         if (u == "GEO")  return "geometry";
         if (u == "MATH") return "math";
-        return toLowerAscii(plugin_name);
+        return StringUtils::toLowerAscii(plugin_name);
     }
 
     std::string resolvePluginName(const cmdsdk::CommandMetadata& m)
@@ -439,9 +570,9 @@ namespace
 #if defined(_WIN32)
                 return p.extension() == ".dll";
 #elif defined(__APPLE__)
-                return beginsWith(fn, "lib") && p.extension() == ".dylib";
+                return StringUtils::beginsWith(fn, "lib") && p.extension() == ".dylib";
 #else
-                return beginsWith(fn, "lib") && p.extension() == ".so";
+                return StringUtils::beginsWith(fn, "lib") && p.extension() == ".so";
 #endif
             };
 
@@ -472,7 +603,7 @@ namespace
             {
                 std::string fn = p.filename().string();
 #if defined(_WIN32)
-                fn = toUpperAscii(fn);
+                fn = StringUtils::toUpperAscii(fn);
 #endif
                 if (!seen.insert(fn).second)
                 {
@@ -503,14 +634,14 @@ namespace
         if (uri.empty()) return false;
         if (uri == "app://math-form") { path = kMathFormPath; return true; }
         if (uri == "app://dashboard-ui") { path = "/"; return true; }
-        if (beginsWith(uri, "app://"))
+        if (StringUtils::beginsWith(uri, "app://"))
         {
             const std::string s = uri.substr(6);
             path = (s.empty() || s[0] != '/') ? "/" + s : s;
             return true;
         }
         const std::string pfx = "http://localhost:6543";
-        if (beginsWith(uri, pfx))
+        if (StringUtils::beginsWith(uri, pfx))
         {
             const std::string s = uri.substr(pfx.size());
             path = s.empty() ? "/" : s;
@@ -570,7 +701,7 @@ namespace
         std::string& content,
         std::string& error)
     {
-        const bool mcp_debug = envFlagEnabled("FASTMCP_MCP_DEBUG", false);
+        const bool mcp_debug = gMcpDebug.load();
         std::string path;
         if (!uriToMcpAppsPath(uri, path))
         {
@@ -671,13 +802,13 @@ namespace
         {
             resolved = it->first; return &it->second;
         }
-        const auto ru = toUpperAscii(requested);
+        const auto ru = StringUtils::toUpperAscii(requested);
         for (const auto& [pn, pi] : plugins)
-            if (toUpperAscii(pn) == ru) { resolved = pn; return &pi; }
-        const auto rl = toLowerAscii(requested);
+            if (StringUtils::toUpperAscii(pn) == ru) { resolved = pn; return &pi; }
+        const auto rl = StringUtils::toLowerAscii(requested);
         for (const auto& [pn, pi] : plugins)
         {
-            const auto pu = toUpperAscii(pn);
+            const auto pu = StringUtils::toUpperAscii(pn);
             if (((rl == "geo" || rl == "geometry") && pu == "GEO") ||
                 (rl == "math" && pu == "MATH") ||
                 canonicalResourceName(pn) == rl)
@@ -804,7 +935,8 @@ namespace
 int main(int argc, char** argv)
 {
     ServerConfig config = parseArguments(argc, argv);
-    const bool mcp_debug = envFlagEnabled("FASTMCP_MCP_DEBUG", false);
+    gMcpDebug.store(envFlagEnabled("FASTMCP_MCP_DEBUG", false));
+    const bool mcp_debug = gMcpDebug.load();
     const bool require_session_id = envFlagEnabled("FASTMCP_REQUIRE_SESSION_ID", true);
 
     if (config.plugin_paths.empty())
@@ -1000,147 +1132,39 @@ return std::string("Error: " + err);
 
                 auto mcp_server = mcp::server::Server::create(std::move(server_config));
 
-                std::set<std::string> used_tool_names;
-                std::map<std::string, int> tool_name_suffixes;
-                std::map<std::string, std::string> command_tool_names;
+                ToolRegistrationState registration_state;
 
                 for (const auto& meta : registry.listMetadata())
                 {
-                    std::string subtype_list;
-                    for (const auto& st : meta.sub_cmd_types)
-                    {
-                        if (!subtype_list.empty()) subtype_list += ", ";
-                        subtype_list += st.sub_type_name;
-                    }
-
-                    std::string full_desc = meta.description;
-                    if (!subtype_list.empty())
-                        full_desc += " [subType: " + subtype_list + "]";
-
-                    json input_schema = {
-                        {"type", "object"},
-                        {"properties", json::object()},
-                        {"additionalProperties", true}
-                    };
-                    std::set<std::string> required_fields;
-
-                    for (const auto& param : meta.parameters)
-                    {
-                        std::string json_type = "string";
-                        if (param.parameter_type == "number") json_type = "number";
-                        else if (param.parameter_type == "boolean") json_type = "boolean";
-                        else if (param.parameter_type == "object") json_type = "object";
-                        else if (param.parameter_type == "array") json_type = "array";
-
-                        input_schema["properties"][param.parameter_name] = {
-                            {"type", json_type},
-                            {"description", param.description}
-                        };
-                        if (param.required)
-                            required_fields.insert(param.parameter_name);
-                    }
-
-                    if (!meta.sub_cmd_types.empty())
-                    {
-                        json enum_values = json::array();
-                        for (const auto& st : meta.sub_cmd_types)
-                            enum_values.push_back(st.sub_type_name);
-                        input_schema["properties"]["subType"] = {
-                            {"type", "string"},
-                            {"enum", enum_values},
-                            {"description", "SubCommand type to execute"}
-                        };
-                        required_fields.insert("subType");
-                    }
-
-                    if (!required_fields.empty())
-                    {
-                        json required = json::array();
-                        for (const auto& field : required_fields)
+                    const auto cmd_name = meta.cmd_name;
+                    // command handler extracted into a lambda to capture cmd_name and registry by reference
+                    const auto cmd_handler = [&registry, cmd_name](const json& args) -> json
                         {
-                            required.push_back(field);
-                        }
-                        input_schema["required"] = required;
-                    }
-
-                    const std::string original_cmd_name = meta.cmd_name;
-                    std::string tool_name = sanitizeToolName(original_cmd_name);
-                    if (used_tool_names.count(tool_name) > 0)
-                    {
-                        int& suffix = tool_name_suffixes[tool_name];
-                        do
-                        {
-                            ++suffix;
-                        } while (used_tool_names.count(tool_name + "_" + std::to_string(suffix)) > 0);
-                        tool_name = tool_name + "_" + std::to_string(suffix);
-                    }
-                    used_tool_names.insert(tool_name);
-                    command_tool_names[original_cmd_name] = tool_name;
-
-                    mcp::server::ToolDefinition tool;
-                    tool.name = tool_name;
-                    std::string tool_description = full_desc;
-                    if (tool_name != original_cmd_name)
-                    {
-                        tool_description += " [original: " + original_cmd_name + "]";
-                    }
-                    tool.description = std::move(tool_description);
-                    tool.inputSchema = toMcpJson(input_schema);
-
-                    if (mcp_debug)
-                    {
-                        logDiag("MCP-REGISTER",
-                            "Registering tool " + tool_name + " (command=" + original_cmd_name + ")");
-                    }
-
-                    mcp_server->registerTool(
-                        std::move(tool),
-                        [&registry, cmd_name = original_cmd_name, tool_name, mcp_debug](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult
-                        {
-                            try
+                            auto command = registry.create(cmd_name);
+                            if (!command)
                             {
-                                if (mcp_debug)
-                                {
-                                    logRequestContext("MCP-TOOL-CALL",
-                                        context.requestContext,
-                                        "tool=" + tool_name + " command=" + cmd_name);
-                                }
-
-                                const json args = fromMcpJson(context.arguments);
-
-                                auto command = registry.create(cmd_name);
-                                if (!command)
-                                    throw std::runtime_error("Tool not found: " + cmd_name);
-
-                                std::string error;
-                                if (!command->validate(args, error))
-                                    throw std::invalid_argument("Validation failed: " + error);
-                                if (!command->execute(args, error))
-                                    throw std::runtime_error("Execution failed: " + error);
-
-                                const json raw = command->getResult();
-                                json structured = raw.is_object() ? raw : json{ {"result", raw} };
-                                if (args.contains("subType") && args["subType"].is_string())
-                                    structured["subTypeExecuted"] = args["subType"].get<std::string>();
-
-                                std::cout << "[tools/call] " << cmd_name << " -> " << raw.dump() << '\n';
-
-                                mcp::server::CallToolResult result;
-                                result.structuredContent = toMcpJson(structured);
-                                result.content = McpJson::array();
-                                result.content.push_back(makeTextContent(raw.dump()));
-                                result.isError = false;
-                                return result;
+                                throw std::runtime_error("Tool not found: " + cmd_name);
                             }
-                            catch (const std::exception& e)
+
+                            std::string error;
+                            if (!command->validate(args, error))
                             {
-                                if (mcp_debug)
-                                {
-                                    logDiag("MCP-TOOL-ERROR", cmd_name + " failed: " + e.what());
-                                }
-                                throw;
+                                throw std::invalid_argument("Validation failed: " + error);
                             }
-                        });
+                            if (!command->execute(args, error))
+                            {
+                                throw std::runtime_error("Execution failed: " + error);
+                            }
+
+                            return command->getResult();
+                        };
+
+                    registerCmdAsTool(
+                        registry,
+                        *mcp_server,
+                        meta,
+                        cmd_handler,
+                        registration_state);
                 }
 
                 std::vector<std::string> math_subtypes;
@@ -1150,7 +1174,7 @@ return std::string("Error: " + err);
                     const auto plugin_name = resolvePluginName(meta);
                     const bool is_math_command =
                         (meta.cmd_name == "math.calculate") ||
-                        (toUpperAscii(plugin_name) == "MATH");
+                        (StringUtils::toUpperAscii(plugin_name) == "MATH");
                     if (!is_math_command || meta.sub_cmd_types.empty()) continue;
 
                     for (const auto& st : meta.sub_cmd_types)
@@ -1162,9 +1186,10 @@ return std::string("Error: " + err);
                 }
 
                 std::string math_tool_name = "math_calculate";
-                if (const auto it = command_tool_names.find("math.calculate"); it != command_tool_names.end())
+                if (const auto it = registration_state.command_tool_names.find("math.calculate");
+                    it != registration_state.command_tool_names.end() && !it->second.empty())
                 {
-                    math_tool_name = it->second;
+                    math_tool_name = it->second.front();
                 }
 
                 mcp::server::ToolDefinition math_form_tool;
@@ -1340,8 +1365,8 @@ return std::string("Error: " + err);
         {
             addCorsHeaders(res);
             std::string pname = req.path_params.at("plugin");
-            if (endsWith(pname, ".json"))       pname = pname.substr(0, pname.size() - 5);
-            else if (endsWith(pname, ".yaml") || endsWith(pname, ".yml"))
+            if (StringUtils::endsWith(pname, ".json"))       pname = pname.substr(0, pname.size() - 5);
+            else if (StringUtils::endsWith(pname, ".yaml") || StringUtils::endsWith(pname, ".yml"))
                 pname = pname.substr(0, pname.rfind('.'));
 
             const auto spec = api_aggregator.getPluginSpec(pname);
