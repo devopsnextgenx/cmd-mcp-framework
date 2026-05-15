@@ -432,6 +432,99 @@ namespace
         const std::function<mcp::server::CallToolResult(const json&)>& handler)
     {
         const std::string resourceUri = "ui://" + toolName + "/" + resourceFileName;
+        const bool mcp_debug = gMcpDebug.load();
+
+        // ─── Register the Tool ───────────────────────────────────────────────
+        mcp::server::ToolDefinition toolDef;
+        toolDef.name = toolName;
+        toolDef.title = title;
+        toolDef.description = description;
+        toolDef.inputSchema = toMcpJson(input_schema);
+        toolDef.annotations = mcp::jsonrpc::JsonValue::object({
+            {"readOnlyHint", true}
+        });
+        toolDef.metadata = mcp::jsonrpc::JsonValue::object({
+            {
+                "ui", mcp::jsonrpc::JsonValue::object({
+                    {"resourceUri", resourceUri}
+                })
+            }
+        });
+
+        if (mcp_debug)
+        {
+            logDiag("MCP-REGISTER", "Registering app tool " + toolName + " with UI resource " + resourceUri);
+        }
+
+        server.registerTool(
+            std::move(toolDef),
+            [handler, toolName, resourceUri](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult
+            {
+                try
+                {
+                    if (gMcpDebug.load())
+                    {
+                        logRequestContext("MCP-TOOL-CALL", context.requestContext, "tool=" + toolName);
+                    }
+
+                    const mcp::server::CallToolResult result = handler(fromMcpJson(context.arguments));
+                    
+                    if (gMcpDebug.load())
+                    {
+                        logDiag("MCP-TOOL-SUCCESS", toolName + " executed successfully");
+                    }
+
+                    return result;
+                }
+                catch (const std::exception& e)
+                {
+                    if (gMcpDebug.load())
+                    {
+                        logDiag("MCP-TOOL-ERROR", toolName + " failed: " + e.what());
+                    }
+                    throw;
+                }
+            });
+
+        // ─── Register the UI Resource ────────────────────────────────────────
+        mcp::server::ResourceDefinition resourceDef;
+        resourceDef.uri = resourceUri;
+        resourceDef.name = toolName + "-ui";
+        resourceDef.description = "UI resource for " + title;
+        resourceDef.mimeType = "text/html";
+
+        if (mcp_debug)
+        {
+            logDiag("MCP-REGISTER", "Registering app resource " + resourceUri);
+        }
+
+        server.registerResource(
+            std::move(resourceDef),
+            [resourceUri, mcp_debug](const mcp::server::ResourceReadContext& ctx) -> std::vector<mcp::server::ResourceContent>
+            {
+                if (mcp_debug)
+                {
+                    logRequestContext("MCP-RESOURCE-READ", ctx.requestContext, "uri=" + resourceUri);
+                }
+
+                // Serve HTML content - stub implementation
+                // In production, load from the built UI artifacts
+                std::string html_content = R"HTML(
+                    <!DOCTYPE html>
+                    <html>
+                    <head><title>App Tool UI</title></head>
+                    <body><p>UI Resource: )HTML" + resourceUri + R"HTML(</p></body>
+                    </html>
+                )HTML";
+
+                auto item = mcp::server::ResourceContent::text(
+                    resourceUri,
+                    html_content,
+                    "text/html"
+                );
+                return { item };
+            });
+
         return true;
     }
 
@@ -1167,6 +1260,7 @@ return std::string("Error: " + err);
                         registration_state);
                 }
 
+                // registerToolWithUI for math.calculate start
                 std::vector<std::string> math_subtypes;
                 std::map<std::string, std::string> math_labels;
                 for (const auto& meta : registry.listMetadata())
@@ -1192,41 +1286,21 @@ return std::string("Error: " + err);
                     math_tool_name = it->second.front();
                 }
 
-                mcp::server::ToolDefinition math_form_tool;
-                math_form_tool.name = "open-math-form";
-                math_form_tool.description = "Open a math form UI and configure operation subtypes for the math MCP tool.";
-
                 json math_form_schema = {
                     {"type", "object"},
                     {"properties", json::object()},
                     {"required", json::array()}
                 };
-                math_form_tool.inputSchema = toMcpJson(math_form_schema);
-                math_form_tool.annotations = mcp::jsonrpc::JsonValue::object({
-                    {"readOnlyHint", true}
-                    });
-                math_form_tool.metadata = mcp::jsonrpc::JsonValue::object({
+
+                registerToolWithUI(
+                    *mcp_server,
+                    "open-math-form",
+                    "Open Math Form",
+                    "Open a math form UI and configure operation subtypes for the math MCP tool.",
+                    "math-form.html",
+                    math_form_schema,
+                    [math_subtypes, math_labels, math_tool_name](const json& args) -> mcp::server::CallToolResult
                     {
-                        "ui", mcp::jsonrpc::JsonValue::object({
-                        {"resourceUri", "http://localhost:6543/ui/math-form.html"}
-                        })
-                    },
-                    {
-                        "ui/resourceUri", "http://localhost:6543/ui/math-form.html"
-                    }
-                    });
-                if (mcp_debug)
-                {
-                    logDiag("MCP-REGISTER", "Registering tool open-math-form");
-                }
-                mcp_server->registerTool(
-                    std::move(math_form_tool),
-                    [mcp_debug, math_subtypes, math_labels, math_tool_name](const mcp::server::ToolCallContext& ctx) -> mcp::server::CallToolResult
-                    {
-                        if (mcp_debug)
-                        {
-                            logRequestContext("MCP-TOOL-CALL", ctx.requestContext, "tool=open-math-form");
-                        }
                         mcp::server::CallToolResult result;
 
                         const json response = {
@@ -1304,6 +1378,7 @@ return std::string("Error: " + err);
                             return { item };
                         });
                 }
+                // registerToolWithUI for math.calculate end
 
                 return mcp_server;
             }
