@@ -381,45 +381,13 @@ namespace
                         wrapped_handler);
             };
 
-        if (cmd_meta.sub_cmd_types.empty())
-        {
-            return register_one(
-                StringUtils::sanitizeToolName(original_cmd_name),
-                cmd_meta.description,
-                buildInputSchema(cmd_meta, std::nullopt),
-                handler);
-        }
-
-        bool all_registered = true;
-        for (const auto& subtype_meta : cmd_meta.sub_cmd_types)
-        {
-            const std::string subtype = subtype_meta.sub_type_name;
-            const std::string tool_base = StringUtils::sanitizeToolName(original_cmd_name + "-" + subtype);
-            std::string subtype_description = cmd_meta.description;
-            if (!subtype_meta.description.empty())
-            {
-                subtype_description += " [subType=" + subtype + ": " + subtype_meta.description + "]";
-            }
-            else
-            {
-                subtype_description += " [subType=" + subtype + "]";
-            }
-
-            const auto wrapped_handler = [handler, subtype](const json& args) -> json
-                {
-                    json injected = args;
-                    injected["subType"] = subtype;
-                    return handler(injected);
-                };
-
-            all_registered = register_one(
-                tool_base,
-                subtype_description,
-                buildInputSchema(cmd_meta, subtype),
-                wrapped_handler) && all_registered;
-        }
-
-        return all_registered;
+        // Register exactly one MCP tool per command. If subTypes exist,
+        // buildInputSchema exposes them as enum options in the single tool input.
+        return register_one(
+            StringUtils::sanitizeToolName(original_cmd_name),
+            cmd_meta.description,
+            buildInputSchema(cmd_meta, std::nullopt),
+            handler);
     }
     
     bool registerToolWithUI(
