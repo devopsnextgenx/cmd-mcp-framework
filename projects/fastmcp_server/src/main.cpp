@@ -1292,6 +1292,44 @@ return std::string("Error: " + err);
                     {"required", json::array()}
                 };
 
+                // Define the handler for the math form tool
+                auto math_form_handler = [math_subtypes, math_labels, math_tool_name](const json& args) -> mcp::server::CallToolResult
+                {
+                    mcp::server::CallToolResult result;
+
+                    const json response = {
+                        {"status", "success"},
+                        {"availability", "math-form available"},
+                        {"message", "Math form UI available at http://localhost:6543/ui/math-form.html"},
+                        {"resourceUri", "app://math-form"},
+                        {"uiResourceUri", "http://localhost:6543/ui/math-form.html"},
+                        {"toolName", math_tool_name},
+                        {"subTypes", math_subtypes},
+                        {"labels", math_labels}
+                    };
+
+                    result.structuredContent = toMcpJson(response);
+                    result.content = McpJson::array();
+                    result.content.push_back(makeTextContent(
+                        "math-form available\n"
+                        "resource: app://math-form\n"
+                        "url: http://localhost:6543/ui/math-form.html\n"
+                        "tool: " + math_tool_name));
+                    result.content.push_back(makeResourceLinkContent(
+                        "http://localhost:6543/ui/math-form.html",
+                        "math-form-ui",
+                        "Math Form UI",
+                        "text/html"));
+                    result.content.push_back(makeResourceLinkContent(
+                        "app://math-form",
+                        "math-form-resource",
+                        "Math Form MCP Resource",
+                        "text/html"));
+                    result.content.push_back(makeTextContent(response.dump()));
+                    result.isError = false;
+                    return result;
+                };
+
                 registerToolWithUI(
                     *mcp_server,
                     "open-math-form",
@@ -1299,42 +1337,7 @@ return std::string("Error: " + err);
                     "Open a math form UI and configure operation subtypes for the math MCP tool.",
                     "math-form.html",
                     math_form_schema,
-                    [math_subtypes, math_labels, math_tool_name](const json& args) -> mcp::server::CallToolResult
-                    {
-                        mcp::server::CallToolResult result;
-
-                        const json response = {
-                            {"status", "success"},
-                            {"availability", "math-form available"},
-                            {"message", "Math form UI available at http://localhost:6543/ui/math-form.html"},
-                            {"resourceUri", "app://math-form"},
-                            {"uiResourceUri", "http://localhost:6543/ui/math-form.html"},
-                            {"toolName", math_tool_name},
-                            {"subTypes", math_subtypes},
-                            {"labels", math_labels}
-                        };
-
-                        result.structuredContent = toMcpJson(response);
-                        result.content = McpJson::array();
-                        result.content.push_back(makeTextContent(
-                            "math-form available\n"
-                            "resource: app://math-form\n"
-                            "url: http://localhost:6543/ui/math-form.html\n"
-                            "tool: " + math_tool_name));
-                        result.content.push_back(makeResourceLinkContent(
-                            "http://localhost:6543/ui/math-form.html",
-                            "math-form-ui",
-                            "Math Form UI",
-                            "text/html"));
-                        result.content.push_back(makeResourceLinkContent(
-                            "app://math-form",
-                            "math-form-resource",
-                            "Math Form MCP Resource",
-                            "text/html"));
-                        result.content.push_back(makeTextContent(response.dump()));
-                        result.isError = false;
-                        return result;
-                    });
+                    math_form_handler);
 
                 mcp::server::ResourceTemplateDefinition app_template;
                 app_template.uriTemplate = "app://{path}";
