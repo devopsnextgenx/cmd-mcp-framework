@@ -204,31 +204,31 @@ namespace
             .inputSchema = toMcpJson(input_schema),
         };
 
-        server->registerTool(
-            std::move(toolDef),
-            [handler](const json& input)
-            {
-                try
-                {
-                    return handler(input);
-                }
-                catch (const std::exception& ex)
-                {
-                    logDiag("ToolHandler", std::string("Exception: ") + ex.what());
-                    mcp::server::CallToolResult result;
-                    result.isError = true;
-                    result.content = makeTextContent(std::string("Error: ") + ex.what());
-                    return result;
-                }
-                catch (...)
-                {
-                    logDiag("ToolHandler", "Unknown exception");
-                    mcp::server::CallToolResult result;
-                    result.isError = true;
-                    result.content = makeTextContent("Error: unknown exception");
-                    return result;
-                }
-            });
+        // server->registerTool(
+        //     std::move(toolDef),
+        //     [handler](const json& input)
+        //     {
+        //         try
+        //         {
+        //             return handler(input);
+        //         }
+        //         catch (const std::exception& ex)
+        //         {
+        //             logDiag("ToolHandler", std::string("Exception: ") + ex.what());
+        //             mcp::server::CallToolResult result;
+        //             result.isError = true;
+        //             result.content = makeTextContent(std::string("Error: ") + ex.what());
+        //             return result;
+        //         }
+        //         catch (...)
+        //         {
+        //             logDiag("ToolHandler", "Unknown exception");
+        //             mcp::server::CallToolResult result;
+        //             result.isError = true;
+        //             result.content = makeTextContent("Error: unknown exception");
+        //             return result;
+        //         }
+        //     });
         return true;
     }
 
