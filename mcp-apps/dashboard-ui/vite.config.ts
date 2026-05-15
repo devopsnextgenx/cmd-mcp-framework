@@ -59,7 +59,7 @@ export default defineConfig(
         plugins: [react(), viteSingleFile()],
         build: {
           rollupOptions: { input: INPUT },
-          outDir: 'dist/ui',
+          outDir: 'dist',
           emptyOutDir: false,
           minify: true,
           sourcemap: false,
