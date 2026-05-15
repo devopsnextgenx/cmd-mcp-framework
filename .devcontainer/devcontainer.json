@@ -1,5 +1,6 @@
 {
   "name": "cmd-mcp-framework (Linux)",
+  "image": "amitkshirsagar13/code-cpp:${localWorkspaceFolderBasename}",
   "build": {
     "dockerfile": "Dockerfile",
     "context": ".."
@@ -7,6 +8,10 @@
   "features": {
     "ghcr.io/devcontainers/features/node:1": {
       "version": "20"
+    },
+    "ghcr.io/devcontainers/features/cpp:1": {
+      "version": "latest",
+      "vcpkgEnabled": false
     }
   },
   "customizations": {
@@ -22,7 +27,16 @@
       }
     }
   },
+  "mounts": [
+    "source=/usr/local/vcpkg,target=/usr/local/vcpkg,type=bind"
+  ],
   "forwardPorts": [4173, 5432, 5433, 6543],
   "postCreateCommand": "bash .devcontainer/post-create.sh",
-  "remoteUser": "vscode"
+  "containerEnv": {
+    "GIT_AUTHOR_NAME": "Amit Kshirsagar",
+    "GIT_AUTHOR_EMAIL": "amit.kshirsagar.13@gmail.com",
+    "GIT_COMMITTER_NAME": "Amit Kshirsagar",
+    "GIT_COMMITTER_EMAIL": "amit.kshirsagar.13@gmail.com"
+  },
+  "remoteUser": "node"
 }
