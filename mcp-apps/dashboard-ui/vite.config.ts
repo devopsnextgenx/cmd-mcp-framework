@@ -29,6 +29,28 @@ const resourceManifest = {
         },
       },
     },
+    {
+      uri: 'app://geo-form',
+      name: 'Geometry Form UI',
+      description: 'Geometry operation form with perimeter, area, and volume calculations',
+      mimeType: 'text/html',
+      _meta: {
+        ui: {
+          resourceUri: 'http://localhost:6543/ui/geo-form.html',
+        },
+      },
+    },
+    {
+      uri: 'http://localhost:6543/ui/geo-form.html',
+      name: 'Geometry Calculator Form',
+      description: 'Geometry calculator form UI for perimeter, area, and volume operations via MCP tool',
+      mimeType: 'text/html',
+      _meta: {
+        ui: {
+          resourceUri: 'http://localhost:6543/ui/geo-form.html',
+        },
+      },
+    },
   ],
 };
 

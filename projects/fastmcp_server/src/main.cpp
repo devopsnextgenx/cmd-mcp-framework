@@ -1307,6 +1307,86 @@ return std::string("Error: " + err);
                     math_form_schema,
                     math_form_handler);
 
+                // registerToolWithUI for geo.calculate start
+                std::vector<std::string> geo_subtypes;
+                std::map<std::string, std::string> geo_labels;
+                for (const auto& meta : registry.listMetadata())
+                {
+                    const auto plugin_name = resolvePluginName(meta);
+                    const bool is_geo_command =
+                        (meta.cmd_name == "geo.calculate") ||
+                        (StringUtils::toUpperAscii(plugin_name) == "GEO");
+                    if (!is_geo_command || meta.sub_cmd_types.empty()) continue;
+
+                    for (const auto& st : meta.sub_cmd_types)
+                    {
+                        geo_subtypes.push_back(st.sub_type_name);
+                        geo_labels[st.sub_type_name] = st.description;
+                    }
+                    break;
+                }
+
+                std::string geo_tool_name = "geo_calculate";
+                if (const auto it = registration_state.command_tool_names.find("geo.calculate");
+                    it != registration_state.command_tool_names.end() && !it->second.empty())
+                {
+                    geo_tool_name = it->second.front();
+                }
+
+                json geo_form_schema = {
+                    {"type", "object"},
+                    {"properties", json::object()},
+                    {"required", json::array()}
+                };
+
+                // Define the handler for the geo form tool
+                auto geo_form_handler = [geo_subtypes, geo_labels, geo_tool_name](const json& args) -> mcp::server::CallToolResult
+                {
+                    mcp::server::CallToolResult result;
+
+                    const json response = {
+                        {"status", "success"},
+                        {"availability", "geo-form available"},
+                        {"message", "Geometry form UI available at http://localhost:6543/ui/geo-form.html"},
+                        {"resourceUri", "app://geo-form"},
+                        {"uiResourceUri", "http://localhost:6543/ui/geo-form.html"},
+                        {"toolName", geo_tool_name},
+                        {"subTypes", geo_subtypes},
+                        {"labels", geo_labels}
+                    };
+
+                    result.structuredContent = toMcpJson(response);
+                    result.content = McpJson::array();
+                    result.content.push_back(makeTextContent(
+                        "geo-form available\n"
+                        "resource: app://geo-form\n"
+                        "url: http://localhost:6543/ui/geo-form.html\n"
+                        "tool: " + geo_tool_name));
+                    result.content.push_back(makeResourceLinkContent(
+                        "http://localhost:6543/ui/geo-form.html",
+                        "geo-form-ui",
+                        "Geometry Form UI",
+                        "text/html"));
+                    result.content.push_back(makeResourceLinkContent(
+                        "app://geo-form",
+                        "geo-form-resource",
+                        "Geometry Form MCP Resource",
+                        "text/html"));
+                    result.content.push_back(makeTextContent(response.dump()));
+                    result.isError = false;
+                    return result;
+                };
+
+                registerToolWithUI(
+                    *mcp_server,
+                    "open-geo-form",
+                    "Open Geometry Form",
+                    "Open a geometry form UI and configure operation subtypes for the geometry MCP tool.",
+                    "geo-form.html",
+                    geo_form_schema,
+                    geo_form_handler);
+                // registerToolWithUI for geo.calculate end
+
                 mcp::server::ResourceTemplateDefinition app_template;
                 app_template.uriTemplate = "app://{path}";
                 app_template.name = "app-resource-template";
