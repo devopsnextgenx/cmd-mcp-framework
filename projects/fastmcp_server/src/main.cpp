@@ -1187,7 +1187,7 @@ int main(int argc, char** argv)
                         {"status", "success"},
                         {"availability", "math-form available"},
                         {"message", "Math form UI available at ui://ui/math-form.html"},
-                        {"resourceUri", "ui://ui/math-form"},
+                        {"resourceUri", "ui://ui/math-form.html"},
                         {"uiResourceUri", "ui://ui/math-form.html"},
                         {"toolName", math_tool_name},
                         {"subTypes", math_subtypes},
@@ -1196,21 +1196,6 @@ int main(int argc, char** argv)
 
                     result.structuredContent = toMcpJson(response);
                     result.content = McpJson::array();
-                    result.content.push_back(makeTextContent(
-                        "math-form available\n"
-                        "resource: ui://ui/math-form\n"
-                        "url: ui://ui/math-form.html\n"
-                        "tool: " + math_tool_name));
-                    result.content.push_back(makeResourceLinkContent(
-                        "ui://ui/math-form.html",
-                        "math-form-ui",
-                        "Math Form UI",
-                        "text/html"));
-                    result.content.push_back(makeResourceLinkContent(
-                        "ui://ui/math-form",
-                        "math-form-resource",
-                        "Math Form MCP Resource",
-                        "text/html"));
                     result.content.push_back(makeTextContent(response.dump()));
                     result.isError = false;
                     return result;
@@ -1266,7 +1251,7 @@ int main(int argc, char** argv)
                         {"status", "success"},
                         {"availability", "geo-form available"},
                         {"message", "Geometry form UI available at ui://ui/geo-form.html"},
-                        {"resourceUri", "ui://ui/geo-form"},
+                        {"resourceUri", "ui://ui/geo-form.html"},
                         {"uiResourceUri", "ui://ui/geo-form.html"},
                         {"toolName", geo_tool_name},
                         {"subTypes", geo_subtypes},
@@ -1275,21 +1260,6 @@ int main(int argc, char** argv)
 
                     result.structuredContent = toMcpJson(response);
                     result.content = McpJson::array();
-                    result.content.push_back(makeTextContent(
-                        "geo-form available\n"
-                        "resource: ui://ui/geo-form\n"
-                        "url: ui://ui/geo-form.html\n"
-                        "tool: " + geo_tool_name));
-                    result.content.push_back(makeResourceLinkContent(
-                        "ui://ui/geo-form.html",
-                        "geo-form-ui",
-                        "Geometry Form UI",
-                        "text/html"));
-                    result.content.push_back(makeResourceLinkContent(
-                        "ui://ui/geo-form",
-                        "geo-form-resource",
-                        "Geometry Form MCP Resource",
-                        "text/html"));
                     result.content.push_back(makeTextContent(response.dump()));
                     result.isError = false;
                     return result;
