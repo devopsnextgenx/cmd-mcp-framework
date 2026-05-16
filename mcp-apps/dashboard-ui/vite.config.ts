@@ -8,7 +8,7 @@ const INPUT = process.env.INPUT;
 const resourceManifest = {
   resources: [
     {
-      uri: 'app://math-form',
+      uri: 'ui://ui/math-form',
       name: 'Math Form UI',
       description: 'Math operation form with subtype enum and two numeric inputs',
       mimeType: 'text/html',
@@ -19,31 +19,9 @@ const resourceManifest = {
       },
     },
     {
-      uri: 'http://localhost:6543/ui/math-form.html',
-      name: 'Math Calculator Form',
-      description: 'Math calculator form UI for arithmetic operations via MCP tool',
-      mimeType: 'text/html',
-      _meta: {
-        ui: {
-          resourceUri: 'http://localhost:6543/ui/math-form.html',
-        },
-      },
-    },
-    {
-      uri: 'app://geo-form',
+      uri: 'ui://ui/geo-form',
       name: 'Geometry Form UI',
       description: 'Geometry operation form with perimeter, area, and volume calculations',
-      mimeType: 'text/html',
-      _meta: {
-        ui: {
-          resourceUri: 'http://localhost:6543/ui/geo-form.html',
-        },
-      },
-    },
-    {
-      uri: 'http://localhost:6543/ui/geo-form.html',
-      name: 'Geometry Calculator Form',
-      description: 'Geometry calculator form UI for perimeter, area, and volume operations via MCP tool',
       mimeType: 'text/html',
       _meta: {
         ui: {

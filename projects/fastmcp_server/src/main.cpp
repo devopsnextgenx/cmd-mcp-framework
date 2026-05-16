@@ -418,8 +418,7 @@ namespace
         toolDef.metadata = mcp::jsonrpc::JsonValue::object({
             {
                 "ui", mcp::jsonrpc::JsonValue::object({
-                    {"resourceUri", resourceUri},
-                    {"mimeType", "text/html;profile=mcp-app"}
+                    {"resourceUri", resourceUri}
                 })
             }
         });
@@ -661,25 +660,22 @@ namespace
         return (sep != std::string::npos) ? v.substr(0, sep) : (v.empty() ? fb : v);
     }
 
+    /**
+     * ui://ui/math-form.html or ui://ui/geo-form.html  --> /ui/math-form.html or /ui/geo-form.html (proxied app resource)
+     */
     bool uriToMcpAppsPath(const std::string& uri, std::string& path)
     {
         if (uri.empty()) return false;
-        if (uri == "app://math-form" || uri == "ui://math-form") { path = kMathFormPath; return true; }
-        if (uri == "app://dashboard-ui" || uri == "ui://dashboard-ui") { path = "/"; return true; }
-        if (StringUtils::beginsWith(uri, "app://") || StringUtils::beginsWith(uri, "ui://"))
+        // ui://ui/math-form.html or ui://ui/geo-form.html 
+        if (StringUtils::beginsWith(uri, "ui://") || StringUtils::beginsWith(uri, "ui://"))
         {
-            const std::string s = uri.substr(6);
-            path = (s.empty() || s[0] != '/') ? "/" + s : s;
-            return true;
+            std::string p = uri.substr(5);
+            if (StringUtils::beginsWith(p, "ui/"))
+            {
+                path = "/" + p;
+                return true;
+            }
         }
-        const std::string pfx = "http://localhost:6543";
-        if (StringUtils::beginsWith(uri, pfx))
-        {
-            const std::string s = uri.substr(pfx.size());
-            path = s.empty() ? "/" : s;
-            return true;
-        }
-        if (!uri.empty() && uri[0] == '/') { path = uri; return true; }
         return false;
     }
 
@@ -687,8 +683,7 @@ namespace
     {
         std::string path;
         if (!uriToMcpAppsPath(uri, path)) return uri;
-        if (path == kMathFormPath) return "app://math-form";
-        return (path == "/") ? "app://dashboard-ui" : "app://" + path.substr(1);
+        return (path == "/") ? "ui://dashboard-ui" : "ui://" + path.substr(1);
     }
 
     struct ExternalResourceInfo
@@ -1048,65 +1043,9 @@ int main(int argc, char** argv)
 
     auto plugins = buildPluginRegistry(registry);
 
-    // ── Build MCP resources (plugins + apps) ─────────────────────────────
+    // ── Build MCP resources (apps) ─────────────────────────────
     std::vector<RuntimeResource> resources;
     std::set<std::string> seen_resource_uris;
-    addRuntimeResource(resources, seen_resource_uris, RuntimeResource{
-        "plugins://overview",
-        "plugins-overview",
-        "Available plugins and subtype docs",
-        "text/markdown",
-        [&plugins]() { return buildPluginsMarkdown(plugins); }
-        }, mcp_debug);
-
-    for (const auto& [pname, _] : plugins)
-    {
-        const auto rname = canonicalResourceName(pname);
-        const auto uri = "plugin://" + rname;
-        addRuntimeResource(resources, seen_resource_uris, RuntimeResource{
-            uri,
-            rname,
-            "Plugin details for " + pname,
-            "text/markdown",
-            [&plugins, pname]()
- {
-std::string resolved;
-const auto* pi = findPluginInfo(plugins, pname, resolved);
-if (!pi) return std::string("Plugin not found: " + pname);
-return buildPluginDetailsMarkdown(resolved, *pi);
-}
-            }, mcp_debug);
-    }
-
-    // Add apps overview resource
-    addRuntimeResource(resources, seen_resource_uris, RuntimeResource{
-        "apps://overview",
-        "apps-overview",
-        "Available MCP apps and UI resources from local mcp-apps service",
-        "text/markdown",
-        []()
- {
-std::string doc = "# Available MCP Apps\n\n";
-doc += "Math Form: [app://math-form](app://math-form)\n\n";
-doc += "Access the form at http://localhost:6543/ui/math-form.html\n";
-return doc;
-}
-        }, mcp_debug);
-
-    addRuntimeResource(resources, seen_resource_uris, RuntimeResource{
-        "app://math-form",
-        "math-form",
-        "Math form HTML proxied from local mcp-apps server",
-        "text/html",
-        []()
- {
-std::string canon, mime, body, err;
-if (readMcpAppResource("app://math-form", canon, mime, body, err))
-    return body;
-return std::string("<h1>Math Form</h1><p>mcp-apps not reachable at localhost:6543</p>");
-}
-        }, mcp_debug);
-
     for (const auto& ext : fetchExternalAppResources())
     {
         addRuntimeResource(resources, seen_resource_uris, RuntimeResource{
@@ -1115,12 +1054,12 @@ return std::string("<h1>Math Form</h1><p>mcp-apps not reachable at localhost:654
             ext.description,
             ext.mime_type,
             [uri = ext.uri]()
- {
-std::string canon, mime, body, err;
-if (readMcpAppResource(uri, canon, mime, body, err))
-    return body;
-return std::string("Error: " + err);
-}
+            {
+                std::string canon, mime, body, err;
+                if (readMcpAppResource(uri, canon, mime, body, err))
+                    return body;
+                return std::string("Error: " + err);
+            }
             }, mcp_debug);
     }
 
@@ -1163,86 +1102,6 @@ return std::string("Error: " + err);
                 server_config.instructions = "Use tools for command execution and resources for plugin/app metadata. For the math form UI, call open-math-form and open http://localhost:6543/ui/math-form.html in a browser.";
 
                 auto mcp_server = mcp::server::Server::create(std::move(server_config));
-
-                // ─── Register resource template first ─────────────────────────
-                mcp::server::ResourceTemplateDefinition app_template;
-                app_template.uriTemplate = "app://{path}";
-                app_template.name = "app-resource-template";
-                app_template.description = "Template URI for resources exposed by local mcp-apps service";
-                app_template.mimeType = "text/plain";
-                if (mcp_debug)
-                {
-                    logDiag("MCP-REGISTER", "Registering resource template app://{path}");
-                }
-                mcp_server->registerResourceTemplate(std::move(app_template));
-
-                // ─── Pre-register app://math-form and app://geo-form resources ─
-                // Must happen BEFORE tool registration so SDK validates resourceUri correctly
-                auto registerAppResource = [&](const std::string& uri, const std::string& name,
-                    const std::string& description, const std::function<std::string()>& body_provider)
-                    {
-                        mcp::server::ResourceDefinition definition;
-                        definition.uri = uri;
-                        definition.name = name;
-                        definition.description = description;
-                        definition.mimeType = "text/html";
-
-                        if (mcp_debug)
-                        {
-                            logDiag("MCP-REGISTER", "Pre-registering resource " + uri);
-                        }
-
-                        mcp_server->registerResource(
-                            std::move(definition),
-                            [uri, body_provider, mcp_debug](const mcp::server::ResourceReadContext& ctx)
-                                -> std::vector<mcp::server::ResourceContent>
-                            {
-                                if (mcp_debug)
-                                {
-                                    logRequestContext("MCP-RESOURCE-READ", ctx.requestContext, "uri=" + uri);
-                                }
-                                std::string content = body_provider();
-                                auto item = mcp::server::ResourceContent::text(uri, content, "text/html");
-                                return { item };
-                            });
-                    };
-
-                // Register the app UI resources before tools reference them
-                registerAppResource("app://math-form", "math-form",
-                    "Math form HTML proxied from local mcp-apps server",
-                    [&resources]()
-                    {
-                        for (const auto& r : resources)
-                            if (r.uri == "app://math-form") return r.body_provider();
-                        return std::string("<h1>Math Form</h1><p>Resource not found</p>");
-                    });
-
-                registerAppResource("ui://math-form", "math-form-ui",
-                    "Math form UI HTML proxied from local mcp-apps server",
-                    [&resources]()
-                    {
-                        for (const auto& r : resources)
-                            if (r.uri == "app://math-form") return r.body_provider();
-                        return std::string("<h1>Math Form</h1><p>Resource not found</p>");
-                    });
-
-                registerAppResource("app://geo-form", "geo-form",
-                    "Geometry form HTML proxied from local mcp-apps server",
-                    [&resources]()
-                    {
-                        for (const auto& r : resources)
-                            if (r.uri == "app://geo-form") return r.body_provider();
-                        return std::string("<h1>Geometry Form</h1><p>Resource not found</p>");
-                    });
-
-                registerAppResource("ui://geo-form", "geo-form-ui",
-                    "Geometry form UI HTML proxied from local mcp-apps server",
-                    [&resources]()
-                    {
-                        for (const auto& r : resources)
-                            if (r.uri == "app://geo-form") return r.body_provider();
-                        return std::string("<h1>Geometry Form</h1><p>Resource not found</p>");
-                    });
 
                 ToolRegistrationState registration_state;
 
@@ -1319,9 +1178,9 @@ return std::string("Error: " + err);
                     const json response = {
                         {"status", "success"},
                         {"availability", "math-form available"},
-                        {"message", "Math form UI available at http://localhost:6543/ui/math-form.html"},
-                        {"resourceUri", "app://math-form"},
-                        {"uiResourceUri", "http://localhost:6543/ui/math-form.html"},
+                        {"message", "Math form UI available at ui://ui/math-form.html"},
+                        {"resourceUri", "ui://ui/math-form"},
+                        {"uiResourceUri", "ui://ui/math-form.html"},
                         {"toolName", math_tool_name},
                         {"subTypes", math_subtypes},
                         {"labels", math_labels}
@@ -1331,16 +1190,16 @@ return std::string("Error: " + err);
                     result.content = McpJson::array();
                     result.content.push_back(makeTextContent(
                         "math-form available\n"
-                        "resource: app://math-form\n"
-                        "url: http://localhost:6543/ui/math-form.html\n"
+                        "resource: ui://ui/math-form\n"
+                        "url: ui://ui/math-form.html\n"
                         "tool: " + math_tool_name));
                     result.content.push_back(makeResourceLinkContent(
-                        "http://localhost:6543/ui/math-form.html",
+                        "ui://ui/math-form.html",
                         "math-form-ui",
                         "Math Form UI",
                         "text/html"));
                     result.content.push_back(makeResourceLinkContent(
-                        "app://math-form",
+                        "ui://ui/math-form",
                         "math-form-resource",
                         "Math Form MCP Resource",
                         "text/html"));
@@ -1398,9 +1257,9 @@ return std::string("Error: " + err);
                     const json response = {
                         {"status", "success"},
                         {"availability", "geo-form available"},
-                        {"message", "Geometry form UI available at http://localhost:6543/ui/geo-form.html"},
-                        {"resourceUri", "app://geo-form"},
-                        {"uiResourceUri", "http://localhost:6543/ui/geo-form.html"},
+                        {"message", "Geometry form UI available at ui://ui/geo-form.html"},
+                        {"resourceUri", "ui://ui/geo-form"},
+                        {"uiResourceUri", "ui://ui/geo-form.html"},
                         {"toolName", geo_tool_name},
                         {"subTypes", geo_subtypes},
                         {"labels", geo_labels}
@@ -1410,16 +1269,16 @@ return std::string("Error: " + err);
                     result.content = McpJson::array();
                     result.content.push_back(makeTextContent(
                         "geo-form available\n"
-                        "resource: app://geo-form\n"
-                        "url: http://localhost:6543/ui/geo-form.html\n"
+                        "resource: ui://ui/geo-form\n"
+                        "url: ui://ui/geo-form.html\n"
                         "tool: " + geo_tool_name));
                     result.content.push_back(makeResourceLinkContent(
-                        "http://localhost:6543/ui/geo-form.html",
+                        "ui://ui/geo-form.html",
                         "geo-form-ui",
                         "Geometry Form UI",
                         "text/html"));
                     result.content.push_back(makeResourceLinkContent(
-                        "app://geo-form",
+                        "ui://ui/geo-form",
                         "geo-form-resource",
                         "Geometry Form MCP Resource",
                         "text/html"));
@@ -1441,8 +1300,8 @@ return std::string("Error: " + err);
                 // ─── Register remaining resources (non-app UI resources) ───────
                 for (const auto& resource : resources)
                 {
-                    // Skip app://math-form and app://geo-form as they're already registered
-                    if (resource.uri == "app://math-form" || resource.uri == "app://geo-form")
+                    // Skip ui://ui/math-form and ui://ui/geo-form as they're already registered
+                    if (resource.uri == "ui://ui/math-form" || resource.uri == "ui://ui/geo-form")
                         continue;
 
                     mcp::server::ResourceDefinition definition;
