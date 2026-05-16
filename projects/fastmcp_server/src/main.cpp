@@ -1569,11 +1569,11 @@ return std::string("Error: " + err);
             std::cout << "[REST GET] /mcp-apps (proxy -> :6543/)\n";
             proxy_mcp_app("/", res);
         });
-    rest_server.Get("/mcp-apps/:path", [&](const httplib::Request& req,
+    rest_server.Get(R"(/mcp-apps/(.+))", [&](const httplib::Request& req,
         httplib::Response& res)
         {
             addCorsHeaders(res);
-            const auto app_path = "/" + req.path_params.at("path");
+            const auto app_path = "/" + req.matches[1].str();
             std::cout << "[REST GET] /mcp-apps" << app_path << " (proxy -> :6543" << app_path << ")\n";
             proxy_mcp_app(app_path, res);
         });

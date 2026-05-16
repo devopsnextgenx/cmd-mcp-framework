@@ -5,11 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "node copy-ui-files.mjs",
+    "build": "node build-ui.mjs",
     "build-ui": "node build-ui.mjs",
     "build-ui:watch": "node build-ui.mjs --watch",
     "preview": "vite preview",
-    "start": "npm run build && tsx server.ts"
+    "start": "npm run build && npx tsx server.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/ext-apps": "^1.7.1",
