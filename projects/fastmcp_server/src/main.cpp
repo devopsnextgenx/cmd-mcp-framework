@@ -402,7 +402,7 @@ namespace
         std::string baseName = resourceFileName;
         const auto dotPos = baseName.find('.');
         if (dotPos != std::string::npos) baseName = baseName.substr(0, dotPos);
-        const std::string resourceUri = "ui://" + baseName;
+        const std::string resourceUri = "ui://ui/" + baseName + ".html";
         const bool mcp_debug = gMcpDebug.load();
 
         // ─── Register the Tool ───────────────────────────────────────────────
@@ -414,12 +414,20 @@ namespace
         toolDef.annotations = mcp::jsonrpc::JsonValue::object({
             {"readOnlyHint", true}
         });
+        toolDef.execution = mcp::jsonrpc::JsonValue::object({
+            {
+                "taskSupport", "forbidden"
+            }
+        });
         // Both resourceUri and mimeType profile are needed for inspector to recognize as app
         toolDef.metadata = mcp::jsonrpc::JsonValue::object({
             {
                 "ui", mcp::jsonrpc::JsonValue::object({
                     {"resourceUri", resourceUri}
                 })
+            },
+            {
+                "ui/resourceUri", resourceUri
             }
         });
 
@@ -1301,8 +1309,8 @@ int main(int argc, char** argv)
                 for (const auto& resource : resources)
                 {
                     // Skip ui://ui/math-form and ui://ui/geo-form as they're already registered
-                    if (resource.uri == "ui://ui/math-form" || resource.uri == "ui://ui/geo-form")
-                        continue;
+                    // if (resource.uri == "ui://ui/math-form" || resource.uri == "ui://ui/geo-form")
+                    //     continue;
 
                     mcp::server::ResourceDefinition definition;
                     definition.uri = resource.uri;
@@ -1328,7 +1336,7 @@ int main(int argc, char** argv)
                             auto item = mcp::server::ResourceContent::text(
                                 resource.uri,
                                 content,
-                                resource.mime_type
+                                resource.mime_type + ";profile=mcp-app"
                             );
                             return { item };
                         });
