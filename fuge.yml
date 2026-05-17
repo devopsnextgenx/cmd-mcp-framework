@@ -13,14 +13,20 @@ mcp-ui-server:
   run: npm run start
   ports:
     - ui=6543:6543
+
 mcp-server:
   type: process
-  path: .
-  run: ./build/bin/fastmcp_server
+  path: build/bin
+  run: ./fastmcp_server
   ports:
     - mcp=5432:5432
     - rest=5433:5433
-
+  env:
+    FASTMCP_MCP_DEBUG: true
+    FASTMCP_REQUIRE_SESSION_ID: true
+  dependencies:
+    - mcp-ui-server
+    
 mcp-inspector:
   type: process
   path: .
