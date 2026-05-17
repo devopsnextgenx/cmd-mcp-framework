@@ -1,6 +1,7 @@
 build/
 todo/
 graphify-out/
+graphify-out
 **/node_modules/
 **/dist/
 **/build/
