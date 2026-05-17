@@ -1234,10 +1234,23 @@ int main(int argc, char** argv)
 
                 std::string geo_tool_name = "geo_calculate";
                 if (const auto it = registration_state.command_tool_names.find("geo.calculate");
-                    it != registration_state.command_tool_names.end() && !it->second.empty())
+                it != registration_state.command_tool_names.end() && !it->second.empty())
                 {
                     geo_tool_name = it->second.front();
                 }
+                
+                // json geo_form_schema = ""; // Placeholder schema; can be expanded based on actual command requirements
+                // std::cout << "Building geo.calculate input schema based on command metadata...\n";
+                // for (const auto& meta : registry.listMetadata())
+                // {
+                //     if (meta.cmd_name == "geo.calculate")
+                //     {
+                //         std::optional<std::string>& fixed_subtype = registration_state.command_fixed_subtypes["geo.calculate"];
+                //         geo_form_schema = buildInputSchema(meta, );
+                //         break;
+                //     }
+                // }
+                // std::cout << "Generated geo.calculate input schema: " << geo_form_schema.dump(2) << '\n';
 
                 json geo_form_schema = {
                     {"type", "object"},
@@ -1248,6 +1261,7 @@ int main(int argc, char** argv)
                     }},
                     {"required", json::array({"left", "right", "subType"})}
                 };
+
 
                 // Define the handler for the geo form tool
                 auto geo_form_handler = [geo_subtypes, geo_labels, geo_tool_name](const json& args) -> mcp::server::CallToolResult
