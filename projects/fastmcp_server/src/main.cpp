@@ -81,7 +81,7 @@ namespace
     static const std::set<std::string> kNonPluginLibs = { "libcmd_sdk.so" };
 #endif
 
-    enum class ProtocolMode { MCP_ONLY, REST_ONLY, ALL };
+    using ProtocolMode = fastmcp::ProtocolMode;
 
     struct ServerConfig
     {
@@ -95,30 +95,10 @@ namespace
     std::atomic_uint64_t gMcpServerInstanceCounter{ 0 };
     std::mutex gLogMutex;
 
-    std::string nowUtcIso8601()
-    {
-        const auto now = std::chrono::system_clock::now();
-        const auto t = std::chrono::system_clock::to_time_t(now);
-        std::tm tm{};
-#if defined(_WIN32)
-        gmtime_s(&tm, &t);
-#else
-        gmtime_r(&t, &tm);
-#endif
-        std::ostringstream oss;
-        oss << std::put_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
-        return oss.str();
-    }
-
-    std::string safeSessionId(const std::optional<std::string>& session_id)
-    {
-        return session_id.has_value() ? *session_id : "<none>";
-    }
-
     void logDiag(const std::string& area, const std::string& message)
     {
         std::lock_guard<std::mutex> lock(gLogMutex);
-        std::cout << "[" << nowUtcIso8601() << "] [" << area << "] " << message << '\n';
+        std::cout << "[" << StringUtils::nowUtcIso8601() << "] [" << area << "] " << message << '\n';
     }
 
     std::string currentExceptionMessage()
@@ -143,7 +123,7 @@ namespace
     {
         logDiag(area,
             method_or_target +
-            " session=" + safeSessionId(request_context.sessionId) +
+            " session=" + StringUtils::safeSessionId(request_context.sessionId) +
             " protocol=" + request_context.protocolVersion);
     }
 
@@ -177,20 +157,6 @@ namespace
         McpJson block = McpJson::object();
         block["type"] = "text";
         block["text"] = text;
-        return block;
-    }
-
-    McpJson makeResourceLinkContent(const std::string& uri,
-        const std::string& name,
-        const std::string& description,
-        const std::string& mime_type)
-    {
-        McpJson block = McpJson::object();
-        block["type"] = "resource_link";
-        block["uri"] = uri;
-        block["name"] = name;
-        block["description"] = description;
-        block["mimeType"] = mime_type;
         return block;
     }
 
@@ -288,7 +254,6 @@ namespace
         return input_schema;
     }
 
-
     bool registerTool(const cmdsdk::CommandRegistry& registry, mcp::server::Server& server,
         const std::string& tool_name,
         const std::string& title,
@@ -311,10 +276,8 @@ namespace
             logDiag("MCP-REGISTER",
                 "Registering tool " + tool_name + " (command=" + original_cmd_name + ")");
         }
-
-        server.registerTool(
-            toolDef,
-            [handler, tool_name, original_cmd_name](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult
+        // lambda for tool action handler
+        auto toolHandler = [handler, tool_name, original_cmd_name](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult
             {
                 try
                 {
@@ -351,7 +314,11 @@ namespace
                     }
                     throw;
                 }
-            });
+            };
+
+        server.registerTool(
+            toolDef,
+            toolHandler);
 
         return true;
     }
@@ -363,7 +330,8 @@ namespace
     {
         const std::string original_cmd_name = cmd_meta.cmd_name;
 
-        const auto register_one = [&](const std::string& base_tool_name,
+        // Define lambda for tool registration
+        const auto lambda_register_tool = [&](const std::string& base_tool_name,
             const std::string& description,
             const json& input_schema,
             const std::function<json(const json&)>& wrapped_handler) -> bool
@@ -387,9 +355,7 @@ namespace
                         wrapped_handler);
             };
 
-        // Register exactly one MCP tool per command. If subTypes exist,
-        // buildInputSchema exposes them as enum options in the single tool input.
-        return register_one(
+        return lambda_register_tool(
             StringUtils::sanitizeToolName(original_cmd_name),
             cmd_meta.description,
             buildInputSchema(cmd_meta, std::nullopt),
@@ -427,14 +393,8 @@ namespace
         });
         // Both resourceUri and mimeType profile are needed for inspector to recognize as app
         toolDef.metadata = mcp::jsonrpc::JsonValue::object({
-            {
-                "ui", mcp::jsonrpc::JsonValue::object({
-                    {"resourceUri", resourceUri}
-                })
-            },
-            {
-                "ui/resourceUri", resourceUri
-            }
+            { "ui", mcp::jsonrpc::JsonValue::object({ { "resourceUri", resourceUri } }) },
+            { "ui/resourceUri", resourceUri }
         });
 
         if (mcp_debug)
@@ -442,35 +402,38 @@ namespace
             logDiag("MCP-REGISTER", "Registering app tool " + toolName + " with UI resource " + resourceUri);
         }
 
+        auto toolHandler = [handler, toolName, resourceUri](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult
+        {
+            try
+            {
+                if (gMcpDebug.load())
+                {
+                    logRequestContext("MCP-TOOL-CALL", context.requestContext, "tool=" + toolName);
+                }
+
+                const mcp::server::CallToolResult result = handler(fromMcpJson(context.arguments));
+                
+                if (gMcpDebug.load())
+                {
+                    logDiag("MCP-TOOL-SUCCESS", toolName + " executed successfully");
+                }
+
+                return result;
+            }
+            catch (const std::exception& e)
+            {
+                if (gMcpDebug.load())
+                {
+                    logDiag("MCP-TOOL-ERROR", toolName + " failed: " + e.what());
+                }
+                throw;
+            }
+        };
+
         server.registerTool(
             std::move(toolDef),
-            [handler, toolName, resourceUri](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult
-            {
-                try
-                {
-                    if (gMcpDebug.load())
-                    {
-                        logRequestContext("MCP-TOOL-CALL", context.requestContext, "tool=" + toolName);
-                    }
-
-                    const mcp::server::CallToolResult result = handler(fromMcpJson(context.arguments));
-                    
-                    if (gMcpDebug.load())
-                    {
-                        logDiag("MCP-TOOL-SUCCESS", toolName + " executed successfully");
-                    }
-
-                    return result;
-                }
-                catch (const std::exception& e)
-                {
-                    if (gMcpDebug.load())
-                    {
-                        logDiag("MCP-TOOL-ERROR", toolName + " failed: " + e.what());
-                    }
-                    throw;
-                }
-            });
+            toolHandler
+            );
 
         if (mcp_debug)
         {
@@ -674,32 +637,6 @@ namespace
         return (sep != std::string::npos) ? v.substr(0, sep) : (v.empty() ? fb : v);
     }
 
-    /**
-     * ui://ui/math-form.html or ui://ui/geo-form.html  --> /ui/math-form.html or /ui/geo-form.html (proxied app resource)
-     */
-    bool uriToMcpAppsPath(const std::string& uri, std::string& path)
-    {
-        if (uri.empty()) return false;
-        // ui://ui/math-form.html or ui://ui/geo-form.html 
-        if (StringUtils::beginsWith(uri, "ui://") || StringUtils::beginsWith(uri, "ui://"))
-        {
-            std::string p = uri.substr(5);
-            if (StringUtils::beginsWith(p, "ui/"))
-            {
-                path = "/" + p;
-                return true;
-            }
-        }
-        return false;
-    }
-
-    std::string toMcpAppUri(const std::string& uri)
-    {
-        std::string path;
-        if (!uriToMcpAppsPath(uri, path)) return uri;
-        return (path == "/") ? "ui://dashboard-ui" : "ui://" + path.substr(1);
-    }
-
     struct ExternalResourceInfo
     {
         std::string uri, name, description, mime_type;
@@ -723,9 +660,9 @@ namespace
                 if (!e.is_object() || !e.contains("uri")) continue;
                 const std::string ruri = e["uri"].get<std::string>();
                 std::string app_path;
-                if (!uriToMcpAppsPath(ruri, app_path)) continue;
+                if (!StringUtils::uriToMcpAppsPath(ruri, app_path)) continue;
                 ExternalResourceInfo info;
-                info.uri = toMcpAppUri(ruri);
+                info.uri = StringUtils::toMcpAppUri(ruri);
                 info.name = e.value("name", "App Resource: " + app_path);
                 info.description = e.value("description", "Resource from local mcp-apps");
                 info.mime_type = e.value("mimeType", "application/json");
@@ -744,7 +681,7 @@ namespace
     {
         const bool mcp_debug = gMcpDebug.load();
         std::string path;
-        if (!uriToMcpAppsPath(uri, path))
+        if (!StringUtils::uriToMcpAppsPath(uri, path))
         {
             if (mcp_debug)
             {
@@ -931,15 +868,7 @@ namespace
     </html>)HTML";
     }
 
-    std::string protocolModeToString(ProtocolMode m)
-    {
-        switch (m)
-        {
-        case ProtocolMode::MCP_ONLY:  return "MCP Only";
-        case ProtocolMode::REST_ONLY: return "REST Only";
-        default:                       return "MCP + REST";
-        }
-    }
+    // move to FastMcpStringUtils.hpp
 
     struct RuntimeResource
     {
@@ -1127,19 +1056,13 @@ int main(int argc, char** argv)
                         {
                             auto command = registry.create(cmd_name);
                             if (!command)
-                            {
                                 throw std::runtime_error("Tool not found: " + cmd_name);
-                            }
 
                             std::string error;
                             if (!command->validate(args, error))
-                            {
                                 throw std::invalid_argument("Validation failed: " + error);
-                            }
                             if (!command->execute(args, error))
-                            {
                                 throw std::runtime_error("Execution failed: " + error);
-                            }
 
                             return command->getResult();
                         };
@@ -1478,7 +1401,7 @@ int main(int argc, char** argv)
     std::cout << "\n========================================\n"
         << "FastMCP Server  (cpp-mcp-sdk by itcv-GmbH)\n"
         << "========================================\n"
-        << "Protocol mode : " << protocolModeToString(config.protocol_mode) << "\n\n"
+        << "Protocol mode : " << StringUtils::protocolModeToString(config.protocol_mode) << "\n\n"
         << "MCP  (cpp-mcp-sdk)  → http://0.0.0.0:" << config.port << "/mcp\n"
         << "REST (httplib)  → http://0.0.0.0:" << rest_port << "/\n\n"
         << "REST routes:\n"

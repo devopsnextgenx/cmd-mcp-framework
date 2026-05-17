@@ -2,6 +2,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <sstream>
 
 namespace fastmcp
 {
@@ -66,6 +70,58 @@ namespace fastmcp
         while (!out.empty() && (out.back() == '_' || out.back() == '-')) out.pop_back();
         if (out.empty()) return "tool";
         return out;
+    }
+
+    std::string FastMcpStringUtils::nowUtcIso8601()
+    {
+        const auto now = std::chrono::system_clock::now();
+        const auto t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm{};
+#if defined(_WIN32)
+        gmtime_s(&tm, &t);
+#else
+        gmtime_r(&t, &tm);
+#endif
+        std::ostringstream oss;
+        oss << std::put_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
+        return oss.str();
+    }
+
+    std::string FastMcpStringUtils::safeSessionId(const std::optional<std::string>& session_id)
+    {
+        return session_id.has_value() ? *session_id : "<none>";
+    }
+
+    bool FastMcpStringUtils::uriToMcpAppsPath(const std::string& uri, std::string& path)
+    {
+        if (uri.empty()) return false;
+        if (FastMcpStringUtils::beginsWith(uri, "ui://"))
+        {
+            std::string p = uri.substr(5);
+            if (FastMcpStringUtils::beginsWith(p, "ui/"))
+            {
+                path = "/" + p;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::string FastMcpStringUtils::toMcpAppUri(const std::string& uri)
+    {
+        std::string path;
+        if (!FastMcpStringUtils::uriToMcpAppsPath(uri, path)) return uri;
+        return (path == "/") ? "ui://dashboard-ui" : "ui://" + path.substr(1);
+    }
+
+    std::string FastMcpStringUtils::protocolModeToString(ProtocolMode mode)
+    {
+        switch (mode)
+        {
+        case ProtocolMode::MCP_ONLY:  return "MCP Only";
+        case ProtocolMode::REST_ONLY: return "REST Only";
+        default:                       return "MCP + REST";
+        }
     }
 
 } // namespace fastmcp
