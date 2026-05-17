@@ -1,0 +1,30 @@
+fuge_global:
+  tail: true
+  monitor: true
+  host: 127.0.0.1
+  dns_enabled: true
+  # Setting up your custom local cluster routing
+  dns_namespace: cmd-framework
+  dns_suffix: mcp.local
+
+mcp-ui-server:
+  type: process
+  path: mcp-apps/dashboard-ui
+  run: npm run start
+  ports:
+    - ui=6543:6543
+mcp-server:
+  type: process
+  path: .
+  run: ./build/bin/fastmcp_server
+  ports:
+    - mcp=5432:5432
+    - rest=5433:5433
+
+mcp-inspector:
+  type: process
+  path: .
+  run: npx @modelcontextprotocol/inspector --url http://localhost:5432/mcp --transport http
+  ports:
+    - inspector=6274:6274
+

@@ -1,6 +1,6 @@
 {
 	"servers": {
-		"cmd-mcp-framework": {
+		"cmd-mcp-server": {
 			"url": "http://localhost:5432/mcp",
 			"type": "http"
 		}
