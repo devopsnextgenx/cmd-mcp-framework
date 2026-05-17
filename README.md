@@ -273,6 +273,9 @@ Inside plugin `RegisterCommands(...)`, provide `CommandMetadata` with:
 - human-readable description
 - parameter definitions + validation semantics
 - subtype documentation (if applicable)
+- `is_tool` flag to register the command as an MCP tool (default: true)
+- `is_app_tool` flag to register a helper UI tool for the command (default: false)
+- optional `resource_uri` for the UI resource, such as `ui://ui/<cmd>-form.html`
 
 Example registration pattern for SubCmd:
 

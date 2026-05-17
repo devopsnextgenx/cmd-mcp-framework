@@ -369,14 +369,10 @@ namespace
         const std::string& toolName,
         const std::string& title,
         const std::string& description,
-        const std::string& resourceFileName,
+        const std::string& resource_uri,
         const json& input_schema,
         const std::function<mcp::server::CallToolResult(const json&)>& handler)
     {
-        std::string baseName = resourceFileName;
-        const auto dotPos = baseName.find('.');
-        if (dotPos != std::string::npos) baseName = baseName.substr(0, dotPos);
-        const std::string resourceUri = "ui://ui/" + baseName + ".html";
         const bool mcp_debug = gMcpDebug.load();
 
         // ─── Register the Tool ───────────────────────────────────────────────
@@ -395,16 +391,16 @@ namespace
         });
         // Both resourceUri and mimeType profile are needed for inspector to recognize as app
         toolDef.metadata = mcp::jsonrpc::JsonValue::object({
-            { "ui", mcp::jsonrpc::JsonValue::object({ { "resourceUri", resourceUri } }) },
-            { "ui/resourceUri", resourceUri }
+            { "ui", mcp::jsonrpc::JsonValue::object({ { "resourceUri", resource_uri } }) },
+            { "ui/resourceUri", resource_uri }
         });
 
         if (mcp_debug)
         {
-            logDiag("MCP-REGISTER", "Registering app tool " + toolName + " with UI resource " + resourceUri);
+            logDiag("MCP-REGISTER", "Registering app tool " + toolName + " with UI resource " + resource_uri);
         }
 
-        auto toolHandler = [handler, toolName, resourceUri](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult
+        auto toolHandler = [handler, toolName, resource_uri](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult
         {
             try
             {
@@ -439,10 +435,73 @@ namespace
 
         if (mcp_debug)
         {
-            logDiag("MCP-REGISTER", "Tool UI resource set to " + resourceUri + " (proxied/app resource)");
+            logDiag("MCP-REGISTER", "Tool UI resource set to " + resource_uri + " (proxied/app resource)");
         }
 
         return true;
+    }
+
+    bool registerAppToolWithUI(const cmdsdk::CommandRegistry& registry, mcp::server::Server& server,
+        const cmdsdk::CommandMetadata& cmd_meta,
+        ToolRegistrationState& registration_state)
+    {
+        const std::string original_cmd_name = cmd_meta.cmd_name;
+        const std::string tool_base_name = "open-" + StringUtils::sanitizeToolName(original_cmd_name) + "-form";
+        const std::string tool_name = allocateUniqueToolName(tool_base_name, registration_state);
+        const std::string resource_uri = cmd_meta.resource_uri.empty()
+            ? "ui://ui/" + StringUtils::sanitizeToolName(original_cmd_name) + "-form.html"
+            : cmd_meta.resource_uri;
+        const std::string title = "Open " + original_cmd_name + " Form";
+        const std::string description = "Open a UI form for " + original_cmd_name + ".";
+        const json input_schema = buildInputSchema(cmd_meta, std::nullopt);
+
+        std::vector<std::string> subtype_names;
+        std::map<std::string, std::string> subtype_labels;
+        for (const auto& st : cmd_meta.sub_cmd_types)
+        {
+            subtype_names.push_back(st.sub_type_name);
+            subtype_labels[st.sub_type_name] = st.description;
+        }
+
+        const std::string command_tool_name =
+            (!registration_state.command_tool_names[original_cmd_name].empty())
+                ? registration_state.command_tool_names[original_cmd_name].front()
+                : std::string();
+
+        auto ui_handler = [resource_uri, command_tool_name, original_cmd_name, subtype_names, subtype_labels](const json& args) -> mcp::server::CallToolResult
+        {
+            mcp::server::CallToolResult result;
+
+            json response = {
+                {"status", "success"},
+                {"availability", original_cmd_name + " form available"},
+                {"message", "UI form available"},
+                {"resourceUri", resource_uri},
+                {"toolName", command_tool_name},
+                {"commandName", original_cmd_name},
+                {"subTypes", subtype_names},
+                {"labels", subtype_labels}
+            };
+
+            if (!args.is_null() && !args.empty())
+            {
+                response["args"] = args;
+            }
+
+            result.structuredContent = toMcpJson(response);
+            result.content = McpJson::array();
+            result.content.push_back(makeTextContent(response.dump()));
+            result.isError = false;
+            return result;
+        };
+
+        return registerToolWithUI(server,
+            tool_name,
+            title,
+            description,
+            resource_uri,
+            input_schema,
+            ui_handler);
     }
 
     // ── argument parsing ──────────────────────────────────────────────────────
@@ -629,7 +688,6 @@ namespace
     // ── mcp-apps reverse-proxy helpers ────────────────────────────────────────
     constexpr const char* kMcpAppsHost = "localhost";
     constexpr int         kMcpAppsPort = 6543;
-    constexpr const char* kMathFormPath = "/ui/math-form.html";
 
     std::string contentTypeFromResponse(const httplib::Result& r, const std::string& fb)
     {
@@ -987,7 +1045,7 @@ int main(int argc, char** argv)
                     std::nullopt,
                     std::nullopt);
                 server_config.serverInfo = mcp::lifecycle::session::Implementation("fastmcp_server", "0.3.0");
-                server_config.instructions = "Use tools for command execution and resources for plugin/app metadata. For the math form UI, call open-math-form and open http://localhost:6543/ui/math-form.html in a browser.";
+                server_config.instructions = "Use tools for command execution and resources for plugin/app metadata. UI-enabled commands can expose app tools via CommandMetadata.is_app_tool and resource_uri.";
 
                 auto mcp_server = mcp::server::Server::create(std::move(server_config));
 
@@ -1012,153 +1070,25 @@ int main(int argc, char** argv)
                             return command->getResult();
                         };
 
-                    registerCmdAsTool(
-                        registry,
-                        *mcp_server,
-                        meta,
-                        cmd_handler,
-                        registration_state);
-                }
-
-                // registerToolWithUI for math.calculate start
-                std::vector<std::string> math_subtypes;
-                std::map<std::string, std::string> math_labels;
-                for (const auto& meta : registry.listMetadata())
-                {
-                    const auto plugin_name = resolvePluginName(meta);
-                    const bool is_math_command =
-                        (meta.cmd_name == "math.calculate") ||
-                        (StringUtils::toUpperAscii(plugin_name) == "MATH");
-                    if (!is_math_command || meta.sub_cmd_types.empty()) continue;
-
-                    for (const auto& st : meta.sub_cmd_types)
+                    if (meta.is_tool)
                     {
-                        math_subtypes.push_back(st.sub_type_name);
-                        math_labels[st.sub_type_name] = st.description;
+                        registerCmdAsTool(
+                            registry,
+                            *mcp_server,
+                            meta,
+                            cmd_handler,
+                            registration_state);
                     }
-                    break;
-                }
 
-                std::string math_tool_name = "math_calculate";
-                if (const auto it = registration_state.command_tool_names.find("math.calculate");
-                    it != registration_state.command_tool_names.end() && !it->second.empty())
-                {
-                    math_tool_name = it->second.front();
-                }
-
-                json math_form_schema = {
-                    {"type", "object"},
-                    {"properties", json{
-                        {"left", json{{"type", "number"}, {"description", "first number in operation"}}},
-                        {"right", json{{"type", "number"}, {"description", "second number in operation"}}},
-                        {"subType", json{{"type", "string"}, {"enum", math_subtypes}, {"description", "operator option for math"}}}
-                    }},
-                    {"required", json::array({"left", "right", "subType"})}
-                };
-
-                // Define the handler for the math form tool
-                auto math_form_handler = [math_subtypes, math_labels, math_tool_name](const json& args) -> mcp::server::CallToolResult
-                {
-                    mcp::server::CallToolResult result;
-
-                    json response = {
-                        {"status", "success"},
-                        {"availability", "math-form available"},
-                        {"message", "Math form UI available"},
-                        {"resourceUri", "ui://ui/math-form.html"},
-                        {"toolName", math_tool_name},
-                        {"subTypes", math_subtypes},
-                        {"labels", math_labels}
-                    };
-
-                    if (args.contains("left")) response["left"] = args["left"];
-                    if (args.contains("right")) response["right"] = args["right"];
-                    if (args.contains("subType")) response["subType"] = args["subType"];
-
-                    result.structuredContent = toMcpJson(response);
-                    result.content = McpJson::array();
-                    result.content.push_back(makeTextContent(response.dump()));
-                    result.isError = false;
-                    return result;
-                };
-
-                registerToolWithUI(
-                    *mcp_server,
-                    "open-math-form",
-                    "Open Math Form",
-                    "Open a math form UI and configure operation subtypes for the math MCP tool.",
-                    "math-form.html",
-                    math_form_schema,
-                    math_form_handler);
-
-                // registerToolWithUI for geo.calculate start
-                std::vector<std::string> geo_subtypes;
-                std::map<std::string, std::string> geo_labels;
-                json geo_form_schema = ""; // Placeholder schema; can be expanded based on actual command requirements
-                for (const auto& meta : registry.listMetadata())
-                {
-                    const auto plugin_name = resolvePluginName(meta);
-                    const bool is_geo_command =
-                        (meta.cmd_name == "geo.calculate") ||
-                        (StringUtils::toUpperAscii(plugin_name) == "GEO");
-                    if (!is_geo_command || meta.sub_cmd_types.empty()) continue;
-
-                    for (const auto& st : meta.sub_cmd_types)
+                    if (meta.is_app_tool)
                     {
-                        geo_subtypes.push_back(st.sub_type_name);
-                        geo_labels[st.sub_type_name] = st.description;
+                        registerAppToolWithUI(
+                            registry,
+                            *mcp_server,
+                            meta,
+                            registration_state);
                     }
-                    geo_form_schema = buildInputSchema(meta, geo_subtypes);
-                    break;
                 }
-
-                std::string geo_tool_name = "geo_calculate";
-                if (const auto it = registration_state.command_tool_names.find("geo.calculate");
-                it != registration_state.command_tool_names.end() && !it->second.empty())
-                {
-                    geo_tool_name = it->second.front();
-                }
-
-                // Define the handler for the geo form tool
-                auto geo_form_handler = [geo_subtypes, geo_labels, geo_tool_name](const json& args) -> mcp::server::CallToolResult
-                {
-                    mcp::server::CallToolResult result;
-
-                    json response = {
-                        {"status", "success"},
-                        {"availability", "geo-form available"},
-                        {"message", "Geometry form UI available"},
-                        {"resourceUri", "ui://ui/geo-form.html"},
-                        {"toolName", geo_tool_name},
-                        {"subTypes", geo_subtypes},
-                        {"labels", geo_labels}
-                    };
-
-                    if (args.contains("a")) response["a"] = args["a"];
-                    if (args.contains("b")) response["b"] = args["b"];
-                    if (args.contains("c")) response["c"] = args["c"];
-                    if (args.contains("height")) response["height"] = args["height"];
-                    if (args.contains("radius")) response["radius"] = args["radius"];
-                    if (args.contains("side")) response["side"] = args["side"];
-                    if (args.contains("slant")) response["slant"] = args["slant"];
-                    if (args.contains("subType")) response["subType"] = args["subType"];
-
-                    result.structuredContent = toMcpJson(response);
-                    result.content = McpJson::array();
-                    result.content.push_back(makeTextContent(response.dump()));
-                    result.isError = false;
-                    return result;
-                };
-
-                registerToolWithUI(
-                    *mcp_server,
-                    "open-geo-form",
-                    "Open Geometry Form",
-                    "Open a geometry form UI and configure operation subtypes for the geometry MCP tool.",
-                    "geo-form.html",
-                    geo_form_schema,
-                    geo_form_handler);
-                // registerToolWithUI for geo.calculate end
 
                 // ─── Register remaining resources (non-app UI resources) ───────
                 for (const auto& resource : resources)
