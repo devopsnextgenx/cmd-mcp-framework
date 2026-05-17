@@ -6,6 +6,7 @@
 #include <ctime>
 #include <iomanip>
 #include <sstream>
+#include <nlohmann/json.hpp>
 
 namespace fastmcp
 {
@@ -122,6 +123,35 @@ namespace fastmcp
         case ProtocolMode::REST_ONLY: return "REST Only";
         default:                       return "MCP + REST";
         }
+    }
+
+    std::string FastMcpStringUtils::buildPluginsMarkdown(const std::map<std::string, PluginInfo>& plugins)
+    {
+        std::string doc = "# Available Plugins and SubCommand Types\n\n";
+        for (const auto& [pname, subtypes] : plugins)
+        {
+            doc += "## Plugin: " + pname + "\n\n### Available SubCommand Types:\n\n";
+            for (const auto& [sname, sm] : subtypes)
+            {
+                doc += "- **" + sname + "**: " + sm.description + "\n";
+                if (sm.response_schema.is_object() && !sm.response_schema.empty())
+                    doc += "  - Response schema:\n```json\n" + sm.response_schema.dump(2) + "\n```\n";
+            }
+            doc += "\n";
+        }
+        return doc;
+    }
+
+    std::string FastMcpStringUtils::buildPluginDetailsMarkdown(const std::string& pname, const PluginInfo& pi)
+    {
+        std::string doc = "# Plugin: " + pname + "\n\n## Available SubCommand Types\n\n";
+        for (const auto& [sname, sm] : pi)
+        {
+            doc += "- **" + sname + "**: " + sm.description + "\n";
+            if (sm.response_schema.is_object() && !sm.response_schema.empty())
+                doc += "  - Response schema:\n```json\n" + sm.response_schema.dump(2) + "\n```\n";
+        }
+        return doc;
     }
 
 } // namespace fastmcp
