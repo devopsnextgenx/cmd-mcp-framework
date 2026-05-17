@@ -1174,8 +1174,12 @@ int main(int argc, char** argv)
 
                 json math_form_schema = {
                     {"type", "object"},
-                    {"properties", json::object()},
-                    {"required", json::array()}
+                    {"properties", json{
+                        {"left", json{{"type", "number"}, {"description", "first number in operation"}}},
+                        {"right", json{{"type", "number"}, {"description", "second number in operation"}}},
+                        {"subType", json{{"type", "string"}, {"enum", math_subtypes}, {"description", "operator option for math"}}}
+                    }},
+                    {"required", json::array({"left", "right", "subType"})}
                 };
 
                 // Define the handler for the math form tool
