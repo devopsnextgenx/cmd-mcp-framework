@@ -2,11 +2,15 @@
 
 #include <optional>
 #include <string>
+#include <map>
+#include "cmdsdk/CommandMetadata.hpp"
 
 namespace fastmcp
 {
 
 enum class ProtocolMode { MCP_ONLY, REST_ONLY, ALL };
+
+using PluginInfo = std::map<std::string, cmdsdk::SubCmdTypeMetadata>;
 
 class FastMcpStringUtils
 {
@@ -21,6 +25,8 @@ public:
     static bool uriToMcpAppsPath(const std::string& uri, std::string& path);
     static std::string toMcpAppUri(const std::string& uri);
     static std::string protocolModeToString(ProtocolMode mode);
+    static std::string buildPluginsMarkdown(const std::map<std::string, PluginInfo>& plugins);
+    static std::string buildPluginDetailsMarkdown(const std::string& pname, const PluginInfo& pi);
 };
 
 } // namespace fastmcp

@@ -112,6 +112,8 @@ class GeometryCmdProvider final : public cmdsdk::SubCmd {
         {"height",   "number", false, "Must be numeric (>0).",                              "Height for 3-D shapes."},
         {"slant",    "number", false, "Must be numeric (>0).",                              "Slant height for a pyramid lateral face."},
     };
+    metadata.is_app_tool = true;
+    metadata.resource_uri = "ui://ui/geo-form.html";
     metadata.sub_cmd_types = {
       {"GEO.PERIMETER.TRIANGLE",  "Perimeter of a triangle. Params: a, b, c.", geoResultSchema("GEO.PERIMETER.TRIANGLE")},
       {"GEO.PERIMETER.RECTANGLE", "Perimeter of a rectangle. Params: a (length), b (width).", geoResultSchema("GEO.PERIMETER.RECTANGLE")},

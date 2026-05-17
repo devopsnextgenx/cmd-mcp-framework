@@ -26,6 +26,9 @@ struct CommandMetadata {
   std::string description;
   std::vector<ParameterMetadata> parameters;
   std::vector<SubCmdTypeMetadata> sub_cmd_types;
+  bool is_tool{true};
+  bool is_app_tool{false};
+  std::string resource_uri;
 };
 
 }  // namespace cmdsdk

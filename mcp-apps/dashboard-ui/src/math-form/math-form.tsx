@@ -22,6 +22,9 @@ interface MathFormConfig {
   subTypes?: string[];
   labels?: Record<string, string>;
   toolName?: string;
+  left?: number;
+  right?: number;
+  subType?: string;
 }
 
 interface MathResult {
@@ -50,7 +53,13 @@ function extractResultValue(structuredContent: unknown): number | null {
 function isMathFormConfig(value: unknown): value is MathFormConfig {
   if (!value || typeof value !== 'object') return false;
   const candidate = value as MathFormConfig;
-  return Array.isArray(candidate.subTypes) || typeof candidate.toolName === 'string';
+  return (
+    Array.isArray(candidate.subTypes) ||
+    typeof candidate.toolName === 'string' ||
+    typeof candidate.left === 'number' ||
+    typeof candidate.right === 'number' ||
+    typeof candidate.subType === 'string'
+  );
 }
 
 // ─── Component ───────────────────────────────────────────────────────────────
@@ -78,6 +87,16 @@ function MathFormWidget() {
         }
         if (data.subTypes?.length) {
           setOperation(data.subTypes[0]);
+        }
+        // Prepopulate fields if provided
+        if (typeof data.left === 'number') {
+          setLeftValue(data.left.toString());
+        }
+        if (typeof data.right === 'number') {
+          setRightValue(data.right.toString());
+        }
+        if (typeof data.subType === 'string') {
+          setOperation(data.subType);
         }
       }
       setIsConnected(true);
