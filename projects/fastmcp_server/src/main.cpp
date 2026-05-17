@@ -1116,7 +1116,7 @@ int main(int argc, char** argv)
                 {
                     mcp::server::CallToolResult result;
 
-                    const json response = {
+                    json response = {
                         {"status", "success"},
                         {"availability", "math-form available"},
                         {"message", "Math form UI available"},
@@ -1125,6 +1125,10 @@ int main(int argc, char** argv)
                         {"subTypes", math_subtypes},
                         {"labels", math_labels}
                     };
+
+                    if (args.contains("left")) response["left"] = args["left"];
+                    if (args.contains("right")) response["right"] = args["right"];
+                    if (args.contains("subType")) response["subType"] = args["subType"];
 
                     result.structuredContent = toMcpJson(response);
                     result.content = McpJson::array();
@@ -1175,7 +1179,7 @@ int main(int argc, char** argv)
                 {
                     mcp::server::CallToolResult result;
 
-                    const json response = {
+                    json response = {
                         {"status", "success"},
                         {"availability", "geo-form available"},
                         {"message", "Geometry form UI available"},
@@ -1184,6 +1188,15 @@ int main(int argc, char** argv)
                         {"subTypes", geo_subtypes},
                         {"labels", geo_labels}
                     };
+
+                    if (args.contains("a")) response["a"] = args["a"];
+                    if (args.contains("b")) response["b"] = args["b"];
+                    if (args.contains("c")) response["c"] = args["c"];
+                    if (args.contains("height")) response["height"] = args["height"];
+                    if (args.contains("radius")) response["radius"] = args["radius"];
+                    if (args.contains("side")) response["side"] = args["side"];
+                    if (args.contains("slant")) response["slant"] = args["slant"];
+                    if (args.contains("subType")) response["subType"] = args["subType"];
 
                     result.structuredContent = toMcpJson(response);
                     result.content = McpJson::array();

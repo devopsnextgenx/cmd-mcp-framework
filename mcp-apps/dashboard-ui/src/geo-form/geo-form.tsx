@@ -42,6 +42,14 @@ interface GeoFormConfig {
   subTypes?: string[];
   labels?: Record<string, string>;
   toolName?: string;
+  a?: number;
+  b?: number;
+  c?: number;
+  radius?: number;
+  height?: number;
+  side?: number;
+  slant?: number;
+  subType?: string;
 }
 
 interface GeoResult {
@@ -76,7 +84,18 @@ function extractResultValue(structuredContent: unknown): number | null {
 function isGeoFormConfig(value: unknown): value is GeoFormConfig {
   if (!value || typeof value !== 'object') return false;
   const candidate = value as GeoFormConfig;
-  return Array.isArray(candidate.subTypes) || typeof candidate.toolName === 'string';
+  return (
+    Array.isArray(candidate.subTypes) ||
+    typeof candidate.toolName === 'string' ||
+    typeof candidate.a === 'number' ||
+    typeof candidate.b === 'number' ||
+    typeof candidate.c === 'number' ||
+    typeof candidate.radius === 'number' ||
+    typeof candidate.height === 'number' ||
+    typeof candidate.side === 'number' ||
+    typeof candidate.slant === 'number' ||
+    typeof candidate.subType === 'string'
+  );
 }
 
 // ─── Component ───────────────────────────────────────────────────────────────
@@ -113,6 +132,19 @@ function GeoFormWidget() {
         if (data.subTypes?.length) {
           setOperation(data.subTypes[0]);
         }
+        // Prepopulate fields if provided
+        const newParamValues = { ...paramValues };
+        if (typeof data.a === 'number') newParamValues.a = data.a.toString();
+        if (typeof data.b === 'number') newParamValues.b = data.b.toString();
+        if (typeof data.c === 'number') newParamValues.c = data.c.toString();
+        if (typeof data.radius === 'number') newParamValues.radius = data.radius.toString();
+        if (typeof data.height === 'number') newParamValues.height = data.height.toString();
+        if (typeof data.side === 'number') newParamValues.side = data.side.toString();
+        if (typeof data.slant === 'number') newParamValues.slant = data.slant.toString();
+        setParamValues(newParamValues);
+        if (typeof data.subType === 'string') {
+          setOperation(data.subType);
+        }
       }
       setIsConnected(true);
     };
@@ -124,7 +156,7 @@ function GeoFormWidget() {
         // Gracefully degrade — the form still works; users can enter values manually.
         setIsConnected(false);
       });
-  }, [appInstance]);
+  }, [appInstance, paramValues]);
 
   const operations = buildOperations(formConfig);
   const currentOp = operations.find(op => op.value === operation);
