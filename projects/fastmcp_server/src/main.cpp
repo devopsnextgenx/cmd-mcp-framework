@@ -219,7 +219,7 @@ namespace
     }
 
     json buildInputSchema(const cmdsdk::CommandMetadata& cmd_meta,
-        const std::optional<std::string>& fixed_subtype)
+        const std::optional<std::vector<std::string>>& fixed_subtype)
     {
         json input_schema = {
             {"type", "object"},
@@ -248,9 +248,15 @@ namespace
 
         if (fixed_subtype.has_value())
         {
+            // convert to json array            
+            json enum_values = json::array();
+            for (const auto& st : *fixed_subtype)
+            {
+                enum_values.push_back(st);
+            }
             input_schema["properties"]["subType"] = {
                 {"type", "string"},
-                {"enum", json::array({ *fixed_subtype })},
+                {"enum", enum_values},
                 {"description", "Injected subType for this tool"}
             };
         }
@@ -1216,6 +1222,7 @@ int main(int argc, char** argv)
                 // registerToolWithUI for geo.calculate start
                 std::vector<std::string> geo_subtypes;
                 std::map<std::string, std::string> geo_labels;
+                json geo_form_schema = ""; // Placeholder schema; can be expanded based on actual command requirements
                 for (const auto& meta : registry.listMetadata())
                 {
                     const auto plugin_name = resolvePluginName(meta);
@@ -1229,6 +1236,7 @@ int main(int argc, char** argv)
                         geo_subtypes.push_back(st.sub_type_name);
                         geo_labels[st.sub_type_name] = st.description;
                     }
+                    geo_form_schema = buildInputSchema(meta, geo_subtypes);
                     break;
                 }
 
@@ -1238,30 +1246,6 @@ int main(int argc, char** argv)
                 {
                     geo_tool_name = it->second.front();
                 }
-                
-                // json geo_form_schema = ""; // Placeholder schema; can be expanded based on actual command requirements
-                // std::cout << "Building geo.calculate input schema based on command metadata...\n";
-                // for (const auto& meta : registry.listMetadata())
-                // {
-                //     if (meta.cmd_name == "geo.calculate")
-                //     {
-                //         std::optional<std::string>& fixed_subtype = registration_state.command_fixed_subtypes["geo.calculate"];
-                //         geo_form_schema = buildInputSchema(meta, );
-                //         break;
-                //     }
-                // }
-                // std::cout << "Generated geo.calculate input schema: " << geo_form_schema.dump(2) << '\n';
-
-                json geo_form_schema = {
-                    {"type", "object"},
-                    {"properties", json{
-                        {"left", json{{"type", "number"}, {"description", "first number in operation"}}},
-                        {"right", json{{"type", "number"}, {"description", "second number in operation"}}},
-                        {"subType", json{{"type", "string"}, {"enum", geo_subtypes}, {"description", "operator option for geometry"}}}
-                    }},
-                    {"required", json::array({"left", "right", "subType"})}
-                };
-
 
                 // Define the handler for the geo form tool
                 auto geo_form_handler = [geo_subtypes, geo_labels, geo_tool_name](const json& args) -> mcp::server::CallToolResult
