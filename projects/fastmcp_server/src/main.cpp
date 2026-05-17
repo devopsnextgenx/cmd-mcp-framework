@@ -1186,9 +1186,8 @@ int main(int argc, char** argv)
                     const json response = {
                         {"status", "success"},
                         {"availability", "math-form available"},
-                        {"message", "Math form UI available at ui://ui/math-form.html"},
+                        {"message", "Math form UI available"},
                         {"resourceUri", "ui://ui/math-form.html"},
-                        {"uiResourceUri", "ui://ui/math-form.html"},
                         {"toolName", math_tool_name},
                         {"subTypes", math_subtypes},
                         {"labels", math_labels}
@@ -1250,9 +1249,8 @@ int main(int argc, char** argv)
                     const json response = {
                         {"status", "success"},
                         {"availability", "geo-form available"},
-                        {"message", "Geometry form UI available at ui://ui/geo-form.html"},
+                        {"message", "Geometry form UI available"},
                         {"resourceUri", "ui://ui/geo-form.html"},
-                        {"uiResourceUri", "ui://ui/geo-form.html"},
                         {"toolName", geo_tool_name},
                         {"subTypes", geo_subtypes},
                         {"labels", geo_labels}
