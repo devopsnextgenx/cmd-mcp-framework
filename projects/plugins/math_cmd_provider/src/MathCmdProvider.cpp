@@ -57,8 +57,6 @@ class MathCmdProvider final : public cmdsdk::SubCmd {
         {"left",  "number", true, "Must be numeric.", "Left operand."},
         {"right", "number", true, "Must be numeric.", "Right operand."},
     };
-    metadata.is_app_tool = true;
-    metadata.resource_uri = "ui://ui/math-form.html";
     metadata.sub_cmd_types = {
       {"MATH.ADD", "Add left and right.", mathResultSchema("MATH.ADD", "addition")},
       {"MATH.SUB", "Subtract right from left.", mathResultSchema("MATH.SUB", "subtraction")},
@@ -67,6 +65,8 @@ class MathCmdProvider final : public cmdsdk::SubCmd {
       {"MATH.MOD", "Modulo of left by right.", mathResultSchema("MATH.MOD", "modulo", true)},
       {"MATH.POW", "Raise left to the power of right.", mathResultSchema("MATH.POW", "power")},
     };
+    metadata.is_app_tool = true;
+    metadata.resource_uri = "ui://ui/math-form.html";
     return metadata;
   }
 
