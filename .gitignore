@@ -1,3 +1,13 @@
 build/
 todo/
 graphify-out/
+**/node_modules/
+**/dist/
+**/build/
+**/out/
+**/coverage/
+**/package-lock.json
+**/yarn.lock
+**/.DS_Stores
+.tmp_cpp_mcp_sdk/
+approval-mcpapp/

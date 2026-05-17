@@ -1,3 +1,28 @@
+﻿// ---------------------------------------------------------------------------
+// fastmcp_server/src/main.cpp
+//
+// MCP protocol layer  → cpp-mcp-sdk (itcv-GmbH/cpp-mcp-sdk, C++17)
+//   Key APIs:
+//     • mcp::server::Server::create(configuration)
+//     • server->registerTool(definition, handler)
+//     • server->registerResource(definition, handler)
+//     • mcp::server::StreamableHttpServerRunner for /mcp transport
+//
+// Auxiliary REST layer → cpp-httplib (kept for non-MCP routes)
+//   GET  /             — homepage
+//   GET  /swagger      — Swagger UI
+//   GET  /openapi.json — combined OpenAPI spec
+//   GET  /openapi.yaml — combined OpenAPI spec (YAML)
+//   GET  /openapi/:p   — per-plugin spec
+//   POST /api/:cmd     — REST command execution
+//   GET  /mcp-apps*    — reverse-proxy to mcp-apps at :6543
+//
+// Port layout:
+//   MCP  → port N   (e.g. 5432) — cpp-mcp-sdk streamable HTTP runner
+//   REST → port N+1 (e.g. 5433) — httplib on a detached thread
+// ---------------------------------------------------------------------------
+
+#include <chrono>
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -7,12 +32,28 @@
 #include <map>
 #include <algorithm>
 #include <cctype>
-#include <algorithm>
-#include <cctype>
+#include <thread>
+#include <memory>
+#include <atomic>
+#include <csignal>
+#include <cstdint>
+#include <optional>
+#include <mutex>
+#include <iomanip>
+#include <cstdlib>
 
+// ── cpp-mcp-sdk ───────────────────────────────────────────────────────────
+#include <mcp/lifecycle/session/implementation.hpp>
+#include <mcp/lifecycle/session/resources_capability.hpp>
+#include <mcp/lifecycle/session/server_capabilities.hpp>
+#include <mcp/lifecycle/session/tools_capability.hpp>
+#include <mcp/server/all.hpp>
+
+// ── Auxiliary HTTP for non-MCP routes ────────────────────────────────────
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include "FastMcpStringUtils.hpp"
 #include "PluginLoader.hpp"
 #include "cmdsdk/CommandRegistry.hpp"
 #include "cmdsdk/OpenApiGenerator.hpp"
@@ -22,1404 +63,1507 @@
 #include "cmdsdk/PluginMetadata.hpp"
 #include "cmdsdk/SwaggerResources.hpp"
 
-namespace {
+namespace
+{
 
-constexpr int kDefaultServerPort = CMDSDK_SERVER_PORT;
+    using json = nlohmann::json;
+    using StringUtils = fastmcp::FastMcpStringUtils;
 
-// ---------------------------------------------------------------------------
-// Known SDK libraries that live in lib/ but are NOT plugins.
-// Extend this list if more SDK shared libs are added.
-// ---------------------------------------------------------------------------
+    using McpJson = mcp::jsonrpc::JsonValue;
+
+    constexpr int kDefaultServerPort = CMDSDK_SERVER_PORT;
+
 #if defined(_WIN32)
-static const std::set<std::string> kNonPluginLibs = {
-  "cmd_sdk.dll",
-};
+    static const std::set<std::string> kNonPluginLibs = { "cmd_sdk.dll" };
 #elif defined(__APPLE__)
-static const std::set<std::string> kNonPluginLibs = {
-  "libcmd_sdk.dylib",
-};
+    static const std::set<std::string> kNonPluginLibs = { "libcmd_sdk.dylib" };
 #else
-static const std::set<std::string> kNonPluginLibs = {
-  "libcmd_sdk.so",
-};
+    static const std::set<std::string> kNonPluginLibs = { "libcmd_sdk.so" };
 #endif
 
-// Protocol modes for endpoint support
-enum class ProtocolMode {
-  MCP_ONLY,   // Only MCP endpoints
-  REST_ONLY,  // Only REST endpoints
-  ALL         // Both MCP and REST endpoints (default)
-};
+    enum class ProtocolMode { MCP_ONLY, REST_ONLY, ALL };
 
-struct ServerConfig {
-  int port = kDefaultServerPort;
-  std::vector<std::filesystem::path> plugin_paths;
-  ProtocolMode protocol_mode = ProtocolMode::ALL;
-};
-
-ServerConfig parseArguments(int argc, char** argv) {
-  ServerConfig config;
-  for (int i = 1; i < argc; ++i) {
-    std::string arg = argv[i];
-    if (arg.starts_with("--port=")) {
-      config.port = std::stoi(arg.substr(7));
-    } else if (arg.starts_with("--plugins=")) {
-      std::string plugins_str = arg.substr(10);
-      std::stringstream ss(plugins_str);
-      std::string plugin;
-      while (std::getline(ss, plugin, ',')) {
-        if (!plugin.empty()) {
-          config.plugin_paths.emplace_back(plugin);
-        }
-      }
-    } else if (arg.starts_with("--protocol=")) {
-      std::string mode_str = arg.substr(11);
-      if (mode_str == "mcp") {
-        config.protocol_mode = ProtocolMode::MCP_ONLY;
-      } else if (mode_str == "rest") {
-        config.protocol_mode = ProtocolMode::REST_ONLY;
-      } else if (mode_str == "all") {
-        config.protocol_mode = ProtocolMode::ALL;
-      } else {
-        std::cerr << "Invalid protocol mode: " << mode_str << ". Use: mcp, rest, or all\n";
-        exit(1);
-      }
-    } else {
-      std::cerr << "Unknown argument: " << arg << '\n';
-      std::cerr << "Usage: " << argv[0] << " [--port=PORT] [--plugins=PLUGIN1,PLUGIN2,...] [--protocol=mcp|rest|all]\n";
-      exit(1);
-    }
-  }
-  return config;
-}
-
-void addCorsHeaders(httplib::Response& response) {
-  response.set_header("Access-Control-Allow-Origin", "*");
-  response.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  response.set_header("Access-Control-Allow-Headers", "Content-Type, MCP-Session-Id, MCP-Protocol-Version");
-}
-
-nlohmann::json parameterToMcpSchema(const cmdsdk::ParameterMetadata& parameter,
-                                     const nlohmann::json& subtype_options = nullptr) {
-  std::string type = "string";
-  if (parameter.parameter_type == "number")       type = "number";
-  else if (parameter.parameter_type == "boolean") type = "boolean";
-  else if (parameter.parameter_type == "object")  type = "object";
-  else if (parameter.parameter_type == "array")   type = "array";
-
-  nlohmann::json schema = {
-      {"type",        type},
-      {"description", parameter.description}
-  };
-
-  if (parameter.parameter_name == "subType" &&
-      subtype_options != nullptr && subtype_options.is_array()) {
-    schema["enum"] = subtype_options;
-  }
-
-  return schema;
-}
-
-nlohmann::json buildSubtypeResponseSchemas(const cmdsdk::CommandMetadata& metadata) {
-  nlohmann::json schemas = nlohmann::json::object();
-  for (const auto& subtype : metadata.sub_cmd_types) {
-    if (subtype.response_schema.is_object() && !subtype.response_schema.empty()) {
-      schemas[subtype.sub_type_name] = subtype.response_schema;
-    }
-  }
-  return schemas;
-}
-
-nlohmann::json commandToMcpTool(const cmdsdk::CommandMetadata& metadata) {
-  nlohmann::json subtype_enums = nlohmann::json::array();
-  for (const auto& subtype : metadata.sub_cmd_types) {
-    subtype_enums.push_back(subtype.sub_type_name);
-  }
-
-  nlohmann::json inputSchema = {
-      {"type",       "object"},
-      {"properties", nlohmann::json::object()},
-      {"required",   nlohmann::json::array()}
-  };
-
-  for (const auto& param : metadata.parameters) {
-    nlohmann::json param_schema =
-        (param.parameter_name == "subType" && !subtype_enums.empty())
-            ? parameterToMcpSchema(param, subtype_enums)
-            : parameterToMcpSchema(param);
-    inputSchema["properties"][param.parameter_name] = param_schema;
-    if (param.required) {
-      inputSchema["required"].push_back(param.parameter_name);
-    }
-  }
-
-  nlohmann::json tool = {
-      {"name",        metadata.cmd_name},
-      {"description", metadata.description},
-      {"inputSchema", inputSchema}
-  };
-
-  const auto subtype_response_schemas = buildSubtypeResponseSchemas(metadata);
-  if (!subtype_response_schemas.empty()) {
-    nlohmann::json one_of_schemas = nlohmann::json::array();
-    nlohmann::json subtype_enum = nlohmann::json::array();
-    for (const auto& [subtype_name, schema] : subtype_response_schemas.items()) {
-      subtype_enum.push_back(subtype_name);
-      one_of_schemas.push_back(schema);
-    }
-
-    tool["outputSchema"] = {
-        {"type", "object"},
-        {"description", "Subtype-specific response schema. Select branch by subTypeExecuted."},
-        {"properties", {
-            {"subTypeExecuted", {
-                {"type", "string"},
-                {"enum", subtype_enum},
-                {"description", "Indicates which subType produced the response payload."}
-            }}
-        }},
-        {"oneOf", one_of_schemas}
+    struct ServerConfig
+    {
+        int port = kDefaultServerPort;
+        std::vector<std::filesystem::path> plugin_paths;
+        ProtocolMode protocol_mode = ProtocolMode::ALL;
     };
-  }
 
-  return tool;
-}
+    std::atomic_bool gStopRequested{ false };
+    std::atomic_bool gMcpDebug{ false };
+    std::atomic_uint64_t gMcpServerInstanceCounter{ 0 };
+    std::mutex gLogMutex;
 
-nlohmann::json makeJsonRpcResult(const nlohmann::json& id, const nlohmann::json& result) {
-  return {{"jsonrpc", "2.0"}, {"id", id}, {"result", result}};
-}
-
-nlohmann::json makeJsonRpcError(const nlohmann::json& id, int code, const std::string& message) {
-  return {
-      {"jsonrpc", "2.0"},
-      {"id",      id},
-      {"error",   {{"code", code}, {"message", message}}}
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Plugin registry helpers
-//
-// A "plugin name" is derived from the plugin_name field set via
-// SubCmd::setPluginName() and exposed through CommandMetadata::plugin_name.
-//
-// Fallback: if plugin_name is empty, extract the first dot-segment of the
-// first sub_cmd_type name (e.g. "MATH" from "MATH.ADD").
-// ---------------------------------------------------------------------------
-using PluginInfo = std::map<std::string, cmdsdk::SubCmdTypeMetadata>;  // subtype_name -> metadata
-
-std::string toUpperAscii(std::string value) {
-  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
-    return static_cast<char>(std::toupper(ch));
-  });
-  return value;
-}
-
-std::string toLowerAscii(std::string value) {
-  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
-    return static_cast<char>(std::tolower(ch));
-  });
-  return value;
-}
-
-std::string canonicalResourceName(const std::string& plugin_name) {
-  const auto upper = toUpperAscii(plugin_name);
-  if (upper == "GEO") {
-    return "geometry";
-  }
-  if (upper == "MATH") {
-    return "math";
-  }
-  return toLowerAscii(plugin_name);
-}
-
-std::string resolvePluginName(const cmdsdk::CommandMetadata& metadata) {
-  // Prefer the explicit plugin_name field populated by setPluginName().
-  if (!metadata.plugin_name.empty()) {
-    return metadata.plugin_name;
-  }
-  // Fallback: first dot-segment of the first registered sub-type name.
-  if (!metadata.sub_cmd_types.empty()) {
-    const auto& first = metadata.sub_cmd_types.front().sub_type_name;
-    const auto dot = first.find('.');
-    if (dot != std::string::npos) {
-      return first.substr(0, dot);
-    }
-    return first;
-  }
-  // Last resort: use the command name itself.
-  return metadata.cmd_name;
-}
-
-std::string openApiPathForCommand(const cmdsdk::CommandMetadata& metadata) {
-  return "/api/" + metadata.cmd_name;
-}
-
-bool mergeMissingSubtypeEnumsIntoSpec(nlohmann::json& spec,
-                                      const cmdsdk::CommandMetadata& metadata) {
-  if (!spec.is_object()) {
-    return false;
-  }
-
-  const auto path = openApiPathForCommand(metadata);
-  if (!spec.contains("paths") || !spec["paths"].is_object() ||
-      !spec["paths"].contains(path) || !spec["paths"][path].is_object() ||
-      !spec["paths"][path].contains("post") || !spec["paths"][path]["post"].is_object()) {
-    return false;
-  }
-
-  auto& post = spec["paths"][path]["post"];
-  if (!post.contains("requestBody") || !post["requestBody"].is_object() ||
-      !post["requestBody"].contains("content") || !post["requestBody"]["content"].is_object() ||
-      !post["requestBody"]["content"].contains("application/json") ||
-      !post["requestBody"]["content"]["application/json"].is_object() ||
-      !post["requestBody"]["content"]["application/json"].contains("schema") ||
-      !post["requestBody"]["content"]["application/json"]["schema"].is_object()) {
-    return false;
-  }
-
-  auto& schema = post["requestBody"]["content"]["application/json"]["schema"];
-  if (!schema.contains("properties") || !schema["properties"].is_object() ||
-      !schema["properties"].contains("subType") || !schema["properties"]["subType"].is_object()) {
-    return false;
-  }
-
-  auto& sub_type_schema = schema["properties"]["subType"];
-  if (!sub_type_schema.contains("enum") || !sub_type_schema["enum"].is_array()) {
-    sub_type_schema["enum"] = nlohmann::json::array();
-  }
-
-  std::set<std::string> known_subtypes;
-  for (const auto& existing_value : sub_type_schema["enum"]) {
-    if (existing_value.is_string()) {
-      known_subtypes.insert(existing_value.get<std::string>());
-    }
-  }
-
-  bool changed = false;
-  for (const auto& subtype : metadata.sub_cmd_types) {
-    if (known_subtypes.insert(subtype.sub_type_name).second) {
-      sub_type_schema["enum"].push_back(subtype.sub_type_name);
-      changed = true;
-    }
-  }
-
-  return changed;
-}
-
-std::map<std::string, PluginInfo> buildPluginRegistry(const cmdsdk::CommandRegistry& registry) {
-  std::map<std::string, PluginInfo> plugins;
-  for (const auto& metadata : registry.listMetadata()) {
-    const std::string plugin_name = resolvePluginName(metadata);
-    for (const auto& subtype : metadata.sub_cmd_types) {
-      plugins[plugin_name][subtype.sub_type_name] = subtype;
-    }
-  }
-  return plugins;
-}
-
-std::string buildPluginsMarkdown(const std::map<std::string, PluginInfo>& plugins) {
-  std::string doc = "# Available Plugins and SubCommand Types\n\n";
-  for (const auto& [plugin_name, subtypes] : plugins) {
-    doc += "## Plugin: " + plugin_name + "\n\n";
-    doc += "### Available SubCommand Types:\n\n";
-    for (const auto& [subtype_name, subtype_metadata] : subtypes) {
-      doc += "- **" + subtype_name + "**: " + subtype_metadata.description + "\n";
-      if (subtype_metadata.response_schema.is_object() &&
-          !subtype_metadata.response_schema.empty()) {
-        doc += "  - Expected response schema:\n";
-        doc += "```json\n" + subtype_metadata.response_schema.dump(2) + "\n```\n";
-      }
-    }
-    doc += "\n";
-  }
-  return doc;
-}
-
-const PluginInfo* findPluginInfo(const std::map<std::string, PluginInfo>& plugins,
-                                 const std::string& requested_name,
-                                 std::string& resolved_name) {
-  const auto exact = plugins.find(requested_name);
-  if (exact != plugins.end()) {
-    resolved_name = exact->first;
-    return &exact->second;
-  }
-
-  const auto requested_upper = toUpperAscii(requested_name);
-  for (const auto& [plugin_name, plugin_info] : plugins) {
-    if (toUpperAscii(plugin_name) == requested_upper) {
-      resolved_name = plugin_name;
-      return &plugin_info;
-    }
-  }
-
-  const auto requested_lower = toLowerAscii(requested_name);
-  for (const auto& [plugin_name, plugin_info] : plugins) {
-    const auto plugin_upper = toUpperAscii(plugin_name);
-    if ((requested_lower == "geo" || requested_lower == "geometry") &&
-        plugin_upper == "GEO") {
-      resolved_name = plugin_name;
-      return &plugin_info;
-    }
-    if (requested_lower == "math" && plugin_upper == "MATH") {
-      resolved_name = plugin_name;
-      return &plugin_info;
-    }
-    if (canonicalResourceName(plugin_name) == requested_lower) {
-      resolved_name = plugin_name;
-      return &plugin_info;
-    }
-  }
-
-  return nullptr;
-}
-
-std::string buildPluginDetailsMarkdown(const std::string& plugin_name,
-                                        const PluginInfo& plugin_info) {
-  std::string doc = "# Plugin: " + plugin_name + "\n\n";
-  doc += "## Available SubCommand Types\n\n";
-  for (const auto& [subtype_name, subtype_metadata] : plugin_info) {
-    doc += "- **" + subtype_name + "**: " + subtype_metadata.description + "\n";
-    if (subtype_metadata.response_schema.is_object() &&
-        !subtype_metadata.response_schema.empty()) {
-      doc += "  - Expected response schema:\n";
-      doc += "```json\n" + subtype_metadata.response_schema.dump(2) + "\n```\n";
-    }
-  }
-  return doc;
-}
-
-// ---------------------------------------------------------------------------
-// MCP request dispatcher
-// ---------------------------------------------------------------------------
-nlohmann::json handleMcpRequest(const nlohmann::json& request,
-                                 cmdsdk::CommandRegistry& registry) {
-  const auto id = request.contains("id") ? request.at("id") : nlohmann::json(nullptr);
-
-  if (!request.is_object())
-    return makeJsonRpcError(id, -32600, "Invalid Request: body must be an object.");
-  if (!request.contains("jsonrpc") || request.at("jsonrpc") != "2.0")
-    return makeJsonRpcError(id, -32600, "Invalid Request: jsonrpc must be 2.0.");
-  if (!request.contains("method") || !request.at("method").is_string())
-    return makeJsonRpcError(id, -32600, "Invalid Request: method must be a string.");
-
-  const auto method = request.at("method").get<std::string>();
-
-  // ── initialize ────────────────────────────────────────────────────────────
-  if (method == "initialize") {
-    return makeJsonRpcResult(id, {
-        {"protocolVersion", "2024-11-05"},
-        {"capabilities", {
-            {"tools",     {{"listChanged", true}}},
-            {"resources", {{"listChanged", true}}}
-        }},
-        {"serverInfo", {{"name", "fastmcp_server"}, {"version", "0.1.0"}}}
-    });
-  }
-
-  // ── tools/list ────────────────────────────────────────────────────────────
-  if (method == "tools/list") {
-    nlohmann::json tools = nlohmann::json::array();
-    for (const auto& metadata : registry.listMetadata()) {
-      tools.push_back(commandToMcpTool(metadata));
-    }
-    return makeJsonRpcResult(id, {{"tools", tools}});
-  }
-
-  // ── tools/call ────────────────────────────────────────────────────────────
-  if (method == "tools/call") {
-    if (!request.contains("params") || !request.at("params").is_object())
-      return makeJsonRpcError(id, -32602, "Invalid params: params must be an object.");
-
-    const auto& params = request.at("params");
-    if (!params.contains("name") || !params.at("name").is_string())
-      return makeJsonRpcError(id, -32602, "Invalid params: name must be a string.");
-
-    const auto cmd_name = params.at("name").get<std::string>();
-    const auto args = params.contains("arguments")
-                          ? params.at("arguments")
-                          : nlohmann::json::object();
-    if (!args.is_object())
-      return makeJsonRpcError(id, -32602, "Invalid params: arguments must be a JSON object.");
-
-    auto command = registry.create(cmd_name);
-    if (!command)
-      return makeJsonRpcError(id, -32601, "Tool not found: " + cmd_name);
-
-    std::string error;
-    if (!command->validate(args, error))
-      return makeJsonRpcError(id, -32000, "Validation failed: " + error);
-    if (!command->execute(args, error))
-      return makeJsonRpcError(id, -32001, "Execution failed: " + error);
-
-    const auto raw_result = command->getResult();
-    nlohmann::json structured_result;
-    if (raw_result.is_object()) {
-      structured_result = raw_result;
-    } else {
-      structured_result = nlohmann::json{{"result", raw_result}};
-    }
-
-    // Include subTypeExecuted if subType was in the request (MCP protocol standard)
-    if (args.contains("subType") && args["subType"].is_string()) {
-      const auto subtype_executed = args["subType"].get<std::string>();
-      structured_result["subTypeExecuted"] = subtype_executed;
-    }
-
-    return makeJsonRpcResult(id, {
-      {"content", {{{"type", "text"}, {"text", raw_result.dump()}}}},
-      {"structuredContent", structured_result}
-    });
-  }
-
-  // ── resources/list ────────────────────────────────────────────────────────
-  if (method == "resources/list") {
-    auto plugins = buildPluginRegistry(registry);
-    nlohmann::json resources = nlohmann::json::array();
-
-    resources.push_back({
-        {"uri",         "plugins://overview"},
-        {"name",        "Plugins Overview"},
-        {"description", "Overview of all available plugins and their SubCommand types"},
-        {"mimeType",    "text/markdown"}
-    });
-
-    for (const auto& [plugin_name, _] : plugins) {
-      const auto resource_name = canonicalResourceName(plugin_name);
-      resources.push_back({
-          {"uri",         "plugin://" + resource_name},
-          {"name",        "Plugin: " + resource_name},
-          {"description", "Details for " + plugin_name + " plugin including available SubCommand types"},
-          {"mimeType",    "text/markdown"}
-      });
-    }
-
-    return makeJsonRpcResult(id, {{"resources", resources}});
-  }
-
-  // ── resources/read ────────────────────────────────────────────────────────
-  if (method == "resources/read") {
-    if (!request.contains("params") || !request.at("params").is_object())
-      return makeJsonRpcError(id, -32602, "Invalid params: params must be an object.");
-
-    const auto& params = request.at("params");
-    if (!params.contains("uri") || !params.at("uri").is_string())
-      return makeJsonRpcError(id, -32602, "Invalid params: uri must be a string.");
-
-    const std::string uri = params.at("uri").get<std::string>();
-    auto plugins = buildPluginRegistry(registry);
-
-    if (uri == "plugins://overview") {
-      return makeJsonRpcResult(id, {
-          {"contents", {{
-              {"uri",      uri},
-              {"mimeType", "text/markdown"},
-              {"text",     buildPluginsMarkdown(plugins)}
-          }}}
-      });
-    }
-
-    std::string requested_resource = uri;
-    if (uri.starts_with("plugin://")) {
-      requested_resource = uri.substr(9);
-    }
-
-    if (!requested_resource.empty()) {
-      std::string resolved_name;
-      const auto* plugin_info = findPluginInfo(plugins, requested_resource, resolved_name);
-      if (plugin_info != nullptr) {
-        const auto canonical_uri = "plugin://" + canonicalResourceName(resolved_name);
-        return makeJsonRpcResult(id, {
-            {"contents", {{
-                {"uri",      canonical_uri},
-                {"mimeType", "text/markdown"},
-                {"text",     buildPluginDetailsMarkdown(resolved_name, *plugin_info)}
-            }}}
-        });
-      }
-      return makeJsonRpcError(id, -32001, "Plugin not found: " + requested_resource);
-    }
-
-    return makeJsonRpcError(id, -32001, "Resource not found: " + uri);
-  }
-
-  return makeJsonRpcError(id, -32601, "Method not found.");
-}
-
-// ---------------------------------------------------------------------------
-// Plugin discovery
-//
-// Scans <executable>/../lib/ for shared libraries, skipping known SDK libs
-// (libcmd_sdk.so) that are not plugins and would cause spurious load errors.
-// ---------------------------------------------------------------------------
-std::vector<std::filesystem::path> getAllPluginsInLib(const char* argv0) {
-  const auto executable_path      = std::filesystem::absolute(argv0);
-  const auto executable_directory = executable_path.parent_path();
-  const auto parent_directory     = executable_directory.parent_path();
-
-  std::vector<std::filesystem::path> candidate_directories;
-  candidate_directories.push_back(executable_directory);
-  if (!parent_directory.empty()) {
-    candidate_directories.push_back(parent_directory);
-    candidate_directories.push_back(parent_directory / "lib");
-
-    const auto build_root_directory = parent_directory.parent_path();
-    if (!build_root_directory.empty()) {
-      candidate_directories.push_back(build_root_directory / "lib");
-      candidate_directories.push_back(build_root_directory / "bin");
-
-      // Handle multi-config generators (Debug/Release/etc.) by checking
-      // matching config folders under lib/ and bin/.
-      const auto config_directory = executable_directory.filename().string();
-      if (config_directory == "Debug" || config_directory == "Release" ||
-          config_directory == "RelWithDebInfo" || config_directory == "MinSizeRel") {
-        candidate_directories.push_back(build_root_directory / "lib" / config_directory);
-        candidate_directories.push_back(build_root_directory / "bin" / config_directory);
-      }
-    }
-  }
-
-  auto isPluginLibrary = [](const std::filesystem::path& path) {
-    if (!path.has_filename()) return false;
-    const auto filename = path.filename().string();
+    std::string nowUtcIso8601()
+    {
+        const auto now = std::chrono::system_clock::now();
+        const auto t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm{};
 #if defined(_WIN32)
-    return path.extension() == ".dll";
-#elif defined(__APPLE__)
-    return filename.starts_with("lib") && path.extension() == ".dylib";
+        gmtime_s(&tm, &t);
 #else
-    return filename.starts_with("lib") && path.extension() == ".so";
+        gmtime_r(&t, &tm);
 #endif
-  };
-
-  std::set<std::string> seen_filenames;
-  std::vector<std::filesystem::path> plugins;
-
-  for (const auto& dir : candidate_directories) {
-    if (!std::filesystem::exists(dir) || !std::filesystem::is_directory(dir)) {
-      continue;
+        std::ostringstream oss;
+        oss << std::put_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
+        return oss.str();
     }
 
-    std::vector<std::filesystem::path> directory_entries;
-    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
-      if (!entry.is_regular_file()) continue;
-
-      const auto& path = entry.path();
-      if (!isPluginLibrary(path)) continue;
-
-      const auto filename = path.filename().string();
-      if (kNonPluginLibs.count(filename)) {
-        std::cout << "Skipping SDK library (not a plugin): " << filename << '\n';
-        continue;
-      }
-
-      directory_entries.push_back(std::filesystem::absolute(path));
+    std::string safeSessionId(const std::optional<std::string>& session_id)
+    {
+        return session_id.has_value() ? *session_id : "<none>";
     }
 
-    std::sort(directory_entries.begin(), directory_entries.end(),
-              [](const std::filesystem::path& lhs, const std::filesystem::path& rhs) {
-                const auto lhs_name = lhs.filename().string();
-                const auto rhs_name = rhs.filename().string();
-                if (lhs_name != rhs_name) {
-                  return lhs_name < rhs_name;
+    void logDiag(const std::string& area, const std::string& message)
+    {
+        std::lock_guard<std::mutex> lock(gLogMutex);
+        std::cout << "[" << nowUtcIso8601() << "] [" << area << "] " << message << '\n';
+    }
+
+    std::string currentExceptionMessage()
+    {
+        try
+        {
+            throw;
+        }
+        catch (const std::exception& ex)
+        {
+            return ex.what();
+        }
+        catch (...)
+        {
+            return "non-std exception";
+        }
+    }
+
+    void logRequestContext(const std::string& area,
+        const mcp::jsonrpc::RequestContext& request_context,
+        const std::string& method_or_target)
+    {
+        logDiag(area,
+            method_or_target +
+            " session=" + safeSessionId(request_context.sessionId) +
+            " protocol=" + request_context.protocolVersion);
+    }
+
+    bool envFlagEnabled(const char* name, bool default_value = false)
+    {
+        const char* value = std::getenv(name);
+        if (!value) return default_value;
+        std::string v = value;
+        std::transform(v.begin(), v.end(), v.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return !(v == "0" || v == "false" || v == "off" || v == "no");
+    }
+
+    void handleSignal(int)
+    {
+        gStopRequested.store(true);
+    }
+
+    McpJson toMcpJson(const json& value)
+    {
+        return McpJson::parse(value.dump());
+    }
+
+    json fromMcpJson(const McpJson& value)
+    {
+        return json::parse(value.to_string());
+    }
+
+    McpJson makeTextContent(const std::string& text)
+    {
+        McpJson block = McpJson::object();
+        block["type"] = "text";
+        block["text"] = text;
+        return block;
+    }
+
+    McpJson makeResourceLinkContent(const std::string& uri,
+        const std::string& name,
+        const std::string& description,
+        const std::string& mime_type)
+    {
+        McpJson block = McpJson::object();
+        block["type"] = "resource_link";
+        block["uri"] = uri;
+        block["name"] = name;
+        block["description"] = description;
+        block["mimeType"] = mime_type;
+        return block;
+    }
+
+    struct ToolRegistrationState
+    {
+        std::set<std::string> used_tool_names;
+        std::map<std::string, int> tool_name_suffixes;
+        std::map<std::string, std::vector<std::string>> command_tool_names;
+    };
+
+    std::string allocateUniqueToolName(const std::string& base_name,
+        ToolRegistrationState& state)
+    {
+        std::string tool_name = base_name;
+        if (state.used_tool_names.count(tool_name) > 0)
+        {
+            int& suffix = state.tool_name_suffixes[tool_name];
+            do
+            {
+                ++suffix;
+            } while (state.used_tool_names.count(tool_name + "_" + std::to_string(suffix)) > 0);
+            tool_name = tool_name + "_" + std::to_string(suffix);
+        }
+        state.used_tool_names.insert(tool_name);
+        return tool_name;
+    }
+
+    json buildInputSchema(const cmdsdk::CommandMetadata& cmd_meta,
+        const std::optional<std::vector<std::string>>& fixed_subtype)
+    {
+        json input_schema = {
+            {"type", "object"},
+            {"properties", json::object()},
+            {"additionalProperties", true}
+        };
+        std::set<std::string> required_fields;
+
+        for (const auto& param : cmd_meta.parameters)
+        {
+            std::string json_type = "string";
+            if (param.parameter_type == "number") json_type = "number";
+            else if (param.parameter_type == "boolean") json_type = "boolean";
+            else if (param.parameter_type == "object") json_type = "object";
+            else if (param.parameter_type == "array") json_type = "array";
+
+            input_schema["properties"][param.parameter_name] = {
+                {"type", json_type},
+                {"description", param.description}
+            };
+            if (param.required)
+            {
+                required_fields.insert(param.parameter_name);
+            }
+        }
+
+        if (fixed_subtype.has_value())
+        {
+            // convert to json array            
+            json enum_values = json::array();
+            for (const auto& st : *fixed_subtype)
+            {
+                enum_values.push_back(st);
+            }
+            input_schema["properties"]["subType"] = {
+                {"type", "string"},
+                {"enum", enum_values},
+                {"description", "Injected subType for this tool"}
+            };
+        }
+        else if (!cmd_meta.sub_cmd_types.empty())
+        {
+            json enum_values = json::array();
+            for (const auto& st : cmd_meta.sub_cmd_types)
+            {
+                enum_values.push_back(st.sub_type_name);
+            }
+            input_schema["properties"]["subType"] = {
+                {"type", "string"},
+                {"enum", enum_values},
+                {"description", "SubCommand type to execute"}
+            };
+            required_fields.insert("subType");
+        }
+
+        if (!required_fields.empty())
+        {
+            json required = json::array();
+            for (const auto& field : required_fields)
+            {
+                required.push_back(field);
+            }
+            input_schema["required"] = required;
+        }
+
+        return input_schema;
+    }
+
+
+    bool registerTool(const cmdsdk::CommandRegistry& registry, mcp::server::Server& server,
+        const std::string& tool_name,
+        const std::string& title,
+        const std::string& description,
+        const json& input_schema,
+        const std::string& original_cmd_name,
+        const std::function<json(const json&)>& handler)
+    {
+        static_cast<void>(registry);
+        const bool mcp_debug = gMcpDebug.load();
+        const mcp::server::ToolDefinition toolDef{
+            .name = tool_name,
+            .title = title,
+            .description = description,
+            .inputSchema = toMcpJson(input_schema),
+        };
+
+        if (mcp_debug)
+        {
+            logDiag("MCP-REGISTER",
+                "Registering tool " + tool_name + " (command=" + original_cmd_name + ")");
+        }
+
+        server.registerTool(
+            toolDef,
+            [handler, tool_name, original_cmd_name](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult
+            {
+                try
+                {
+                    if (gMcpDebug.load())
+                    {
+                        logRequestContext("MCP-TOOL-CALL",
+                            context.requestContext,
+                            "tool=" + tool_name + " command=" + original_cmd_name);
+                    }
+
+                    const json args = fromMcpJson(context.arguments);
+                    const json raw = handler(args);
+
+                    json structured = raw.is_object() ? raw : json{ {"result", raw} };
+                    if (args.contains("subType") && args["subType"].is_string())
+                    {
+                        structured["subTypeExecuted"] = args["subType"].get<std::string>();
+                    }
+
+                    std::cout << "[tools/call] " << original_cmd_name << " -> " << raw.dump() << '\n';
+
+                    mcp::server::CallToolResult result;
+                    result.structuredContent = toMcpJson(structured);
+                    result.content = McpJson::array();
+                    result.content.push_back(makeTextContent(raw.dump()));
+                    result.isError = false;
+                    return result;
                 }
-                return lhs.string() < rhs.string();
-              });
+                catch (const std::exception& e)
+                {
+                    if (gMcpDebug.load())
+                    {
+                        logDiag("MCP-TOOL-ERROR", original_cmd_name + " failed: " + e.what());
+                    }
+                    throw;
+                }
+            });
 
-    for (const auto& path : directory_entries) {
-      std::string filename = path.filename().string();
+        return true;
+    }
+
+    bool registerCmdAsTool(const cmdsdk::CommandRegistry& registry, mcp::server::Server& server,
+        const cmdsdk::CommandMetadata& cmd_meta,
+        const std::function<json(const json&)>& handler,
+        ToolRegistrationState& registration_state)
+    {
+        const std::string original_cmd_name = cmd_meta.cmd_name;
+
+        const auto register_one = [&](const std::string& base_tool_name,
+            const std::string& description,
+            const json& input_schema,
+            const std::function<json(const json&)>& wrapped_handler) -> bool
+            {
+                const auto tool_name = allocateUniqueToolName(base_tool_name, registration_state);
+                registration_state.command_tool_names[original_cmd_name].push_back(tool_name);
+
+                std::string tool_description = description;
+                if (tool_name != original_cmd_name)
+                {
+                    tool_description += " [original: " + original_cmd_name + "]";
+                }
+
+                return registerTool(registry,
+                    server,
+                    tool_name,
+                    original_cmd_name,
+                    tool_description,
+                    input_schema,
+                    original_cmd_name,
+                        wrapped_handler);
+            };
+
+        // Register exactly one MCP tool per command. If subTypes exist,
+        // buildInputSchema exposes them as enum options in the single tool input.
+        return register_one(
+            StringUtils::sanitizeToolName(original_cmd_name),
+            cmd_meta.description,
+            buildInputSchema(cmd_meta, std::nullopt),
+            handler);
+    }
+    
+    bool registerToolWithUI(
+        mcp::server::Server& server,
+        const std::string& toolName,
+        const std::string& title,
+        const std::string& description,
+        const std::string& resourceFileName,
+        const json& input_schema,
+        const std::function<mcp::server::CallToolResult(const json&)>& handler)
+    {
+        std::string baseName = resourceFileName;
+        const auto dotPos = baseName.find('.');
+        if (dotPos != std::string::npos) baseName = baseName.substr(0, dotPos);
+        const std::string resourceUri = "ui://ui/" + baseName + ".html";
+        const bool mcp_debug = gMcpDebug.load();
+
+        // ─── Register the Tool ───────────────────────────────────────────────
+        mcp::server::ToolDefinition toolDef;
+        toolDef.name = toolName;
+        toolDef.title = title;
+        toolDef.description = description;
+        toolDef.inputSchema = toMcpJson(input_schema);
+        toolDef.annotations = mcp::jsonrpc::JsonValue::object({
+            {"readOnlyHint", true}
+        });
+        toolDef.execution = mcp::jsonrpc::JsonValue::object({
+            {
+                "taskSupport", "forbidden"
+            }
+        });
+        // Both resourceUri and mimeType profile are needed for inspector to recognize as app
+        toolDef.metadata = mcp::jsonrpc::JsonValue::object({
+            {
+                "ui", mcp::jsonrpc::JsonValue::object({
+                    {"resourceUri", resourceUri}
+                })
+            },
+            {
+                "ui/resourceUri", resourceUri
+            }
+        });
+
+        if (mcp_debug)
+        {
+            logDiag("MCP-REGISTER", "Registering app tool " + toolName + " with UI resource " + resourceUri);
+        }
+
+        server.registerTool(
+            std::move(toolDef),
+            [handler, toolName, resourceUri](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult
+            {
+                try
+                {
+                    if (gMcpDebug.load())
+                    {
+                        logRequestContext("MCP-TOOL-CALL", context.requestContext, "tool=" + toolName);
+                    }
+
+                    const mcp::server::CallToolResult result = handler(fromMcpJson(context.arguments));
+                    
+                    if (gMcpDebug.load())
+                    {
+                        logDiag("MCP-TOOL-SUCCESS", toolName + " executed successfully");
+                    }
+
+                    return result;
+                }
+                catch (const std::exception& e)
+                {
+                    if (gMcpDebug.load())
+                    {
+                        logDiag("MCP-TOOL-ERROR", toolName + " failed: " + e.what());
+                    }
+                    throw;
+                }
+            });
+
+        if (mcp_debug)
+        {
+            logDiag("MCP-REGISTER", "Tool UI resource set to " + resourceUri + " (proxied/app resource)");
+        }
+
+        return true;
+    }
+
+    // ── argument parsing ──────────────────────────────────────────────────────
+    ServerConfig parseArguments(int argc, char** argv)
+    {
+        ServerConfig cfg;
+        for (int i = 1; i < argc; ++i)
+        {
+            std::string arg = argv[i];
+            if (StringUtils::beginsWith(arg, "--port="))
+            {
+                cfg.port = std::stoi(arg.substr(7));
+            }
+            else if (StringUtils::beginsWith(arg, "--plugins="))
+            {
+                std::stringstream ss(arg.substr(10));
+                std::string p;
+                while (std::getline(ss, p, ','))
+                    if (!p.empty()) cfg.plugin_paths.emplace_back(p);
+            }
+            else if (StringUtils::beginsWith(arg, "--protocol="))
+            {
+                std::string m = arg.substr(11);
+                if (m == "mcp")       cfg.protocol_mode = ProtocolMode::MCP_ONLY;
+                else if (m == "rest") cfg.protocol_mode = ProtocolMode::REST_ONLY;
+                else if (m == "all")  cfg.protocol_mode = ProtocolMode::ALL;
+                else { std::cerr << "Invalid protocol: " << m << '\n'; exit(1); }
+            }
+            else
+            {
+                std::cerr << "Unknown argument: " << arg << '\n'
+                    << "Usage: " << argv[0]
+                    << " [--port=PORT] [--plugins=P1,P2,...] [--protocol=mcp|rest|all]\n";
+                exit(1);
+            }
+        }
+        return cfg;
+    }
+
+    // ── plugin registry helpers ───────────────────────────────────────────────
+    using PluginInfo = std::map<std::string, cmdsdk::SubCmdTypeMetadata>;
+
+    std::string canonicalResourceName(const std::string& plugin_name)
+    {
+        const auto u = StringUtils::toUpperAscii(plugin_name);
+        if (u == "GEO")  return "geometry";
+        if (u == "MATH") return "math";
+        return StringUtils::toLowerAscii(plugin_name);
+    }
+
+    std::string resolvePluginName(const cmdsdk::CommandMetadata& m)
+    {
+        if (!m.plugin_name.empty()) return m.plugin_name;
+        if (!m.sub_cmd_types.empty())
+        {
+            const auto& f = m.sub_cmd_types.front().sub_type_name;
+            auto dot = f.find('.');
+            return (dot != std::string::npos) ? f.substr(0, dot) : f;
+        }
+        return m.cmd_name;
+    }
+
+    std::string openApiPathForCommand(const cmdsdk::CommandMetadata& m)
+    {
+        return "/api/" + m.cmd_name;
+    }
+
+    std::map<std::string, PluginInfo> buildPluginRegistry(const cmdsdk::CommandRegistry& reg)
+    {
+        std::map<std::string, PluginInfo> plugins;
+        for (const auto& meta : reg.listMetadata())
+            for (const auto& st : meta.sub_cmd_types)
+                plugins[resolvePluginName(meta)][st.sub_type_name] = st;
+        return plugins;
+    }
+
+    // ── OpenAPI helpers ───────────────────────────────────────────────────────
+    bool mergeMissingSubtypeEnumsIntoSpec(json& spec, const cmdsdk::CommandMetadata& meta)
+    {
+        if (!spec.is_object()) return false;
+        const auto path = openApiPathForCommand(meta);
+        try
+        {
+            auto& sub_type_schema =
+                spec["paths"][path]["post"]["requestBody"]["content"]
+                ["application/json"]["schema"]["properties"]["subType"];
+            if (!sub_type_schema.contains("enum") || !sub_type_schema["enum"].is_array())
+                sub_type_schema["enum"] = json::array();
+            std::set<std::string> known;
+            for (const auto& v : sub_type_schema["enum"])
+                if (v.is_string()) known.insert(v.get<std::string>());
+            bool changed = false;
+            for (const auto& st : meta.sub_cmd_types)
+                if (known.insert(st.sub_type_name).second)
+                {
+                    sub_type_schema["enum"].push_back(st.sub_type_name);
+                    changed = true;
+                }
+            return changed;
+        }
+        catch (...) { return false; }
+    }
+
+    // ── Plugin discovery ──────────────────────────────────────────────────────
+    std::vector<std::filesystem::path> getAllPluginsInLib(const char* argv0)
+    {
+        const auto exe = std::filesystem::absolute(argv0);
+        const auto exeDir = exe.parent_path();
+        const auto parent = exeDir.parent_path();
+
+        std::vector<std::filesystem::path> dirs = { exeDir };
+        if (!parent.empty())
+        {
+            dirs.push_back(parent);
+            dirs.push_back(parent / "lib");
+            const auto buildRoot = parent.parent_path();
+            if (!buildRoot.empty())
+            {
+                dirs.push_back(buildRoot / "lib");
+                dirs.push_back(buildRoot / "bin");
+                const auto cfg = exeDir.filename().string();
+                if (cfg == "Debug" || cfg == "Release" ||
+                    cfg == "RelWithDebInfo" || cfg == "MinSizeRel")
+                {
+                    dirs.push_back(buildRoot / "lib" / cfg);
+                    dirs.push_back(buildRoot / "bin" / cfg);
+                }
+            }
+        }
+
+        auto isPlugin = [](const std::filesystem::path& p) -> bool
+            {
+                if (!p.has_filename()) return false;
+                const auto fn = p.filename().string();
 #if defined(_WIN32)
-      filename = toUpperAscii(filename);
+                return p.extension() == ".dll";
+#elif defined(__APPLE__)
+                return StringUtils::beginsWith(fn, "lib") && p.extension() == ".dylib";
+#else
+                return StringUtils::beginsWith(fn, "lib") && p.extension() == ".so";
 #endif
-      if (!seen_filenames.insert(filename).second) {
-        std::cout << "Skipping duplicate plugin library: " << path.filename().string() << '\n';
-        continue;
-      }
+            };
 
-      plugins.push_back(path);
-    }
-  }
+        std::set<std::string> seen;
+        std::vector<std::filesystem::path> plugins;
 
-  return plugins;
-}
-
-std::string protocolModeToString(ProtocolMode mode) {
-  switch (mode) {
-    case ProtocolMode::MCP_ONLY:
-      return "MCP Only";
-    case ProtocolMode::REST_ONLY:
-      return "REST Only";
-    case ProtocolMode::ALL:
-      return "MCP + REST";
-    default:
-      return "Unknown";
-  }
-}
-
-std::string defaultHtmlPage(int, ProtocolMode,
-               const std::map<std::string, PluginInfo>&) {
-  return R"HTML(<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
-  <title>FastMCP · Command Server Control Hub</title>
-  <!-- Bootstrap 5 Dark Theme with custom blue accent & rounded soft corners -->
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
-  <!-- Font Awesome 6 (free icons) -->
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
-  <!-- Google Fonts: Inter for clean modern typography -->
-  <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;14..32,400;14..32,500;14..32,600;14..32,700&display=swap" rel="stylesheet">
-  <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
-
-    body {
-      background: radial-gradient(circle at 10% 20%, #0a0f1a, #03060c);
-      font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
-      color: #eef2ff;
-      padding: 2rem 1.5rem;
-      min-height: 100vh;
-    }
-
-    /* custom blue accent + rounded corners everywhere */
-    .card, .navbar, .list-group-item, .btn, .badge, pre, .endpoint-card, .swagger-card, .status-badge {
-      border-radius: 14px !important;
-    }
-
-    .card {
-      background: rgba(18, 24, 34, 0.85);
-      backdrop-filter: blur(2px);
-      border: 1px solid rgba(0, 150, 255, 0.2);
-      box-shadow: 0 12px 28px -8px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(0, 150, 255, 0.1);
-      transition: all 0.2s ease;
-    }
-
-    .card:hover {
-      border-color: rgba(0, 150, 255, 0.5);
-      box-shadow: 0 20px 32px -12px rgba(0, 120, 255, 0.2);
-    }
-
-    .btn-primary {
-      background: #0a6cff;
-      border: none;
-      border-radius: 12px;
-      font-weight: 500;
-      padding: 0.5rem 1.2rem;
-      transition: 0.2s;
-      box-shadow: 0 1px 2px rgba(0,0,0,0.2);
-    }
-
-    .btn-primary:hover {
-      background: #2a7eff;
-      transform: translateY(-1px);
-      box-shadow: 0 6px 14px rgba(0, 110, 255, 0.3);
-    }
-
-    .btn-outline-accent {
-      border: 1px solid #2b7aff;
-      color: #aad0ff;
-      border-radius: 12px;
-      background: transparent;
-    }
-    .btn-outline-accent:hover {
-      background: #0a6cff20;
-      color: white;
-      border-color: #4c9aff;
-    }
-
-    .bg-blue-glow {
-      background: linear-gradient(135deg, #0950c0 0%, #0a6cff 100%);
-    }
-
-    .navbar-brand i {
-      font-size: 1.8rem;
-      filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3));
-    }
-
-    .badge-mcp {
-      background: #0e2a3e;
-      color: #6bc8ff;
-      border-left: 3px solid #0a6cff;
-      border-radius: 20px;
-      padding: 6px 12px;
-      font-weight: 500;
-    }
-
-    .endpoint-path {
-      font-family: 'SF Mono', 'Fira Code', monospace;
-      font-size: 0.9rem;
-      background: #0f131c;
-      padding: 6px 12px;
-      border-radius: 40px;
-      border: 1px solid #1e2a3a;
-      letter-spacing: -0.2px;
-    }
-
-    code {
-      background: #0b0f16;
-      color: #bbd9ff;
-      padding: 0.2rem 0.5rem;
-      border-radius: 10px;
-      font-size: 0.85rem;
-    }
-
-    pre {
-      background: #0b0f16;
-      padding: 1rem;
-      border: 1px solid #1a2533;
-      color: #c7e2ff;
-      font-size: 0.8rem;
-    }
-
-    .swagger-badge {
-      background: #1a2a33;
-      color: #36c7ff;
-    }
-
-    .footer-note {
-      font-size: 0.75rem;
-      border-top: 1px solid #16212b;
-    }
-
-    .list-group-item {
-      background-color: #11171f;
-      border: 1px solid #1e2c38;
-      margin-bottom: 6px;
-      color: #deecff;
-    }
-
-    .list-group-item i {
-      color: #3c9eff;
-      width: 28px;
-    }
-
-    hr {
-      background: #1e3347;
-      opacity: 0.5;
-    }
-
-    .glowing-icon {
-      text-shadow: 0 0 4px #0a6cff;
-    }
-
-    @media (max-width: 768px) {
-      body {
-        padding: 1rem;
-      }
-    }
-  </style>
-</head>
-<body>
-
-<div class="container-lg px-0 px-md-2">
-  <!-- header / navbar -->
-  <nav class="navbar navbar-dark mb-4 p-3 shadow-sm" style="background: rgba(8, 12, 20, 0.7); backdrop-filter: blur(10px); border-radius: 20px; border: 1px solid #1f3243;">
-    <div class="container-fluid">
-      <a class="navbar-brand d-flex align-items-center gap-3" href="#">
-        <i class="fas fa-microchip fa-fw glowing-icon" style="color: #3c9eff;"></i>
-        <span class="fw-semibold fs-4 tracking-wide">FastMCP <span style="color: #7bb8ff;">Command Server</span></span>
-        <span class="badge bg-dark text-info border border-info-subtle ms-2 fs-6"><i class="fas fa-plug me-1"></i> MCP + REST</span>
-      </a>
-      <div class="d-flex gap-2">
-        <div class="d-none d-md-flex align-items-center gap-2">
-          <i class="fas fa-circle text-success" style="font-size: 0.7rem;"></i>
-          <span class="text-light-emphasis small">Active · port 5432</span>
-        </div>
-        <button class="btn btn-outline-accent btn-sm px-3" id="copyServerUrlBtn" title="Copy server URL">
-          <i class="fas fa-copy me-1"></i> <span class="d-none d-sm-inline">Copy Base URL</span>
-        </button>
-      </div>
-    </div>
-  </nav>
-
-  <!-- main info row: MCP + Server endpoints -->
-  <div class="row g-4 mb-5">
-    <div class="col-lg-5">
-      <div class="card h-100 p-3">
-        <div class="card-body">
-          <div class="d-flex align-items-center gap-3 mb-3">
-            <i class="fas fa-network-wired fa-2x" style="color: #2e8bff;"></i>
-            <h3 class="card-title mb-0 fw-semibold">MCP Streamable HTTP</h3>
-            <span class="badge bg-primary ms-auto">JSON-RPC 2.0</span>
-          </div>
-          <p class="text-secondary-emphasis mb-2">Endpoint for tool discovery, initialization, and command invocation.</p>
-          <div class="bg-dark bg-opacity-50 p-3 rounded-3 mb-3">
-            <div class="d-flex align-items-center flex-wrap gap-2">
-              <i class="fas fa-link text-info"></i>
-              <code class="fs-6 flex-grow-1">http://localhost:5432/mcp</code>
-              <button class="btn btn-sm btn-outline-light btn-outline-accent" id="copyMCPUrlBtn"><i class="far fa-copy"></i></button>
-            </div>
-          </div>
-          <div class="mt-3">
-            <div class="badge-mcp d-inline-flex mb-2"><i class="fas fa-code-branch me-2"></i> MCP workflow</div>
-            <ol class="list-unstyled small mt-2" style="opacity:0.9">
-              <li class="mb-1"><i class="fas fa-hand-peace me-2"></i> <code>initialize</code> - handshake protocol</li>
-              <li class="mb-1"><i class="fas fa-list me-2"></i> <code>tools/list</code> - discover all exposed commands</li>
-              <li class="mb-1"><i class="fas fa-terminal me-2"></i> <code>tools/call</code> - execute native C/C++ tools</li>
-            </ol>
-            <button class="btn btn-primary w-100 mt-2" id="testDiscoverBtn">
-              <i class="fas fa-flask me-2"></i> Simulate tools/list (mock preview)
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div class="col-lg-7">
-      <div class="card h-100 p-3">
-        <div class="card-body">
-          <div class="d-flex align-items-center gap-2 mb-3 flex-wrap">
-            <i class="fas fa-swagger fa-2x" style="color: #5bc0ff;"></i>
-            <h3 class="card-title fw-semibold mb-0">REST API (Swagger UI)</h3>
-            <span class="badge swagger-badge ms-2"><i class="fas fa-file-alt"></i> OpenAPI 3.0</span>
-            <span class="badge bg-secondary ms-auto">Coming with C++ backend</span>
-          </div>
-          <p>Full RESTful endpoints exposing same command set with Swagger documentation. Interactive API console & schema.</p>
-          <div class="row mt-2">
-            <div class="col-md-6 mb-2">
-              <div class="bg-dark bg-opacity-40 p-2 rounded-3 d-flex align-items-center gap-2">
-                <i class="fas fa-globe text-info"></i>
-                <code>GET /swagger/v1/swagger.json</code>
-              </div>
-            </div>
-            <div class="col-md-6 mb-2">
-              <div class="bg-dark bg-opacity-40 p-2 rounded-3 d-flex align-items-center gap-2">
-                <i class="fas fa-chalkboard-user text-info"></i>
-                <code>GET /swagger</code> - UI
-              </div>
-            </div>
-            <div class="col-md-6 mb-2">
-              <div class="bg-dark bg-opacity-40 p-2 rounded-3 d-flex align-items-center gap-2">
-                <i class="fas fa-plug text-info"></i>
-                <code>POST /api/v1/execute</code>
-              </div>
-            </div>
-            <div class="col-md-6 mb-2">
-              <div class="bg-dark bg-opacity-40 p-2 rounded-3 d-flex align-items-center gap-2">
-                <i class="fas fa-cogs text-info"></i>
-                <code>GET /api/v1/tools</code>
-              </div>
-            </div>
-          </div>
-          <hr class="my-3">
-          <div class="alert alert-dark border-info bg-black bg-opacity-25" role="alert">
-            <i class="fas fa-info-circle me-2 text-info"></i>
-            <strong>Swagger UI endpoint</strong> will be hosted at <code class="text-white">http://localhost:5432/swagger</code> once enabled.
-            Interactive OpenAPI docs with blue theme & dark mode compatible.
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Endpoint cards: Detailed section for both MCP and future REST endpoints -->
-  <div class="row g-4 mb-5">
-    <div class="col-12">
-      <div class="card p-3">
-        <div class="card-header bg-transparent border-bottom border-secondary d-flex align-items-center justify-content-between flex-wrap">
-          <span><i class="fas fa-plug me-2 text-primary"></i><strong>Available Service Endpoints</strong> <span class="badge bg-primary rounded-pill ms-2">active</span></span>
-          <span class="text-muted small"><i class="fas fa-microphone-alt"></i> MCP + REST dual protocol</span>
-        </div>
-        <div class="card-body">
-          <div class="table-responsive">
-            <table class="table table-dark table-hover align-middle" style="border-radius: 14px; overflow: hidden;">
-              <thead class="bg-black bg-opacity-50">
-                <tr>
-                  <th>Method</th>
-                  <th>Endpoint</th>
-                  <th>Protocol</th>
-                  <th>Description</th>
-                  <th class="text-center">Try</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr>
-                  <td><span class="badge bg-info text-dark">POST</span></td>
-                  <td><code>/mcp</code></td>
-                  <td><i class="fab fa-connectdevelop me-1"></i> MCP JSON-RPC</td>
-                  <td>Main entry for MCP initialize, tools/list, tool call</td>
-                  <td class="text-center"><button class="btn btn-outline-accent btn-sm mockMcpCall" data-endpoint="/mcp"><i class="fas fa-vial"></i></button></td>
-                </tr>
-                <tr class="opacity-75">
-                  <td><span class="badge bg-secondary">GET</span></td>
-                  <td><code>/swagger</code></td>
-                  <td><i class="fas fa-scroll"></i> REST / OpenAPI</td>
-                  <td>Interactive Swagger UI (planned / active)</td>
-                  <td class="text-center"><span class="badge bg-dark text-info">soon</span></td>
-                </tr>
-                <tr class="opacity-75">
-                  <td><span class="badge bg-secondary">GET</span></td>
-                  <td><code>/swagger/v1/swagger.json</code></td>
-                  <td><i class="fas fa-code"></i> OpenAPI spec</td>
-                  <td>Machine-readable API schema</td>
-                  <td class="text-center"><i class="fas fa-hourglass-half text-muted"></i></td>
-                </tr>
-                <tr>
-                  <td><span class="badge bg-warning text-dark">GET</span></td>
-                  <td><code>/health</code></td>
-                  <td><i class="fas fa-heartbeat"></i> REST</td>
-                  <td>Server health & version info</td>
-                  <td class="text-center"><button class="btn btn-outline-accent btn-sm" id="healthCheckBtn"><i class="fas fa-stethoscope"></i></button></td>
-                </tr>
-                <tr>
-                  <td><span class="badge bg-success">POST</span></td>
-                  <td><code>/api/v1/commands</code></td>
-                  <td><i class="fas fa-terminal"></i> REST (future)</td>
-                  <td>Native command execution over REST</td>
-                  <td class="text-center"><i class="fas fa-cogs text-info"></i></td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- dynamic response & mock explorer (demo integration) -->
-  <div class="row g-4">
-    <div class="col-md-6">
-      <div class="card h-100 p-3">
-        <div class="d-flex align-items-center gap-2 mb-2">
-          <i class="fas fa-terminal text-primary"></i>
-          <h5 class="mb-0">MCP Discovery Simulator</h5>
-          <span class="ms-auto badge bg-dark">demo playground</span>
-        </div>
-        <p class="small text-secondary">Simulate an MCP handshake + tools/list. This mimics the actual JSON-RPC contract your C++ backend will serve.</p>
-        <div class="btn-group w-100 mb-3" role="group">
-          <button class="btn btn-outline-accent" id="simInitializeBtn"><i class="fas fa-handshake"></i> initialize</button>
-          <button class="btn btn-outline-accent" id="simToolsListBtn"><i class="fas fa-list-ul"></i> tools/list</button>
-        </div>
-        <div class="bg-black bg-gradient rounded-3 p-3" style="min-height: 220px;">
-          <div class="d-flex align-items-center gap-2 text-info mb-2">
-            <i class="fas fa-reply-all"></i> <span class="small fw-semibold">Mock response preview:</span>
-          </div>
-          <pre id="mockResponseArea" class="mb-0" style="font-size: 0.75rem; background: #05090f;"><span class="text-secondary">// Click initialize or tools/list to simulate</span></pre>
-        </div>
-      </div>
-    </div>
-    <div class="col-md-6">
-      <div class="card h-100 p-3">
-        <div class="d-flex align-items-center gap-2 mb-2">
-          <i class="fas fa-paintbrush-fine text-primary"></i>
-          <h5 class="mb-0">Swagger UI Preview (dark + blue accent)</h5>
-          <span class="ms-auto badge bg-primary rounded-pill">design mock</span>
-        </div>
-        <p class="small text-secondary">Your upcoming REST documentation will adopt this sleek Bootstrap dark theme, with rounded corners and crisp blue accent buttons.</p>
-        <div class="mt-2 border border-secondary rounded-3 p-3" style="background: #0b111a;">
-          <div class="d-flex flex-wrap gap-2 align-items-center">
-            <i class="fab fa-swagger fa-2x" style="color: #85c1ff;"></i>
-            <div><strong class="text-light">Swagger UI mockup</strong>
-            <div class="small text-secondary"><i class="fas fa-microphone"></i> /api/v1/execute <span class="text-info">POST</span> • <span class="text-info">GET</span> /tools</div>
-            </div>
-            <button class="btn btn-sm btn-primary ms-auto" disabled><i class="fas fa-external-link-alt"></i> Open (soon)</button>
-          </div>
-          <hr class="my-2">
-          <div class="d-flex gap-2 flex-wrap">
-            <span class="badge bg-info text-dark px-3 py-2 rounded-pill"><i class="fas fa-code"></i> try it out</span>
-            <span class="badge bg-dark border border-info px-3 py-2 rounded-pill"><i class="fas fa-check-circle text-info"></i> OAuth2 disabled</span>
-            <span class="badge bg-dark px-3 py-2">basePath: /api/v1</span>
-          </div>
-          <div class="mt-3 small">📄 <span class="text-info">OpenAPI</span> will list all compiled C++ commands with request/response schemas.</div>
-        </div>
-        <div class="mt-3 text-center">
-          <i class="fas fa-arrow-right text-primary me-1"></i> <span class="text-muted">Swagger UI will be served at <code class="text-info">http://localhost:5432/swagger</code> after enabling REST flag</span>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- toast & footer -->
-  <div class="footer-note mt-5 pt-3 d-flex justify-content-between align-items-center flex-wrap">
-    <div><i class="fas fa-database me-1 text-info"></i> FastMCP Command Server | Port <strong>5432</strong> | MCP Streamable HTTP + REST (Swagger ready)</div>
-    <div><i class="fas fa-palette me-1"></i> dark UI · blue accent · rounded corners · bootstrap 5</div>
-  </div>
-</div>
-
-<!-- toast container for copy feedback -->
-<div class="position-fixed bottom-0 end-0 p-3" style="z-index: 1100">
-  <div id="copyToast" class="toast align-items-center text-bg-dark border-info" role="alert" aria-live="assertive" aria-atomic="true" data-bs-autohide="true" data-bs-delay="2000">
-    <div class="d-flex">
-      <div class="toast-body"><i class="fas fa-check-circle text-info me-2"></i> URL copied to clipboard!</div>
-      <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button>
-    </div>
-  </div>
-</div>
-
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
-<script>
-  (function() {
-    // DOM references
-    const mockArea = document.getElementById('mockResponseArea');
-    const copyMCPBtn = document.getElementById('copyMCPUrlBtn');
-    const copyServerBtn = document.getElementById('copyServerUrlBtn');
-    const healthBtn = document.getElementById('healthCheckBtn');
-    const simInitBtn = document.getElementById('simInitializeBtn');
-    const simToolsBtn = document.getElementById('simToolsListBtn');
-    const testDiscoverBtn = document.getElementById('testDiscoverBtn');
-    const copyToastEl = document.getElementById('copyToast');
-    let toastInstance = null;
-    if (copyToastEl) toastInstance = new bootstrap.Toast(copyToastEl, { delay: 1500 });
-
-    function showCopyToaster() {
-      if (toastInstance) toastInstance.show();
-      else {
-        const fallbackToast = new bootstrap.Toast(copyToastEl);
-        fallbackToast.show();
-      }
-    }
-
-    // copy URLS
-    const baseUrl = 'http://localhost:5432';
-    const mcpUrl = 'http://localhost:5432/mcp';
-
-    function copyToClipboard(text) {
-      navigator.clipboard.writeText(text).then(() => {
-        showCopyToaster();
-      }).catch(() => {
-        alert('Manual copy: ' + text);
-      });
-    }
-
-    if (copyMCPBtn) copyMCPBtn.addEventListener('click', () => copyToClipboard(mcpUrl));
-    if (copyServerBtn) copyServerBtn.addEventListener('click', () => copyToClipboard(baseUrl));
-
-    // healthcheck fetch simulation (real fetch to /health if backend exists)
-    if (healthBtn) {
-      healthBtn.addEventListener('click', async () => {
-        try {
-          mockArea.innerText = 'Fetching /health from server...\n';
-          const response = await fetch('/health');
-          if (response.ok) {
-            const data = await response.json();
-            mockArea.innerText = JSON.stringify(data, null, 2);
-          } else {
-            mockArea.innerText = `Health endpoint responded with ${response.status}. Ensure backend is running.\n(Mock: C++ server will return { status: "ok", version: "1.0.0" })`;
-          }
-        } catch (err) {
-          mockArea.innerText = `Cannot reach /health. Backend not active? Simulated response:\n{\n  "status": "healthy",\n  "service": "FastMCP Command Server",\n  "port": 5432,\n  "mcpEnabled": true,\n  "swaggerReady": true\n}`;
+        for (const auto& dir : dirs)
+        {
+            if (!std::filesystem::exists(dir) || !std::filesystem::is_directory(dir)) continue;
+            std::vector<std::filesystem::path> entries;
+            for (const auto& e : std::filesystem::directory_iterator(dir))
+            {
+                if (!e.is_regular_file() || !isPlugin(e.path())) continue;
+                const auto fn = e.path().filename().string();
+                if (kNonPluginLibs.count(fn))
+                {
+                    std::cout << "Skipping SDK lib: " << fn << '\n';
+                    continue;
+                }
+                entries.push_back(std::filesystem::absolute(e.path()));
+            }
+            std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b)
+                {
+                    const auto an = a.filename().string(), bn = b.filename().string();
+                    return an != bn ? an < bn : a.string() < b.string();
+                });
+            for (const auto& p : entries)
+            {
+                std::string fn = p.filename().string();
+#if defined(_WIN32)
+                fn = StringUtils::toUpperAscii(fn);
+#endif
+                if (!seen.insert(fn).second)
+                {
+                    std::cout << "Skipping duplicate: " << p.filename().string() << '\n';
+                    continue;
+                }
+                plugins.push_back(p);
+            }
         }
-      });
+        return plugins;
     }
 
-    // MCP Simulators: mock JSON-RPC initialize + tools/list responses
-    function setMockResponse(content) {
-      mockArea.innerText = content;
+    // ── mcp-apps reverse-proxy helpers ────────────────────────────────────────
+    constexpr const char* kMcpAppsHost = "localhost";
+    constexpr int         kMcpAppsPort = 6543;
+    constexpr const char* kMathFormPath = "/ui/math-form.html";
+
+    std::string contentTypeFromResponse(const httplib::Result& r, const std::string& fb)
+    {
+        if (!r || !r->has_header("Content-Type")) return fb;
+        std::string v = r->get_header_value("Content-Type");
+        const auto sep = v.find(';');
+        return (sep != std::string::npos) ? v.substr(0, sep) : (v.empty() ? fb : v);
     }
 
-    function mockInitialize() {
-      const initResponse = {
-        jsonrpc: "2.0",
-        id: 1,
-        result: {
-          protocolVersion: "2024-11-05",
-          capabilities: { tools: { listChanged: true } },
-          serverInfo: { name: "FastMCP-CPP", version: "0.2.0" }
+    /**
+     * ui://ui/math-form.html or ui://ui/geo-form.html  --> /ui/math-form.html or /ui/geo-form.html (proxied app resource)
+     */
+    bool uriToMcpAppsPath(const std::string& uri, std::string& path)
+    {
+        if (uri.empty()) return false;
+        // ui://ui/math-form.html or ui://ui/geo-form.html 
+        if (StringUtils::beginsWith(uri, "ui://") || StringUtils::beginsWith(uri, "ui://"))
+        {
+            std::string p = uri.substr(5);
+            if (StringUtils::beginsWith(p, "ui/"))
+            {
+                path = "/" + p;
+                return true;
+            }
         }
-      };
-      setMockResponse(JSON.stringify(initResponse, null, 2) +
-        "\n\n// MCP initialize handshake complete. Server ready for tools/list.");
+        return false;
     }
 
-    function mockToolsList() {
-      const toolsResponse = {
-        jsonrpc: "2.0",
-        id: 2,
-        result: {
-          tools: [
-            { name: "list_directory", description: "List contents of a directory (C++ fs)", inputSchema: { type: "object", properties: { path: { type: "string" } } } },
-            { name: "execute_command", description: "Run native system command", inputSchema: { type: "object", properties: { cmd: { type: "string" } } } },
-            { name: "get_system_info", description: "Retrieve system stats via C++ syscalls" }
-          ]
+    std::string toMcpAppUri(const std::string& uri)
+    {
+        std::string path;
+        if (!uriToMcpAppsPath(uri, path)) return uri;
+        return (path == "/") ? "ui://dashboard-ui" : "ui://" + path.substr(1);
+    }
+
+    struct ExternalResourceInfo
+    {
+        std::string uri, name, description, mime_type;
+        json meta;
+    };
+
+    std::vector<ExternalResourceInfo> fetchExternalAppResources()
+    {
+        std::vector<ExternalResourceInfo> res;
+        httplib::Client cl(kMcpAppsHost, kMcpAppsPort);
+        cl.set_connection_timeout(2, 0);
+        cl.set_read_timeout(2, 0);
+        const auto r = cl.Get("/resource-manifest.json");
+        if (!r || r->status != 200) return res;
+        try
+        {
+            const auto manifest = json::parse(r->body);
+            if (!manifest.is_object() || !manifest.contains("resources")) return res;
+            for (const auto& e : manifest["resources"])
+            {
+                if (!e.is_object() || !e.contains("uri")) continue;
+                const std::string ruri = e["uri"].get<std::string>();
+                std::string app_path;
+                if (!uriToMcpAppsPath(ruri, app_path)) continue;
+                ExternalResourceInfo info;
+                info.uri = toMcpAppUri(ruri);
+                info.name = e.value("name", "App Resource: " + app_path);
+                info.description = e.value("description", "Resource from local mcp-apps");
+                info.mime_type = e.value("mimeType", "application/json");
+                if (e.contains("_meta") && e["_meta"].is_object()) info.meta = e["_meta"];
+                res.push_back(std::move(info));
+            }
         }
-      };
-      setMockResponse(JSON.stringify(toolsResponse, null, 2) +
-        "\n\n// Discovered 3 tools from C++ backend. Use tools/call to invoke.");
+        catch (...) {}
+        return res;
     }
-
-    if (simInitBtn) simInitBtn.addEventListener('click', mockInitialize);
-    if (simToolsBtn) simToolsBtn.addEventListener('click', mockToolsList);
-    if (testDiscoverBtn) {
-      testDiscoverBtn.addEventListener('click', () => {
-        mockToolsList();
-      });
-    }
-
-    // For "Try" buttons that mock MCP call on the /mcp row
-    const mockMcpBtns = document.querySelectorAll('.mockMcpCall');
-    mockMcpBtns.forEach(btn => {
-      btn.addEventListener('click', () => {
-        mockArea.innerText = `MCP Request simulation to /mcp\n\nPOST /mcp\nContent-Type: application/json\n\n{\n  "jsonrpc": "2.0",\n  "method": "tools/list",\n  "id": 1\n}\n\n// Server would respond with the list of compiled commands.\n// Your actual C++ handler will return native command metadata.`;
-      });
-    });
-
-    // initial default friendly message
-    setMockResponse('MCP + REST Dashboard ready.\nClick "initialize" to mock handshake, or "tools/list" to view sample command list.\n\nREST API Swagger UI will be available at /swagger (blue themed).');
-
-    // add small hover effect to show overall endpoints design note
-    console.log("Dark themed UI with blue accent and small border radius active | Bootstrap 5");
-  })();
-</script>
-</body>
-</html>)HTML";
-}
-
-}  // namespace
-
-int main(int argc, char** argv) {
-  ServerConfig config = parseArguments(argc, argv);
-
-  if (config.plugin_paths.empty()) {
-    config.plugin_paths = getAllPluginsInLib(argv[0]);
-  }
-
-  cmdsdk::CommandRegistry registry;
-  PluginLoader loader;
-  cmdsdk::OpenApiAggregator api_aggregator;
-
-  bool loaded_at_least_one_plugin = false;
-  for (const auto& plugin_path : config.plugin_paths) {
-    std::string error;
-    if (loader.load(plugin_path, registry, error)) {
-      loaded_at_least_one_plugin = true;
-      std::cout << "Loaded plugin: " << plugin_path << '\n';
-    } else {
-      std::cerr << "Failed to load plugin " << plugin_path << ": " << error << '\n';
-    }
-  }
-
-  // Build OpenAPI aggregator from registered commands
-  std::map<std::string, bool> processed_plugins;
-  const auto& pm_registry = cmdsdk::PluginMetadataRegistry::instance();
-
-  if (!registry.listMetadata().empty()) {
-    std::cout << "\nRegistered commands:\n";
-    for (const auto& metadata : registry.listMetadata()) {
-      const auto plugin_name = resolvePluginName(metadata);
-      const bool has_custom_openapi = pm_registry.hasCustomOpenApi(plugin_name);
-      const auto command_path = openApiPathForCommand(metadata);
-
-      // Check if this plugin has already been processed for OpenAPI
-      if (!processed_plugins[plugin_name]) {
-        processed_plugins[plugin_name] = true;
-
-        // Try to load custom OpenAPI spec from PluginMetadataRegistry
-        if (has_custom_openapi) {
-          // Use custom OpenAPI spec from registry
-          api_aggregator.addPluginSpec(plugin_name, pm_registry.getCustomOpenApi(plugin_name),
-                                       "registered-metadata");
-          std::cout << "    [OpenAPI] Loaded custom spec from PluginMetadataRegistry\n";
+    bool readMcpAppResource(const std::string& uri,
+        std::string& canonical_uri,
+        std::string& mime_type,
+        std::string& content,
+        std::string& error)
+    {
+        const bool mcp_debug = gMcpDebug.load();
+        std::string path;
+        if (!uriToMcpAppsPath(uri, path))
+        {
+            if (mcp_debug)
+            {
+                logDiag("MCP-APP-READ", "Rejected URI mapping for " + uri);
+            }
+            error = "Invalid URI scheme mapping";
+            return false;
         }
-      }
 
-      if (has_custom_openapi) {
-        auto plugin_spec = api_aggregator.getPluginSpec(plugin_name);
-
-        if (!plugin_spec.contains("paths") || !plugin_spec["paths"].is_object() ||
-            !plugin_spec["paths"].contains(command_path)) {
-          api_aggregator.addAutoGeneratedSpec(metadata, plugin_name);
-          std::cout << "    [OpenAPI] Added missing command from provider metadata: "
-                    << metadata.cmd_name << '\n';
-        } else if (mergeMissingSubtypeEnumsIntoSpec(plugin_spec, metadata)) {
-          api_aggregator.addPluginSpec(plugin_name, plugin_spec, "registered-metadata+provider");
-          std::cout << "    [OpenAPI] Added missing provider subTypes to custom spec for: "
-                    << metadata.cmd_name << '\n';
+        // Ensure path starts with / for httplib
+        if (path.empty() || path[0] != '/')
+        {
+            path = "/" + path;
         }
-      } else {
-        api_aggregator.addAutoGeneratedSpec(metadata, plugin_name);
-      }
 
-      // Print command info
-      std::cout << "  - [" << plugin_name << "] " << metadata.cmd_name << ": "
-                << metadata.description << '\n';
-      for (const auto& subtype : metadata.sub_cmd_types) {
-        std::cout << "      - " << subtype.sub_type_name << ": " << subtype.description
-                  << '\n';
-      }
-    }
-  }
+        httplib::Client cl(kMcpAppsHost, kMcpAppsPort);
+        cl.set_connection_timeout(1, 0); // 1s is plenty for localhost
+        cl.set_read_timeout(2, 0);
 
-  if (!loaded_at_least_one_plugin) {
-    std::cerr << "No plugins were loaded.\n";
-  }
+        if (mcp_debug)
+        {
+            logDiag("MCP-APP-READ", "Fetching " + uri + " via " + path);
+        }
 
-  // Build plugin registry for homepage
-  auto plugins = buildPluginRegistry(registry);
+        const auto r = cl.Get(path.c_str());
 
-  // Create HTTP server
-  httplib::Server server;
+        if (!r)
+        {
+            if (mcp_debug)
+            {
+                logDiag("MCP-APP-READ", "Connection failed for " + uri);
+            }
+            error = "mcp-apps connection failed at " + std::string(kMcpAppsHost);
+            return false;
+        }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // GET / — Enhanced homepage with dark theme
-  // ─────────────────────────────────────────────────────────────────────────
-  server.Get("/", [&](const httplib::Request&, httplib::Response& response) {
-    addCorsHeaders(response);
-    response.set_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-    response.set_header("Pragma", "no-cache");
-    response.set_header("Expires", "0");
-    response.set_content(defaultHtmlPage(config.port, config.protocol_mode, plugins),
-                         "text/html");
-  });
+        if (r->status != 200)
+        {
+            if (mcp_debug)
+            {
+                logDiag("MCP-APP-READ", "Non-200 for " + uri + ": " + std::to_string(r->status));
+            }
+            error = "mcp-apps error: " + std::to_string(r->status);
+            return false;
+        }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // OpenAPI Endpoints
-  // ─────────────────────────────────────────────────────────────────────────
+        // Echo back the caller URI; resource handlers currently publish their registered URI.
+        canonical_uri = uri;
 
-  // GET /openapi.json — Combined OpenAPI spec
-  server.Get("/openapi.json", [&](const httplib::Request&, httplib::Response& response) {
-    addCorsHeaders(response);
-    const auto combined_spec = api_aggregator.buildCombinedSpec("FastMCP API", "0.1.0");
-    response.set_content(combined_spec.dump(2), "application/json");
-  });
+        // Force HTML if we are proxying a Dashboard UI
+        mime_type = contentTypeFromResponse(r, "text/html");
+        content = r->body;
 
-  // GET /openapi.yaml — Combined OpenAPI spec as YAML (basic conversion)
-  server.Get("/openapi.yaml", [&](const httplib::Request&, httplib::Response& response) {
-    addCorsHeaders(response);
-    const auto combined_spec = api_aggregator.buildCombinedSpec("FastMCP API", "0.1.0");
-    // For simplicity, serve as JSON with YAML media type
-    // A full implementation would convert to proper YAML
-    response.set_content(combined_spec.dump(2), "application/yaml");
-  });
+        if (mcp_debug)
+        {
+            logDiag("MCP-APP-READ", "Success for " + uri + " mime=" + mime_type);
+        }
 
-  // GET /openapi/{plugin}.json — Individual plugin spec
-  server.Get("/openapi/:plugin", [&](const httplib::Request& request,
-                                       httplib::Response& response) {
-    addCorsHeaders(response);
-    const auto plugin_name_with_ext = request.path_params.at("plugin");
-    // Strip extension (.json or .yaml)
-    std::string plugin_name = plugin_name_with_ext;
-    if (plugin_name.ends_with(".json")) {
-      plugin_name = plugin_name.substr(0, plugin_name.length() - 5);
-    } else if (plugin_name.ends_with(".yaml") || plugin_name.ends_with(".yml")) {
-      size_t pos = plugin_name.rfind('.');
-      if (pos != std::string::npos) {
-        plugin_name = plugin_name.substr(0, pos);
-      }
+        return true;
     }
 
-    const auto spec = api_aggregator.getPluginSpec(plugin_name);
-    if (spec.is_object() && !spec.empty()) {
-      if (plugin_name_with_ext.ends_with(".json")) {
-        response.set_content(spec.dump(2), "application/json");
-      } else {
-        response.set_content(spec.dump(2), "application/yaml");
-      }
-    } else {
-      response.status = 404;
-      response.set_content(
-          nlohmann::json({{"error", "Plugin spec not found: " + plugin_name}}).dump(),
-          "application/json");
-    }
-  });
-
-  // GET /swagger — Interactive Swagger UI (embedded)
-  server.Get("/swagger", [&](const httplib::Request&, httplib::Response& response) {
-    addCorsHeaders(response);
-    response.set_content(std::string(cmdsdk::swagger_resources::swagger_html),
-                         "text/html");
-  });
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // REST API Endpoints
-  // ─────────────────────────────────────────────────────────────────────────
-
-  // POST /api/{command} — Execute command via REST
-  server.Post("/api/:command", [&](const httplib::Request& request,
-                                     httplib::Response& response) {
-    addCorsHeaders(response);
-
-    const auto command_name = request.path_params.at("command");
-    nlohmann::json request_body;
-
-    try {
-      request_body = nlohmann::json::parse(request.body);
-    } catch (const std::exception& e) {
-      response.status = 400;
-      response.set_content(
-          cmdsdk::RestApiHandler::buildResponse(false, "Invalid JSON: " + std::string(e.what()))
-              .dump(),
-          "application/json");
-      return;
+    // ── Plugin markdown builders ──────────────────────────────────────────────
+    std::string buildPluginsMarkdown(const std::map<std::string, PluginInfo>& plugins)
+    {
+        std::string doc = "# Available Plugins and SubCommand Types\n\n";
+        for (const auto& [pname, subtypes] : plugins)
+        {
+            doc += "## Plugin: " + pname + "\n\n### Available SubCommand Types:\n\n";
+            for (const auto& [sname, sm] : subtypes)
+            {
+                doc += "- **" + sname + "**: " + sm.description + "\n";
+                if (sm.response_schema.is_object() && !sm.response_schema.empty())
+                    doc += "  - Response schema:\n```json\n" + sm.response_schema.dump(2) + "\n```\n";
+            }
+            doc += "\n";
+        }
+        return doc;
     }
 
-    if (!request_body.is_object()) {
-      response.status = 400;
-      response.set_content(
-          cmdsdk::RestApiHandler::buildResponse(false, "Request body must be a JSON object")
-              .dump(),
-          "application/json");
-      return;
+    std::string buildPluginDetailsMarkdown(const std::string& pname, const PluginInfo& pi)
+    {
+        std::string doc = "# Plugin: " + pname + "\n\n## Available SubCommand Types\n\n";
+        for (const auto& [sname, sm] : pi)
+        {
+            doc += "- **" + sname + "**: " + sm.description + "\n";
+            if (sm.response_schema.is_object() && !sm.response_schema.empty())
+                doc += "  - Response schema:\n```json\n" + sm.response_schema.dump(2) + "\n```\n";
+        }
+        return doc;
     }
 
-    std::string error;
-    const auto result = cmdsdk::RestApiHandler::executeCommand(command_name, request_body,
-                                                                registry, error);
-
-    if (!result["success"].get<bool>()) {
-      response.status = 400;
-    }
-    response.set_content(result.dump(), "application/json");
-  });
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // MCP Endpoints
-  // ─────────────────────────────────────────────────────────────────────────
-
-  server.Options("/mcp", [](const httplib::Request&, httplib::Response& response) {
-    addCorsHeaders(response);
-    response.status = 200;
-  });
-
-  server.Post("/mcp", [&](const httplib::Request& request, httplib::Response& response) {
-    addCorsHeaders(response);
-    nlohmann::json rpc_request;
-    try {
-      rpc_request = nlohmann::json::parse(request.body);
-    } catch (const std::exception& parse_error) {
-      const auto error = makeJsonRpcError(nullptr, -32700,
-                                          "Parse error: " + std::string(parse_error.what()));
-      response.status = 400;
-      response.set_content(error.dump(), "application/json");
-      return;
+    const PluginInfo* findPluginInfo(const std::map<std::string, PluginInfo>& plugins,
+        const std::string& requested, std::string& resolved)
+    {
+        if (const auto it = plugins.find(requested); it != plugins.end())
+        {
+            resolved = it->first; return &it->second;
+        }
+        const auto ru = StringUtils::toUpperAscii(requested);
+        for (const auto& [pn, pi] : plugins)
+            if (StringUtils::toUpperAscii(pn) == ru) { resolved = pn; return &pi; }
+        const auto rl = StringUtils::toLowerAscii(requested);
+        for (const auto& [pn, pi] : plugins)
+        {
+            const auto pu = StringUtils::toUpperAscii(pn);
+            if (((rl == "geo" || rl == "geometry") && pu == "GEO") ||
+                (rl == "math" && pu == "MATH") ||
+                canonicalResourceName(pn) == rl)
+            {
+                resolved = pn; return &pi;
+            }
+        }
+        return nullptr;
     }
 
-    const auto rpc_response = handleMcpRequest(rpc_request, registry);
-    response.set_content(rpc_response.dump(2), "application/json");
-  });
+    // ── CORS helper ───────────────────────────────────────────────────────────
+    void addCorsHeaders(httplib::Response& res)
+    {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "Content-Type, MCP-Session-Id, MCP-Protocol-Version");
+    }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Start server
-  // ─────────────────────────────────────────────────────────────────────────
+    // ── Homepage ──────────────────────────────────────────────────────────────
+    std::string defaultHtmlPage(int mcp_port, int rest_port)
+    {
+        return R"HTML(<!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="UTF-8">
+    <title>FastMCP Server</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body  { background:#0a0f1a; color:#eef2ff; font-family:system-ui,sans-serif; padding:2rem; }
+        .card { background:rgba(18,24,34,.9); border:1px solid rgba(0,150,255,.25);
+                border-radius:14px; padding:1.5rem; transition:border-color .2s; }
+        .card:hover { border-color:rgba(0,150,255,.55); }
+        code  { background:#0b0f16; color:#bbd9ff; padding:.2rem .5rem; border-radius:6px; }
+        h1 span { color:#7bb8ff; }
+        .badge-live { background:#0e3a1e; color:#4cff8a; border:1px solid #1a6630;
+                    border-radius:20px; padding:4px 12px; font-size:.8rem; }
+    </style>
+    </head>
+    <body>
+    <div class="container">
+    <h1 class="mb-1">🔌 FastMCP <span>Command Server</span></h1>
+        <p class="text-secondary mb-4">Powered by <strong>cpp-mcp-sdk</strong> (itcv-GmbH) · MCP 2025-11-25 · C++17</p>
 
-  std::cout << "\n========================================\n";
-  std::cout << "FastMCP Server Configuration\n";
-  std::cout << "========================================\n";
-  std::cout << "Port: " << config.port << '\n';
-  std::cout << "Protocol Mode: " << protocolModeToString(config.protocol_mode) << '\n';
-  std::cout << "\nEndpoints:\n";
-  std::cout << "  GET  /                  — Homepage with plugin list\n";
-  std::cout << "  GET  /swagger           — Interactive Swagger UI\n";
-  std::cout << "  GET  /openapi.json      — Combined OpenAPI spec\n";
-  std::cout << "  GET  /openapi.yaml      — Combined OpenAPI spec (YAML)\n";
-  std::cout << "  GET  /openapi/{plugin}  — Individual plugin specs\n";
+    <div class="row g-3 mb-4">
+        <div class="col-md-6">
+        <div class="card">
+            <div class="d-flex align-items-center gap-2 mb-2">
+            <h5 class="mb-0">MCP Streamable HTTP</h5>
+            <span class="badge-live ms-auto">LIVE</span>
+            </div>
+            <p class="text-secondary small mb-2">JSON-RPC 2.0 — tools, resources, SSE transport</p>
+            <code>POST http://localhost:)HTML" + std::to_string(mcp_port) + R"HTML(/mcp</code>
+            <ul class="list-unstyled small mt-3 mb-0" style="opacity:.85">
+            <li>→ <code>initialize</code></li>
+            <li>→ <code>tools/list</code> &amp; <code>tools/call</code></li>
+            <li>→ <code>resources/list</code> &amp; <code>resources/read</code></li>
+            </ul>
+        </div>
+        </div>
+        <div class="col-md-6">
+        <div class="card">
+            <h5 class="mb-2">REST &amp; Swagger</h5>
+            <p class="text-secondary small mb-2">Port )HTML" + std::to_string(rest_port) + R"HTML(</p>
+            <ul class="list-unstyled small mb-0">
+            <li><code>GET  /swagger</code> — Interactive UI</li>
+            <li><code>GET  /openapi.json</code> — OpenAPI spec</li>
+            <li><code>GET  /openapi.yaml</code> — YAML spec</li>
+            <li><code>POST /api/{command}</code> — REST execution</li>
+            <li><code>GET  /mcp-apps/*</code> — App proxy (:6543)</li>
+            </ul>
+        </div>
+        </div>
+    </div>
+    <p class="text-secondary small">MCP port <strong>)HTML" + std::to_string(mcp_port) + R"HTML(</strong>
+        &nbsp;·&nbsp; REST port <strong>)HTML" + std::to_string(rest_port) + R"HTML(</strong>
+        &nbsp;·&nbsp; cpp-mcp-sdk library (itcv-GmbH/cpp-mcp-sdk)</p>
+    </div>
+    </body>
+    </html>)HTML";
+    }
 
-  if (config.protocol_mode == ProtocolMode::REST_ONLY || config.protocol_mode == ProtocolMode::ALL) {
-    std::cout << "  POST /api/{command}     — REST API endpoint\n";
-  }
-  if (config.protocol_mode == ProtocolMode::MCP_ONLY || config.protocol_mode == ProtocolMode::ALL) {
-    std::cout << "  POST /mcp               — MCP JSON-RPC endpoint\n";
-  }
-  std::cout << "========================================\n\n";
+    std::string protocolModeToString(ProtocolMode m)
+    {
+        switch (m)
+        {
+        case ProtocolMode::MCP_ONLY:  return "MCP Only";
+        case ProtocolMode::REST_ONLY: return "REST Only";
+        default:                       return "MCP + REST";
+        }
+    }
 
-  std::cout << "Starting server on http://0.0.0.0:" << config.port << '\n';
+    struct RuntimeResource
+    {
+        std::string uri;
+        std::string name;
+        std::string description;
+        std::string mime_type;
+        std::function<std::string()> body_provider;
+    };
 
-  if (!server.listen("0.0.0.0", config.port)) {
-    std::cerr << "Failed to bind server on port " << config.port << ".\n";
-    return 1;
-  }
+    bool addRuntimeResource(std::vector<RuntimeResource>& resources,
+        std::set<std::string>& seen_resource_uris,
+        RuntimeResource resource,
+        bool mcp_debug)
+    {
+        if (!seen_resource_uris.insert(resource.uri).second)
+        {
+            if (mcp_debug)
+            {
+                logDiag("MCP-RESOURCE", "Skipping duplicate resource URI " + resource.uri);
+            }
+            return false;
+        }
 
-  return 0;
+        resources.push_back(std::move(resource));
+        return true;
+    }
+
+} // namespace
+
+// ===========================================================================
+// main
+// ===========================================================================
+int main(int argc, char** argv)
+{
+    ServerConfig config = parseArguments(argc, argv);
+    gMcpDebug.store(envFlagEnabled("FASTMCP_MCP_DEBUG", false));
+    const bool mcp_debug = gMcpDebug.load();
+    const bool require_session_id = envFlagEnabled("FASTMCP_REQUIRE_SESSION_ID", true);
+
+    if (config.plugin_paths.empty())
+        config.plugin_paths = getAllPluginsInLib(argv[0]);
+
+    // ── Load plugins ──────────────────────────────────────────────────────
+    cmdsdk::CommandRegistry registry;
+    PluginLoader loader;
+    cmdsdk::OpenApiAggregator api_aggregator;
+    bool loaded_at_least_one = false;
+
+    for (const auto& path : config.plugin_paths)
+    {
+        std::string err;
+        if (loader.load(path, registry, err))
+        {
+            loaded_at_least_one = true;
+            std::cout << "Loaded plugin: " << path << '\n';
+        }
+        else
+        {
+            std::cerr << "Failed to load: " << path << ": " << err << '\n';
+        }
+    }
+
+    // ── Build OpenAPI aggregator ──────────────────────────────────────────
+    std::map<std::string, bool> processed_plugins;
+    const auto& pm_registry = cmdsdk::PluginMetadataRegistry::instance();
+
+    if (!registry.listMetadata().empty())
+    {
+        std::cout << "\nRegistered commands:\n";
+        for (const auto& meta : registry.listMetadata())
+        {
+            const auto pname = resolvePluginName(meta);
+            const bool has_custom = pm_registry.hasCustomOpenApi(pname);
+            const auto cmd_path = openApiPathForCommand(meta);
+
+            if (!processed_plugins[pname])
+            {
+                processed_plugins[pname] = true;
+                if (has_custom)
+                {
+                    api_aggregator.addPluginSpec(pname,
+                        pm_registry.getCustomOpenApi(pname),
+                        "registered-metadata");
+                    std::cout << "    [OpenAPI] Custom spec loaded\n";
+                }
+            }
+
+            if (has_custom)
+            {
+                auto pspec = api_aggregator.getPluginSpec(pname);
+                if (!pspec.contains("paths") || !pspec["paths"].contains(cmd_path))
+                {
+                    api_aggregator.addAutoGeneratedSpec(meta, pname);
+                }
+                else if (mergeMissingSubtypeEnumsIntoSpec(pspec, meta))
+                {
+                    api_aggregator.addPluginSpec(pname, pspec, "registered-metadata+provider");
+                }
+            }
+            else
+            {
+                api_aggregator.addAutoGeneratedSpec(meta, pname);
+            }
+
+            std::cout << "  - [" << pname << "] " << meta.cmd_name
+                << ": " << meta.description << '\n';
+            for (const auto& st : meta.sub_cmd_types)
+                std::cout << "      - " << st.sub_type_name << ": " << st.description << '\n';
+        }
+    }
+
+    if (!loaded_at_least_one)
+        std::cerr << "Warning: no plugins loaded.\n";
+
+    auto plugins = buildPluginRegistry(registry);
+
+    // ── Build MCP resources (apps) ─────────────────────────────
+    std::vector<RuntimeResource> resources;
+    std::set<std::string> seen_resource_uris;
+    for (const auto& ext : fetchExternalAppResources())
+    {
+        addRuntimeResource(resources, seen_resource_uris, RuntimeResource{
+            ext.uri,
+            ext.name,
+            ext.description,
+            ext.mime_type,
+            [uri = ext.uri]()
+            {
+                std::string canon, mime, body, err;
+                if (readMcpAppResource(uri, canon, mime, body, err))
+                    return body;
+                return std::string("Error: " + err);
+            }
+            }, mcp_debug);
+    }
+
+    auto createConfiguredMcpServer = [&registry, &resources, mcp_debug]()
+        {
+            const auto server_instance_id = ++gMcpServerInstanceCounter;
+            if (mcp_debug)
+            {
+                logDiag("MCP-CONNECT",
+                    "Creating MCP server instance #" + std::to_string(server_instance_id) +
+                    " (new initialize attempt/session)");
+            }
+
+            try
+            {
+                const mcp::ErrorReporter sdk_error_reporter = [mcp_debug](const mcp::ErrorEvent& event)
+                    {
+                        if (!mcp_debug) return;
+                        logDiag("MCP-SDK-ERROR",
+                            std::string(event.component()) + ": " + std::string(event.message()));
+                    };
+
+                mcp::lifecycle::session::ToolsCapability tools_capability;
+                tools_capability.listChanged = true;
+
+                mcp::lifecycle::session::ResourcesCapability resources_capability;
+                resources_capability.listChanged = true;
+
+                mcp::server::ServerConfiguration server_config;
+                server_config.sessionOptions.errorReporter = sdk_error_reporter;
+                server_config.capabilities = mcp::lifecycle::session::ServerCapabilities(
+                    std::nullopt,
+                    std::nullopt,
+                    std::nullopt,
+                    resources_capability,
+                    tools_capability,
+                    std::nullopt,
+                    std::nullopt);
+                server_config.serverInfo = mcp::lifecycle::session::Implementation("fastmcp_server", "0.3.0");
+                server_config.instructions = "Use tools for command execution and resources for plugin/app metadata. For the math form UI, call open-math-form and open http://localhost:6543/ui/math-form.html in a browser.";
+
+                auto mcp_server = mcp::server::Server::create(std::move(server_config));
+
+                ToolRegistrationState registration_state;
+
+                for (const auto& meta : registry.listMetadata())
+                {
+                    const auto cmd_name = meta.cmd_name;
+                    // command handler extracted into a lambda to capture cmd_name and registry by reference
+                    const auto cmd_handler = [&registry, cmd_name](const json& args) -> json
+                        {
+                            auto command = registry.create(cmd_name);
+                            if (!command)
+                            {
+                                throw std::runtime_error("Tool not found: " + cmd_name);
+                            }
+
+                            std::string error;
+                            if (!command->validate(args, error))
+                            {
+                                throw std::invalid_argument("Validation failed: " + error);
+                            }
+                            if (!command->execute(args, error))
+                            {
+                                throw std::runtime_error("Execution failed: " + error);
+                            }
+
+                            return command->getResult();
+                        };
+
+                    registerCmdAsTool(
+                        registry,
+                        *mcp_server,
+                        meta,
+                        cmd_handler,
+                        registration_state);
+                }
+
+                // registerToolWithUI for math.calculate start
+                std::vector<std::string> math_subtypes;
+                std::map<std::string, std::string> math_labels;
+                for (const auto& meta : registry.listMetadata())
+                {
+                    const auto plugin_name = resolvePluginName(meta);
+                    const bool is_math_command =
+                        (meta.cmd_name == "math.calculate") ||
+                        (StringUtils::toUpperAscii(plugin_name) == "MATH");
+                    if (!is_math_command || meta.sub_cmd_types.empty()) continue;
+
+                    for (const auto& st : meta.sub_cmd_types)
+                    {
+                        math_subtypes.push_back(st.sub_type_name);
+                        math_labels[st.sub_type_name] = st.description;
+                    }
+                    break;
+                }
+
+                std::string math_tool_name = "math_calculate";
+                if (const auto it = registration_state.command_tool_names.find("math.calculate");
+                    it != registration_state.command_tool_names.end() && !it->second.empty())
+                {
+                    math_tool_name = it->second.front();
+                }
+
+                json math_form_schema = {
+                    {"type", "object"},
+                    {"properties", json{
+                        {"left", json{{"type", "number"}, {"description", "first number in operation"}}},
+                        {"right", json{{"type", "number"}, {"description", "second number in operation"}}},
+                        {"subType", json{{"type", "string"}, {"enum", math_subtypes}, {"description", "operator option for math"}}}
+                    }},
+                    {"required", json::array({"left", "right", "subType"})}
+                };
+
+                // Define the handler for the math form tool
+                auto math_form_handler = [math_subtypes, math_labels, math_tool_name](const json& args) -> mcp::server::CallToolResult
+                {
+                    mcp::server::CallToolResult result;
+
+                    const json response = {
+                        {"status", "success"},
+                        {"availability", "math-form available"},
+                        {"message", "Math form UI available"},
+                        {"resourceUri", "ui://ui/math-form.html"},
+                        {"toolName", math_tool_name},
+                        {"subTypes", math_subtypes},
+                        {"labels", math_labels}
+                    };
+
+                    result.structuredContent = toMcpJson(response);
+                    result.content = McpJson::array();
+                    result.content.push_back(makeTextContent(response.dump()));
+                    result.isError = false;
+                    return result;
+                };
+
+                registerToolWithUI(
+                    *mcp_server,
+                    "open-math-form",
+                    "Open Math Form",
+                    "Open a math form UI and configure operation subtypes for the math MCP tool.",
+                    "math-form.html",
+                    math_form_schema,
+                    math_form_handler);
+
+                // registerToolWithUI for geo.calculate start
+                std::vector<std::string> geo_subtypes;
+                std::map<std::string, std::string> geo_labels;
+                json geo_form_schema = ""; // Placeholder schema; can be expanded based on actual command requirements
+                for (const auto& meta : registry.listMetadata())
+                {
+                    const auto plugin_name = resolvePluginName(meta);
+                    const bool is_geo_command =
+                        (meta.cmd_name == "geo.calculate") ||
+                        (StringUtils::toUpperAscii(plugin_name) == "GEO");
+                    if (!is_geo_command || meta.sub_cmd_types.empty()) continue;
+
+                    for (const auto& st : meta.sub_cmd_types)
+                    {
+                        geo_subtypes.push_back(st.sub_type_name);
+                        geo_labels[st.sub_type_name] = st.description;
+                    }
+                    geo_form_schema = buildInputSchema(meta, geo_subtypes);
+                    break;
+                }
+
+                std::string geo_tool_name = "geo_calculate";
+                if (const auto it = registration_state.command_tool_names.find("geo.calculate");
+                it != registration_state.command_tool_names.end() && !it->second.empty())
+                {
+                    geo_tool_name = it->second.front();
+                }
+
+                // Define the handler for the geo form tool
+                auto geo_form_handler = [geo_subtypes, geo_labels, geo_tool_name](const json& args) -> mcp::server::CallToolResult
+                {
+                    mcp::server::CallToolResult result;
+
+                    const json response = {
+                        {"status", "success"},
+                        {"availability", "geo-form available"},
+                        {"message", "Geometry form UI available"},
+                        {"resourceUri", "ui://ui/geo-form.html"},
+                        {"toolName", geo_tool_name},
+                        {"subTypes", geo_subtypes},
+                        {"labels", geo_labels}
+                    };
+
+                    result.structuredContent = toMcpJson(response);
+                    result.content = McpJson::array();
+                    result.content.push_back(makeTextContent(response.dump()));
+                    result.isError = false;
+                    return result;
+                };
+
+                registerToolWithUI(
+                    *mcp_server,
+                    "open-geo-form",
+                    "Open Geometry Form",
+                    "Open a geometry form UI and configure operation subtypes for the geometry MCP tool.",
+                    "geo-form.html",
+                    geo_form_schema,
+                    geo_form_handler);
+                // registerToolWithUI for geo.calculate end
+
+                // ─── Register remaining resources (non-app UI resources) ───────
+                for (const auto& resource : resources)
+                {
+                    // Skip ui://ui/math-form and ui://ui/geo-form as they're already registered
+                    // if (resource.uri == "ui://ui/math-form" || resource.uri == "ui://ui/geo-form")
+                    //     continue;
+
+                    mcp::server::ResourceDefinition definition;
+                    definition.uri = resource.uri;
+                    definition.name = resource.name;
+                    definition.description = resource.description;
+                    definition.mimeType = resource.mime_type;
+
+                    if (mcp_debug)
+                    {
+                        logDiag("MCP-REGISTER", "Registering resource " + resource.uri);
+                    }
+
+                    mcp_server->registerResource(
+                        std::move(definition),
+                        [resource, mcp_debug](const mcp::server::ResourceReadContext& ctx) -> std::vector<mcp::server::ResourceContent>
+                        {
+                            if (mcp_debug)
+                            {
+                                logRequestContext("MCP-RESOURCE-READ", ctx.requestContext, "uri=" + resource.uri);
+                            }
+                            std::string content = resource.body_provider();
+
+                            auto item = mcp::server::ResourceContent::text(
+                                resource.uri,
+                                content,
+                                resource.mime_type + ";profile=mcp-app"
+                            );
+                            return { item };
+                        });
+                }
+
+                return mcp_server;
+            }
+            catch (...)
+            {
+                logDiag("MCP-CONNECT",
+                    "Failed to construct MCP server instance #" + std::to_string(server_instance_id) +
+                    ": " + currentExceptionMessage());
+                throw;
+            }
+        };
+
+    // =========================================================================
+    // Auxiliary httplib REST server (non-MCP routes)
+    //
+    // cpp-mcp owns port N (MCP).  We run httplib on port N+1 for REST/Swagger.
+    // If you want everything on one port you need a cpp-mcp version that
+    // exposes get_server() — check your checkout for that accessor.
+    // =========================================================================
+    const int rest_port = config.port + 1;
+    httplib::Server rest_server;
+
+    // GET /
+    rest_server.Get("/", [&](const httplib::Request&, httplib::Response& res)
+        {
+            addCorsHeaders(res);
+            res.set_header("Cache-Control", "no-store");
+            res.set_content(defaultHtmlPage(config.port, rest_port), "text/html");
+        });
+
+    // GET /swagger
+    rest_server.Get("/swagger", [&](const httplib::Request&, httplib::Response& res)
+        {
+            addCorsHeaders(res);
+            res.set_content(std::string(cmdsdk::swagger_resources::swagger_html), "text/html");
+        });
+
+    // GET /openapi.json
+    rest_server.Get("/openapi.json", [&](const httplib::Request&, httplib::Response& res)
+        {
+            addCorsHeaders(res);
+            res.set_content(
+                api_aggregator.buildCombinedSpec("FastMCP API", "0.1.0").dump(2),
+                "application/json");
+        });
+
+    // GET /openapi.yaml
+    rest_server.Get("/openapi.yaml", [&](const httplib::Request&, httplib::Response& res)
+        {
+            addCorsHeaders(res);
+            res.set_content(
+                api_aggregator.buildCombinedSpec("FastMCP API", "0.1.0").dump(2),
+                "application/yaml");
+        });
+
+    // GET /openapi/:plugin
+    rest_server.Get("/openapi/:plugin", [&](const httplib::Request& req,
+        httplib::Response& res)
+        {
+            addCorsHeaders(res);
+            std::string pname = req.path_params.at("plugin");
+            if (StringUtils::endsWith(pname, ".json"))       pname = pname.substr(0, pname.size() - 5);
+            else if (StringUtils::endsWith(pname, ".yaml") || StringUtils::endsWith(pname, ".yml"))
+                pname = pname.substr(0, pname.rfind('.'));
+
+            const auto spec = api_aggregator.getPluginSpec(pname);
+            if (spec.is_object() && !spec.empty())
+            {
+                res.set_content(spec.dump(2), "application/json");
+            }
+            else
+            {
+                res.status = 404;
+                res.set_content(
+                    json({ {"error", "Plugin spec not found: " + pname} }).dump(),
+                    "application/json");
+            }
+        });
+
+    // POST /api/:command — REST command execution
+    if (config.protocol_mode != ProtocolMode::MCP_ONLY)
+    {
+        rest_server.Post("/api/:command", [&](const httplib::Request& req,
+            httplib::Response& res)
+            {
+                addCorsHeaders(res);
+                const auto cmd_name = req.path_params.at("command");
+                std::cout << "[REST POST] /api/" << cmd_name << " body=" << req.body << '\n';
+                json body;
+                try { body = json::parse(req.body); }
+                catch (const std::exception& e)
+                {
+                    res.status = 400;
+                    res.set_content(
+                        cmdsdk::RestApiHandler::buildResponse(
+                            false, "Invalid JSON: " + std::string(e.what())).dump(),
+                        "application/json");
+                    return;
+                }
+                if (!body.is_object())
+                {
+                    res.status = 400;
+                    res.set_content(
+                        cmdsdk::RestApiHandler::buildResponse(false, "Body must be a JSON object").dump(),
+                        "application/json");
+                    return;
+                }
+                std::string err;
+                const auto result = cmdsdk::RestApiHandler::executeCommand(
+                    cmd_name, body, registry, err);
+                if (!result["success"].get<bool>()) res.status = 400;
+                res.set_content(result.dump(), "application/json");
+            });
+    }
+
+    // GET /mcp-apps  &  /mcp-apps/:path — reverse-proxy
+    auto proxy_mcp_app = [](const std::string& path, httplib::Response& res)
+        {
+            httplib::Client cl(kMcpAppsHost, kMcpAppsPort);
+            cl.set_connection_timeout(2, 0);
+            cl.set_read_timeout(5, 0);
+            const auto r = cl.Get(path.c_str());
+            if (!r)
+            {
+                res.status = 502;
+                res.set_content(
+                    json({ {"error", "mcp-apps unreachable"} }).dump(), "application/json");
+                return;
+            }
+            res.status = r->status;
+            res.set_content(r->body, contentTypeFromResponse(r, "text/plain"));
+        };
+
+    rest_server.Get("/mcp-apps", [&](const httplib::Request&, httplib::Response& res)
+        {
+            addCorsHeaders(res);
+            std::cout << "[REST GET] /mcp-apps (proxy -> :6543/)\n";
+            proxy_mcp_app("/", res);
+        });
+    rest_server.Get(R"(/mcp-apps/(.+))", [&](const httplib::Request& req,
+        httplib::Response& res)
+        {
+            addCorsHeaders(res);
+            const auto app_path = "/" + req.matches[1].str();
+            std::cout << "[REST GET] /mcp-apps" << app_path << " (proxy -> :6543" << app_path << ")\n";
+            proxy_mcp_app(app_path, res);
+        });
+
+    // CORS preflight
+    rest_server.Options(".*", [](const httplib::Request&, httplib::Response& res)
+        {
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            res.set_header("Access-Control-Allow-Headers", "Content-Type");
+            res.status = 200;
+        });
+
+    // =========================================================================
+    // Banner
+    // =========================================================================
+    std::cout << "\n========================================\n"
+        << "FastMCP Server  (cpp-mcp-sdk by itcv-GmbH)\n"
+        << "========================================\n"
+        << "Protocol mode : " << protocolModeToString(config.protocol_mode) << "\n\n"
+        << "MCP  (cpp-mcp-sdk)  → http://0.0.0.0:" << config.port << "/mcp\n"
+        << "REST (httplib)  → http://0.0.0.0:" << rest_port << "/\n\n"
+        << "REST routes:\n"
+        << "  GET  /              — Homepage\n"
+        << "  GET  /swagger       — Swagger UI\n"
+        << "  GET  /openapi.json  — Combined OpenAPI\n"
+        << "  GET  /openapi.yaml  — YAML OpenAPI\n"
+        << "  GET  /openapi/{p}   — Per-plugin spec\n"
+        << "  GET  /mcp-apps/*    — Proxy to :6543\n";
+    if (config.protocol_mode != ProtocolMode::MCP_ONLY)
+        std::cout << "  POST /api/{cmd}     — REST execution\n";
+    std::cout << "========================================\n\n";
+
+    // =========================================================================
+    // Start servers
+    // =========================================================================
+
+    std::signal(SIGINT, handleSignal);
+    std::signal(SIGTERM, handleSignal);
+
+    std::unique_ptr<mcp::server::StreamableHttpServerRunner> mcp_runner;
+    if (config.protocol_mode != ProtocolMode::REST_ONLY)
+    {
+        const mcp::server::ServerFactory server_factory = [createConfiguredMcpServer]()
+            {
+                return createConfiguredMcpServer();
+            };
+
+        mcp::server::StreamableHttpServerRunnerOptions mcp_options;
+        mcp_options.transportOptions.http.errorReporter = [mcp_debug](const mcp::ErrorEvent& event)
+            {
+                if (!mcp_debug) return;
+                logDiag("MCP-HTTP-ERROR",
+                    std::string(event.component()) + ": " + std::string(event.message()));
+            };
+        mcp_options.transportOptions.http.endpoint.bindAddress = "0.0.0.0";
+        mcp_options.transportOptions.http.endpoint.bindLocalhostOnly = false;
+        mcp_options.transportOptions.http.endpoint.port = static_cast<std::uint16_t>(config.port);
+        mcp_options.transportOptions.http.endpoint.path = "/mcp";
+        mcp_options.transportOptions.http.requireSessionId = require_session_id;
+
+        if (mcp_debug)
+        {
+            if (require_session_id)
+            {
+                logDiag("MCP-CONNECT",
+                    "Streamable HTTP policy requireSessionId=true (strict multi-session mode). "
+                    "Clients must NOT send MCP-Session-Id on initialize; "
+                    "server mints MCP-Session-Id on successful initialize response.");
+            }
+            else
+            {
+                logDiag("MCP-CONNECT",
+                    "Streamable HTTP policy requireSessionId=false (compat mode). "
+                    "All HTTP clients share one MCP session; this improves compatibility "
+                    "with proxies that do not replay MCP-Session-Id consistently.");
+            }
+        }
+
+        mcp_runner = std::make_unique<mcp::server::StreamableHttpServerRunner>(server_factory, mcp_options);
+        mcp_runner->start();
+        std::cout << "MCP  server listening on http://0.0.0.0:" << config.port << "\n";
+    }
+
+    // REST on a background thread (detached — lives for the process lifetime)
+    if (config.protocol_mode != ProtocolMode::MCP_ONLY)
+    {
+        std::thread([&rest_server, rest_port]()
+            {
+                std::cout << "REST server listening on http://0.0.0.0:" << rest_port << '\n';
+                if (!rest_server.listen("0.0.0.0", rest_port))
+                    std::cerr << "ERROR: failed to bind REST server on port " << rest_port << '\n';
+            }).detach();
+    }
+
+    while (!gStopRequested.load())
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    if (mcp_runner)
+    {
+        mcp_runner->stop();
+    }
+    rest_server.stop();
+
+    return 0;
 }
