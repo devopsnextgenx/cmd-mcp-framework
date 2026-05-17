@@ -8,40 +8,29 @@
 //     • server->registerResource(definition, handler)
 //     • mcp::server::StreamableHttpServerRunner for /mcp transport
 //
-// Auxiliary REST layer → cpp-httplib (kept for non-MCP routes)
-//   GET  /             — homepage
-//   GET  /swagger      — Swagger UI
-//   GET  /openapi.json — combined OpenAPI spec
-//   GET  /openapi.yaml — combined OpenAPI spec (YAML)
-//   GET  /openapi/:p   — per-plugin spec
-//   POST /api/:cmd     — REST command execution
-//   GET  /mcp-apps*    — reverse-proxy to mcp-apps at :6543
+// Auxiliary REST layer and plugin registration are in their own TUs:
+//   RestImplementation.cpp  — httplib routes, Swagger, CORS, homepage
+//   PluginRegistration.cpp  — plugin discovery, tool/resource registration
 //
 // Port layout:
 //   MCP  → port N   (e.g. 5432) — cpp-mcp-sdk streamable HTTP runner
 //   REST → port N+1 (e.g. 5433) — httplib on a detached thread
 // ---------------------------------------------------------------------------
 
-#include <chrono>
-#include <filesystem>
-#include <iostream>
-#include <string>
-#include <vector>
-#include <sstream>
-#include <set>
-#include <map>
-#include <algorithm>
-#include <cctype>
-#include <thread>
-#include <memory>
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
-#include <optional>
-#include <mutex>
-#include <iomanip>
 #include <cstdlib>
-#include <charconv>
+#include <filesystem>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
 
 // ── cpp-mcp-sdk ───────────────────────────────────────────────────────────
 #include <mcp/lifecycle/session/implementation.hpp>
@@ -50,857 +39,260 @@
 #include <mcp/lifecycle/session/tools_capability.hpp>
 #include <mcp/server/all.hpp>
 
-// ── Auxiliary HTTP for non-MCP routes ────────────────────────────────────
+// ── Auxiliary HTTP ────────────────────────────────────────────────────────
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include "FastMcpStringUtils.hpp"
 #include "PluginLoader.hpp"
+#include "PluginRegistration.hpp"
+#include "FastMcpLogger.hpp"
+#include "RestImplementation.hpp"
 #include "cmdsdk/CommandRegistry.hpp"
-#include "cmdsdk/OpenApiGenerator.hpp"
 #include "cmdsdk/OpenApiAggregator.hpp"
-#include "cmdsdk/RestApiHandler.hpp"
-#include "cmdsdk/PluginOpenApiLoader.hpp"
-#include "cmdsdk/PluginMetadata.hpp"
-#include "cmdsdk/SwaggerResources.hpp"
-#include "HtmlTemplateString.hpp"
+
+// ===========================================================================
+// Global state (referenced by PluginRegistration.cpp via extern)
+// ===========================================================================
+
+std::atomic_bool     gStopRequested{ false };
+std::atomic_bool     gMcpDebug{ false };
+std::atomic_uint64_t gMcpServerInstanceCounter{ 0 };
+std::mutex           gLogMutex;
 
 namespace
 {
 
-    using json = nlohmann::json;
-    using StringUtils = fastmcp::FastMcpStringUtils;
+using json        = nlohmann::json;
+using StringUtils = fastmcp::FastMcpStringUtils;
+using McpJson     = mcp::jsonrpc::JsonValue;
 
-    using McpJson = mcp::jsonrpc::JsonValue;
+constexpr int kDefaultServerPort = CMDSDK_SERVER_PORT;
 
-    constexpr int kDefaultServerPort = CMDSDK_SERVER_PORT;
+using ProtocolMode = fastmcp::ProtocolMode;
 
-#if defined(_WIN32)
-    static const std::set<std::string> kNonPluginLibs = { "cmd_sdk.dll" };
-#elif defined(__APPLE__)
-    static const std::set<std::string> kNonPluginLibs = { "libcmd_sdk.dylib" };
-#else
-    static const std::set<std::string> kNonPluginLibs = { "libcmd_sdk.so" };
-#endif
+struct ServerConfig
+{
+    int                              port          = kDefaultServerPort;
+    std::vector<std::filesystem::path> plugin_paths;
+    ProtocolMode                     protocol_mode = ProtocolMode::ALL;
+};
 
-    using ProtocolMode = fastmcp::ProtocolMode;
+// ── Logging (also called from PluginRegistration.cpp via extern) ──────────
 
-    struct ServerConfig
+} // anonymous namespace
+
+namespace
+{
+
+std::string currentExceptionMessage()
+{
+    try { throw; }
+    catch (const std::exception& ex) { return ex.what(); }
+    catch (...)                       { return "non-std exception"; }
+}
+
+bool envFlagEnabled(const char* name, bool default_value = false)
+{
+    const char* value = std::getenv(name);
+    if (!value) return default_value;
+    std::string v = value;
+    std::transform(v.begin(), v.end(), v.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return !(v == "0" || v == "false" || v == "off" || v == "no");
+}
+
+void handleSignal(int) { gStopRequested.store(true); }
+
+McpJson toMcpJson(const json& value) { return McpJson::parse(value.dump()); }
+json fromMcpJson(const McpJson& value) { return json::parse(value.to_string()); }
+
+McpJson makeTextContent(const std::string& text)
+{
+    McpJson block = McpJson::object();
+    block["type"] = "text";
+    block["text"] = text;
+    return block;
+}
+
+// ── Argument parsing ──────────────────────────────────────────────────────
+
+ServerConfig parseArguments(int argc, char** argv)
+{
+    ServerConfig cfg;
+    for (int i = 1; i < argc; ++i)
     {
-        int port = kDefaultServerPort;
-        std::vector<std::filesystem::path> plugin_paths;
-        ProtocolMode protocol_mode = ProtocolMode::ALL;
-    };
-
-    std::atomic_bool gStopRequested{ false };
-    std::atomic_bool gMcpDebug{ false };
-    std::atomic_uint64_t gMcpServerInstanceCounter{ 0 };
-    std::mutex gLogMutex;
-
-    void logDiag(const std::string& area, const std::string& message)
-    {
-        std::lock_guard<std::mutex> lock(gLogMutex);
-        std::cout << "[" << StringUtils::nowUtcIso8601() << "] [" << area << "] " << message << '\n';
-    }
-
-    std::string currentExceptionMessage()
-    {
-        try
+        std::string arg = argv[i];
+        if (StringUtils::beginsWith(arg, "--port="))
         {
-            throw;
+            cfg.port = std::stoi(arg.substr(7));
         }
-        catch (const std::exception& ex)
+        else if (StringUtils::beginsWith(arg, "--plugins="))
         {
-            return ex.what();
+            std::stringstream ss(arg.substr(10));
+            std::string p;
+            while (std::getline(ss, p, ','))
+                if (!p.empty()) cfg.plugin_paths.emplace_back(p);
         }
-        catch (...)
+        else if (StringUtils::beginsWith(arg, "--protocol="))
         {
-            return "non-std exception";
+            std::string m = arg.substr(11);
+            if      (m == "mcp")  cfg.protocol_mode = ProtocolMode::MCP_ONLY;
+            else if (m == "rest") cfg.protocol_mode = ProtocolMode::REST_ONLY;
+            else if (m == "all")  cfg.protocol_mode = ProtocolMode::ALL;
+            else { std::cerr << "Invalid protocol: " << m << '\n'; exit(1); }
         }
-    }
-
-    void logRequestContext(const std::string& area,
-        const mcp::jsonrpc::RequestContext& request_context,
-        const std::string& method_or_target)
-    {
-        logDiag(area,
-            method_or_target +
-            " session=" + StringUtils::safeSessionId(request_context.sessionId) +
-            " protocol=" + request_context.protocolVersion);
-    }
-
-    bool envFlagEnabled(const char* name, bool default_value = false)
-    {
-        const char* value = std::getenv(name);
-        if (!value) return default_value;
-        std::string v = value;
-        std::transform(v.begin(), v.end(), v.begin(),
-            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        return !(v == "0" || v == "false" || v == "off" || v == "no");
-    }
-
-    void handleSignal(int)
-    {
-        gStopRequested.store(true);
-    }
-
-    McpJson toMcpJson(const json& value)
-    {
-        return McpJson::parse(value.dump());
-    }
-
-    json fromMcpJson(const McpJson& value)
-    {
-        return json::parse(value.to_string());
-    }
-
-    McpJson makeTextContent(const std::string& text)
-    {
-        McpJson block = McpJson::object();
-        block["type"] = "text";
-        block["text"] = text;
-        return block;
-    }
-
-    struct ToolRegistrationState
-    {
-        std::set<std::string> used_tool_names;
-        std::map<std::string, int> tool_name_suffixes;
-        std::map<std::string, std::vector<std::string>> command_tool_names;
-    };
-
-    std::string allocateUniqueToolName(const std::string& base_name,
-        ToolRegistrationState& state)
-    {
-        std::string tool_name = base_name;
-        if (state.used_tool_names.count(tool_name) > 0)
+        else
         {
-            int& suffix = state.tool_name_suffixes[tool_name];
-            do
-            {
-                ++suffix;
-            } while (state.used_tool_names.count(tool_name + "_" + std::to_string(suffix)) > 0);
-            tool_name = tool_name + "_" + std::to_string(suffix);
+            std::cerr << "Unknown argument: " << arg << '\n'
+                      << "Usage: " << argv[0]
+                      << " [--port=PORT] [--plugins=P1,P2,...] [--protocol=mcp|rest|all]\n";
+            exit(1);
         }
-        state.used_tool_names.insert(tool_name);
-        return tool_name;
     }
+    return cfg;
+}
 
-    json buildInputSchema(const cmdsdk::CommandMetadata& cmd_meta,
-        const std::optional<std::vector<std::string>>& fixed_subtype)
+// ── RuntimeResource (kept in main; only MCP resource registration uses it) ─
+
+struct RuntimeResource
+{
+    std::string uri;
+    std::string name;
+    std::string description;
+    std::string mime_type;
+    std::function<std::string()> body_provider;
+};
+
+bool addRuntimeResource(std::vector<RuntimeResource>& resources,
+                        std::set<std::string>& seen_resource_uris,
+                        RuntimeResource resource,
+                        bool mcp_debug)
+{
+    if (!seen_resource_uris.insert(resource.uri).second)
     {
-        json input_schema = {
-            {"type", "object"},
-            {"properties", json::object()},
-            {"additionalProperties", true}
-        };
-        std::set<std::string> required_fields;
-
-        for (const auto& param : cmd_meta.parameters)
-        {
-            std::string json_type = "string";
-            if (param.parameter_type == "number") json_type = "number";
-            else if (param.parameter_type == "boolean") json_type = "boolean";
-            else if (param.parameter_type == "object") json_type = "object";
-            else if (param.parameter_type == "array") json_type = "array";
-
-            input_schema["properties"][param.parameter_name] = {
-                {"type", json_type},
-                {"description", param.description}
-            };
-            if (param.required)
-            {
-                required_fields.insert(param.parameter_name);
-            }
-        }
-
-        if (fixed_subtype.has_value())
-        {
-            // convert to json array            
-            json enum_values = json::array();
-            for (const auto& st : *fixed_subtype)
-            {
-                enum_values.push_back(st);
-            }
-            input_schema["properties"]["subType"] = {
-                {"type", "string"},
-                {"enum", enum_values},
-                {"description", "Injected subType for this tool"}
-            };
-        }
-        else if (!cmd_meta.sub_cmd_types.empty())
-        {
-            json enum_values = json::array();
-            for (const auto& st : cmd_meta.sub_cmd_types)
-            {
-                enum_values.push_back(st.sub_type_name);
-            }
-            input_schema["properties"]["subType"] = {
-                {"type", "string"},
-                {"enum", enum_values},
-                {"description", "SubCommand type to execute"}
-            };
-            required_fields.insert("subType");
-        }
-
-        if (!required_fields.empty())
-        {
-            json required = json::array();
-            for (const auto& field : required_fields)
-            {
-                required.push_back(field);
-            }
-            input_schema["required"] = required;
-        }
-
-        return input_schema;
-    }
-
-    bool registerTool(const cmdsdk::CommandRegistry& registry, mcp::server::Server& server,
-        const std::string& tool_name,
-        const std::string& title,
-        const std::string& description,
-        const json& input_schema,
-        const std::string& original_cmd_name,
-        const std::function<json(const json&)>& handler)
-    {
-        static_cast<void>(registry);
-        const bool mcp_debug = gMcpDebug.load();
-        const mcp::server::ToolDefinition toolDef{
-            .name = tool_name,
-            .title = title,
-            .description = description,
-            .inputSchema = toMcpJson(input_schema),
-        };
-
         if (mcp_debug)
-        {
-            logDiag("MCP-REGISTER",
-                "Registering tool " + tool_name + " (command=" + original_cmd_name + ")");
-        }
-        // lambda for tool action handler
-        auto toolHandler = [handler, tool_name, original_cmd_name](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult
-            {
-                try
-                {
-                    if (gMcpDebug.load())
-                    {
-                        logRequestContext("MCP-TOOL-CALL",
-                            context.requestContext,
-                            "tool=" + tool_name + " command=" + original_cmd_name);
-                    }
-
-                    const json args = fromMcpJson(context.arguments);
-                    const json raw = handler(args);
-
-                    json structured = raw.is_object() ? raw : json{ {"result", raw} };
-                    if (args.contains("subType") && args["subType"].is_string())
-                    {
-                        structured["subTypeExecuted"] = args["subType"].get<std::string>();
-                    }
-
-                    std::cout << "[tools/call] " << original_cmd_name << " -> " << raw.dump() << '\n';
-
-                    mcp::server::CallToolResult result;
-                    result.structuredContent = toMcpJson(structured);
-                    result.content = McpJson::array();
-                    result.content.push_back(makeTextContent(raw.dump()));
-                    result.isError = false;
-                    return result;
-                }
-                catch (const std::exception& e)
-                {
-                    if (gMcpDebug.load())
-                    {
-                        logDiag("MCP-TOOL-ERROR", original_cmd_name + " failed: " + e.what());
-                    }
-                    throw;
-                }
-            };
-
-        server.registerTool(
-            toolDef,
-            toolHandler);
-
-        return true;
+            fastmcp::logDiag("MCP-RESOURCE", "Skipping duplicate resource URI " + resource.uri);
+        return false;
     }
+    resources.push_back(std::move(resource));
+    return true;
+}
 
-    bool registerCmdAsTool(const cmdsdk::CommandRegistry& registry, mcp::server::Server& server,
-        const cmdsdk::CommandMetadata& cmd_meta,
-        const std::function<json(const json&)>& handler,
-        ToolRegistrationState& registration_state)
+// ── MCP server factory ─────────────────────────────────────────────────────
+
+std::shared_ptr<mcp::server::Server>
+createConfiguredMcpServer(const cmdsdk::CommandRegistry& registry,
+                          const std::vector<RuntimeResource>& resources)
+{
+    const auto server_instance_id = ++gMcpServerInstanceCounter;
+    const bool mcp_debug          = gMcpDebug.load();
+
+    if (mcp_debug)
+        fastmcp::logDiag("MCP-CONNECT",
+            "Creating MCP server instance #" + std::to_string(server_instance_id) +
+            " (new initialize attempt/session)");
+
+    try
     {
-        const std::string original_cmd_name = cmd_meta.cmd_name;
-
-        // Define lambda for tool registration
-        const auto lambda_register_tool = [&](const std::string& base_tool_name,
-            const std::string& description,
-            const json& input_schema,
-            const std::function<json(const json&)>& wrapped_handler) -> bool
-            {
-                const auto tool_name = allocateUniqueToolName(base_tool_name, registration_state);
-                registration_state.command_tool_names[original_cmd_name].push_back(tool_name);
-
-                std::string tool_description = description;
-                if (tool_name != original_cmd_name)
-                {
-                    tool_description += " [original: " + original_cmd_name + "]";
-                }
-
-                return registerTool(registry,
-                    server,
-                    tool_name,
-                    original_cmd_name,
-                    tool_description,
-                    input_schema,
-                    original_cmd_name,
-                        wrapped_handler);
-            };
-
-        return lambda_register_tool(
-            StringUtils::sanitizeToolName(original_cmd_name),
-            cmd_meta.description,
-            buildInputSchema(cmd_meta, std::nullopt),
-            handler);
-    }
-    
-    bool registerToolWithUI(
-        mcp::server::Server& server,
-        const std::string& toolName,
-        const std::string& title,
-        const std::string& description,
-        const std::string& resource_uri,
-        const json& input_schema,
-        const std::function<mcp::server::CallToolResult(const json&)>& handler)
-    {
-        const bool mcp_debug = gMcpDebug.load();
-
-        // ─── Register the Tool ───────────────────────────────────────────────
-        mcp::server::ToolDefinition toolDef;
-        toolDef.name = toolName;
-        toolDef.title = title;
-        toolDef.description = description;
-        toolDef.inputSchema = toMcpJson(input_schema);
-        toolDef.annotations = mcp::jsonrpc::JsonValue::object({
-            {"readOnlyHint", true}
-        });
-        toolDef.execution = mcp::jsonrpc::JsonValue::object({
-            {
-                "taskSupport", "forbidden"
-            }
-        });
-        // Both resourceUri and mimeType profile are needed for inspector to recognize as app
-        toolDef.metadata = mcp::jsonrpc::JsonValue::object({
-            { "ui", mcp::jsonrpc::JsonValue::object({ { "resourceUri", resource_uri } }) },
-            { "ui/resourceUri", resource_uri }
-        });
-
-        if (mcp_debug)
+        const mcp::ErrorReporter sdk_error_reporter =
+            [mcp_debug](const mcp::ErrorEvent& event)
         {
-            logDiag("MCP-REGISTER", "Registering app tool " + toolName + " with UI resource " + resource_uri);
-        }
-
-        auto toolHandler = [handler, toolName, resource_uri](const mcp::server::ToolCallContext& context) -> mcp::server::CallToolResult
-        {
-            try
-            {
-                if (gMcpDebug.load())
-                {
-                    logRequestContext("MCP-TOOL-CALL", context.requestContext, "tool=" + toolName);
-                }
-
-                const mcp::server::CallToolResult result = handler(fromMcpJson(context.arguments));
-                
-                if (gMcpDebug.load())
-                {
-                    logDiag("MCP-TOOL-SUCCESS", toolName + " executed successfully");
-                }
-
-                return result;
-            }
-            catch (const std::exception& e)
-            {
-                if (gMcpDebug.load())
-                {
-                    logDiag("MCP-TOOL-ERROR", toolName + " failed: " + e.what());
-                }
-                throw;
-            }
+            if (!mcp_debug) return;
+            fastmcp::logDiag("MCP-SDK-ERROR",
+                std::string(event.component()) + ": " + std::string(event.message()));
         };
 
-        server.registerTool(
-            std::move(toolDef),
-            toolHandler
-            );
+        mcp::lifecycle::session::ToolsCapability tools_capability;
+        tools_capability.listChanged = true;
 
-        if (mcp_debug)
+        mcp::lifecycle::session::ResourcesCapability resources_capability;
+        resources_capability.listChanged = true;
+
+        mcp::server::ServerConfiguration server_config;
+        server_config.sessionOptions.errorReporter = sdk_error_reporter;
+        server_config.capabilities = mcp::lifecycle::session::ServerCapabilities(
+            std::nullopt, std::nullopt, std::nullopt,
+            resources_capability, tools_capability,
+            std::nullopt, std::nullopt);
+        server_config.serverInfo    = mcp::lifecycle::session::Implementation(
+            "fastmcp_server", "0.3.0");
+        server_config.instructions  =
+            "Use tools for command execution and resources for plugin/app metadata. "
+            "UI-enabled commands can expose app tools via CommandMetadata.is_app_tool "
+            "and resource_uri.";
+
+        auto mcp_server = mcp::server::Server::create(std::move(server_config));
+
+        // ── Register tools ─────────────────────────────────────────────────
+        fastmcp::ToolRegistrationState registration_state;
+
+        for (const auto& meta : registry.listMetadata())
         {
-            logDiag("MCP-REGISTER", "Tool UI resource set to " + resource_uri + " (proxied/app resource)");
-        }
+            const auto cmd_name = meta.cmd_name;
 
-        return true;
-    }
-
-    bool registerAppToolWithUI(const cmdsdk::CommandRegistry& registry, mcp::server::Server& server,
-        const cmdsdk::CommandMetadata& cmd_meta,
-        ToolRegistrationState& registration_state)
-    {
-        const std::string original_cmd_name = cmd_meta.cmd_name;
-        const std::string tool_base_name = "open-" + StringUtils::sanitizeToolName(original_cmd_name) + "-form";
-        const std::string tool_name = allocateUniqueToolName(tool_base_name, registration_state);
-        const std::string resource_uri = cmd_meta.resource_uri.empty()
-            ? "ui://ui/" + StringUtils::sanitizeToolName(original_cmd_name) + "-form.html"
-            : cmd_meta.resource_uri;
-        const std::string title = "Open " + original_cmd_name + " Form";
-        const std::string description = "Open a UI form for " + original_cmd_name + ".";
-        const json input_schema = buildInputSchema(cmd_meta, std::nullopt);
-
-        std::vector<std::string> subtype_names;
-        std::map<std::string, std::string> subtype_labels;
-        for (const auto& st : cmd_meta.sub_cmd_types)
-        {
-            subtype_names.push_back(st.sub_type_name);
-            subtype_labels[st.sub_type_name] = st.description;
-        }
-
-        const std::string command_tool_name =
-            (!registration_state.command_tool_names[original_cmd_name].empty())
-                ? registration_state.command_tool_names[original_cmd_name].front()
-                : std::string();
-
-        auto ui_handler = [resource_uri, command_tool_name, original_cmd_name, subtype_names, subtype_labels](const json& args) -> mcp::server::CallToolResult
-        {
-            mcp::server::CallToolResult result;
-
-            json response = {
-                {"status", "success"},
-                {"availability", original_cmd_name + " form available"},
-                {"message", "UI form available"},
-                {"resourceUri", resource_uri},
-                {"toolName", command_tool_name},
-                {"commandName", original_cmd_name},
-                {"subTypes", subtype_names},
-                {"labels", subtype_labels}
+            const auto cmd_handler = [&registry, cmd_name](const json& args) -> json
+            {
+                auto command = registry.create(cmd_name);
+                if (!command)
+                    throw std::runtime_error("Tool not found: " + cmd_name);
+                std::string error;
+                if (!command->validate(args, error))
+                    throw std::invalid_argument("Validation failed: " + error);
+                if (!command->execute(args, error))
+                    throw std::runtime_error("Execution failed: " + error);
+                return command->getResult();
             };
 
-            if (!args.is_null() && !args.empty())
-            {
-                response["args"] = args;
-            }
+            if (meta.is_tool)
+                fastmcp::registerCmdAsTool(registry, *mcp_server, meta,
+                                           cmd_handler, registration_state);
 
-            result.structuredContent = toMcpJson(response);
-            result.content = McpJson::array();
-            result.content.push_back(makeTextContent(response.dump()));
-            result.isError = false;
-            return result;
-        };
-
-        return registerToolWithUI(server,
-            tool_name,
-            title,
-            description,
-            resource_uri,
-            input_schema,
-            ui_handler);
-    }
-
-    // ── argument parsing ──────────────────────────────────────────────────────
-    ServerConfig parseArguments(int argc, char** argv)
-    {
-        ServerConfig cfg;
-        for (int i = 1; i < argc; ++i)
-        {
-            std::string arg = argv[i];
-            if (StringUtils::beginsWith(arg, "--port="))
-            {
-                cfg.port = std::stoi(arg.substr(7));
-            }
-            else if (StringUtils::beginsWith(arg, "--plugins="))
-            {
-                std::stringstream ss(arg.substr(10));
-                std::string p;
-                while (std::getline(ss, p, ','))
-                    if (!p.empty()) cfg.plugin_paths.emplace_back(p);
-            }
-            else if (StringUtils::beginsWith(arg, "--protocol="))
-            {
-                std::string m = arg.substr(11);
-                if (m == "mcp")       cfg.protocol_mode = ProtocolMode::MCP_ONLY;
-                else if (m == "rest") cfg.protocol_mode = ProtocolMode::REST_ONLY;
-                else if (m == "all")  cfg.protocol_mode = ProtocolMode::ALL;
-                else { std::cerr << "Invalid protocol: " << m << '\n'; exit(1); }
-            }
-            else
-            {
-                std::cerr << "Unknown argument: " << arg << '\n'
-                    << "Usage: " << argv[0]
-                    << " [--port=PORT] [--plugins=P1,P2,...] [--protocol=mcp|rest|all]\n";
-                exit(1);
-            }
-        }
-        return cfg;
-    }
-
-    // ── plugin registry helpers ───────────────────────────────────────────────
-    using PluginInfo = std::map<std::string, cmdsdk::SubCmdTypeMetadata>;
-
-    std::string canonicalResourceName(const std::string& plugin_name)
-    {
-        const auto u = StringUtils::toUpperAscii(plugin_name);
-        if (u == "GEO")  return "geometry";
-        if (u == "MATH") return "math";
-        return StringUtils::toLowerAscii(plugin_name);
-    }
-
-    std::string resolvePluginName(const cmdsdk::CommandMetadata& m)
-    {
-        if (!m.plugin_name.empty()) return m.plugin_name;
-        if (!m.sub_cmd_types.empty())
-        {
-            const auto& f = m.sub_cmd_types.front().sub_type_name;
-            auto dot = f.find('.');
-            return (dot != std::string::npos) ? f.substr(0, dot) : f;
-        }
-        return m.cmd_name;
-    }
-
-    std::string openApiPathForCommand(const cmdsdk::CommandMetadata& m)
-    {
-        return "/api/" + m.cmd_name;
-    }
-
-    std::map<std::string, PluginInfo> buildPluginRegistry(const cmdsdk::CommandRegistry& reg)
-    {
-        std::map<std::string, PluginInfo> plugins;
-        for (const auto& meta : reg.listMetadata())
-            for (const auto& st : meta.sub_cmd_types)
-                plugins[resolvePluginName(meta)][st.sub_type_name] = st;
-        return plugins;
-    }
-
-    // ── OpenAPI helpers ───────────────────────────────────────────────────────
-    bool mergeMissingSubtypeEnumsIntoSpec(json& spec, const cmdsdk::CommandMetadata& meta)
-    {
-        if (!spec.is_object()) return false;
-        const auto path = openApiPathForCommand(meta);
-        try
-        {
-            auto& sub_type_schema =
-                spec["paths"][path]["post"]["requestBody"]["content"]
-                ["application/json"]["schema"]["properties"]["subType"];
-            if (!sub_type_schema.contains("enum") || !sub_type_schema["enum"].is_array())
-                sub_type_schema["enum"] = json::array();
-            std::set<std::string> known;
-            for (const auto& v : sub_type_schema["enum"])
-                if (v.is_string()) known.insert(v.get<std::string>());
-            bool changed = false;
-            for (const auto& st : meta.sub_cmd_types)
-                if (known.insert(st.sub_type_name).second)
-                {
-                    sub_type_schema["enum"].push_back(st.sub_type_name);
-                    changed = true;
-                }
-            return changed;
-        }
-        catch (...) { return false; }
-    }
-
-    // ── Plugin discovery ──────────────────────────────────────────────────────
-    std::vector<std::filesystem::path> getAllPluginsInLib(const char* argv0)
-    {
-        const auto exe = std::filesystem::absolute(argv0);
-        const auto exeDir = exe.parent_path();
-        const auto parent = exeDir.parent_path();
-
-        std::vector<std::filesystem::path> dirs = { exeDir };
-        if (!parent.empty())
-        {
-            dirs.push_back(parent);
-            dirs.push_back(parent / "lib");
-            const auto buildRoot = parent.parent_path();
-            if (!buildRoot.empty())
-            {
-                dirs.push_back(buildRoot / "lib");
-                dirs.push_back(buildRoot / "bin");
-                const auto cfg = exeDir.filename().string();
-                if (cfg == "Debug" || cfg == "Release" ||
-                    cfg == "RelWithDebInfo" || cfg == "MinSizeRel")
-                {
-                    dirs.push_back(buildRoot / "lib" / cfg);
-                    dirs.push_back(buildRoot / "bin" / cfg);
-                }
-            }
+            if (meta.is_app_tool)
+                fastmcp::registerAppToolWithUI(registry, *mcp_server, meta,
+                                               registration_state);
         }
 
-        auto isPlugin = [](const std::filesystem::path& p) -> bool
-            {
-                if (!p.has_filename()) return false;
-                const auto fn = p.filename().string();
-#if defined(_WIN32)
-                return p.extension() == ".dll";
-#elif defined(__APPLE__)
-                return StringUtils::beginsWith(fn, "lib") && p.extension() == ".dylib";
-#else
-                return StringUtils::beginsWith(fn, "lib") && p.extension() == ".so";
-#endif
-            };
-
-        std::set<std::string> seen;
-        std::vector<std::filesystem::path> plugins;
-
-        for (const auto& dir : dirs)
+        // ── Register resources ─────────────────────────────────────────────
+        for (const auto& resource : resources)
         {
-            if (!std::filesystem::exists(dir) || !std::filesystem::is_directory(dir)) continue;
-            std::vector<std::filesystem::path> entries;
-            for (const auto& e : std::filesystem::directory_iterator(dir))
-            {
-                if (!e.is_regular_file() || !isPlugin(e.path())) continue;
-                const auto fn = e.path().filename().string();
-                if (kNonPluginLibs.count(fn))
+            mcp::server::ResourceDefinition definition;
+            definition.uri         = resource.uri;
+            definition.name        = resource.name;
+            definition.description = resource.description;
+            definition.mimeType    = resource.mime_type;
+
+            if (mcp_debug)
+                fastmcp::logDiag("MCP-REGISTER", "Registering resource " + resource.uri);
+
+            mcp_server->registerResource(
+                std::move(definition),
+                [resource, mcp_debug](const mcp::server::ResourceReadContext& ctx)
+                    -> std::vector<mcp::server::ResourceContent>
                 {
-                    std::cout << "Skipping SDK lib: " << fn << '\n';
-                    continue;
-                }
-                entries.push_back(std::filesystem::absolute(e.path()));
-            }
-            std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b)
-                {
-                    const auto an = a.filename().string(), bn = b.filename().string();
-                    return an != bn ? an < bn : a.string() < b.string();
+                    if (mcp_debug)
+                        fastmcp::logRequestContext("MCP-RESOURCE-READ", ctx.requestContext,
+                            "uri=" + resource.uri);
+                    std::string content = resource.body_provider();
+                    auto item = mcp::server::ResourceContent::text(
+                        resource.uri, content,
+                        resource.mime_type + ";profile=mcp-app");
+                    return { item };
                 });
-            for (const auto& p : entries)
-            {
-                std::string fn = p.filename().string();
-#if defined(_WIN32)
-                fn = StringUtils::toUpperAscii(fn);
-#endif
-                if (!seen.insert(fn).second)
-                {
-                    std::cout << "Skipping duplicate: " << p.filename().string() << '\n';
-                    continue;
-                }
-                plugins.push_back(p);
-            }
         }
-        return plugins;
+
+        return mcp_server;
     }
-
-    // ── mcp-apps reverse-proxy helpers ────────────────────────────────────────
-    constexpr const char* kMcpAppsHost = "localhost";
-    constexpr int         kMcpAppsPort = 6543;
-
-    std::string contentTypeFromResponse(const httplib::Result& r, const std::string& fb)
+    catch (...)
     {
-        if (!r || !r->has_header("Content-Type")) return fb;
-        std::string v = r->get_header_value("Content-Type");
-        const auto sep = v.find(';');
-        return (sep != std::string::npos) ? v.substr(0, sep) : (v.empty() ? fb : v);
+        fastmcp::logDiag("MCP-CONNECT",
+            "Failed to construct MCP server instance #" + std::to_string(server_instance_id) +
+            ": " + currentExceptionMessage());
+        throw;
     }
+}
 
-    struct ExternalResourceInfo
-    {
-        std::string uri, name, description, mime_type;
-        json meta;
-    };
-
-    std::vector<ExternalResourceInfo> fetchExternalAppResources()
-    {
-        std::vector<ExternalResourceInfo> res;
-        httplib::Client cl(kMcpAppsHost, kMcpAppsPort);
-        cl.set_connection_timeout(2, 0);
-        cl.set_read_timeout(2, 0);
-        const auto r = cl.Get("/resource-manifest.json");
-        if (!r || r->status != 200) return res;
-        try
-        {
-            const auto manifest = json::parse(r->body);
-            if (!manifest.is_object() || !manifest.contains("resources")) return res;
-            for (const auto& e : manifest["resources"])
-            {
-                if (!e.is_object() || !e.contains("uri")) continue;
-                const std::string ruri = e["uri"].get<std::string>();
-                std::string app_path;
-                if (!StringUtils::uriToMcpAppsPath(ruri, app_path)) continue;
-                ExternalResourceInfo info;
-                info.uri = StringUtils::toMcpAppUri(ruri);
-                info.name = e.value("name", "App Resource: " + app_path);
-                info.description = e.value("description", "Resource from local mcp-apps");
-                info.mime_type = e.value("mimeType", "application/json");
-                if (e.contains("_meta") && e["_meta"].is_object()) info.meta = e["_meta"];
-                res.push_back(std::move(info));
-            }
-        }
-        catch (...) {}
-        return res;
-    }
-    bool readMcpAppResource(const std::string& uri,
-        std::string& canonical_uri,
-        std::string& mime_type,
-        std::string& content,
-        std::string& error)
-    {
-        const bool mcp_debug = gMcpDebug.load();
-        std::string path;
-        if (!StringUtils::uriToMcpAppsPath(uri, path))
-        {
-            if (mcp_debug)
-            {
-                logDiag("MCP-APP-READ", "Rejected URI mapping for " + uri);
-            }
-            error = "Invalid URI scheme mapping";
-            return false;
-        }
-
-        // Ensure path starts with / for httplib
-        if (path.empty() || path[0] != '/')
-        {
-            path = "/" + path;
-        }
-
-        httplib::Client cl(kMcpAppsHost, kMcpAppsPort);
-        cl.set_connection_timeout(1, 0); // 1s is plenty for localhost
-        cl.set_read_timeout(2, 0);
-
-        if (mcp_debug)
-        {
-            logDiag("MCP-APP-READ", "Fetching " + uri + " via " + path);
-        }
-
-        const auto r = cl.Get(path.c_str());
-
-        if (!r)
-        {
-            if (mcp_debug)
-            {
-                logDiag("MCP-APP-READ", "Connection failed for " + uri);
-            }
-            error = "mcp-apps connection failed at " + std::string(kMcpAppsHost);
-            return false;
-        }
-
-        if (r->status != 200)
-        {
-            if (mcp_debug)
-            {
-                logDiag("MCP-APP-READ", "Non-200 for " + uri + ": " + std::to_string(r->status));
-            }
-            error = "mcp-apps error: " + std::to_string(r->status);
-            return false;
-        }
-
-        // Echo back the caller URI; resource handlers currently publish their registered URI.
-        canonical_uri = uri;
-
-        // Force HTML if we are proxying a Dashboard UI
-        mime_type = contentTypeFromResponse(r, "text/html");
-        content = r->body;
-
-        if (mcp_debug)
-        {
-            logDiag("MCP-APP-READ", "Success for " + uri + " mime=" + mime_type);
-        }
-
-        return true;
-    }
-
-    const PluginInfo* findPluginInfo(const std::map<std::string, PluginInfo>& plugins,
-        const std::string& requested, std::string& resolved)
-    {
-        if (const auto it = plugins.find(requested); it != plugins.end())
-        {
-            resolved = it->first; return &it->second;
-        }
-        const auto ru = StringUtils::toUpperAscii(requested);
-        for (const auto& [pn, pi] : plugins)
-            if (StringUtils::toUpperAscii(pn) == ru) { resolved = pn; return &pi; }
-        const auto rl = StringUtils::toLowerAscii(requested);
-        for (const auto& [pn, pi] : plugins)
-        {
-            const auto pu = StringUtils::toUpperAscii(pn);
-            if (((rl == "geo" || rl == "geometry") && pu == "GEO") ||
-                (rl == "math" && pu == "MATH") ||
-                canonicalResourceName(pn) == rl)
-            {
-                resolved = pn; return &pi;
-            }
-        }
-        return nullptr;
-    }
-
-    // ── CORS helper ───────────────────────────────────────────────────────────
-    void addCorsHeaders(httplib::Response& res)
-    {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-        res.set_header("Access-Control-Allow-Headers", "Content-Type, MCP-Session-Id, MCP-Protocol-Version");
-    }
-
-    // ── Homepage ──────────────────────────────────────────────────────────────
-    std::string defaultHtmlPage(int mcp_port, int rest_port)
-    {
-        std::string result;
-        result.reserve(
-            fastmcp::html_templates::default_html_page_end.size() +
-            fastmcp::html_templates::default_html_page_prefix.size() +
-            fastmcp::html_templates::default_html_page_middle.size() +
-            fastmcp::html_templates::default_html_page_suffix.size() +
-            fastmcp::html_templates::default_html_page_end.size() +
-            fastmcp::html_templates::default_html_page_tail.size() +
-            32);
-
-        auto appendPort = [&result](int port)
-        {
-            char buffer[16];
-            const auto [ptr, ec] = std::to_chars(buffer, buffer + sizeof(buffer), port);
-            if (ec == std::errc())
-            {
-                result.append(buffer, ptr - buffer);
-            }
-        };
-
-        result.append(fastmcp::html_templates::default_html_page_prefix);
-        appendPort(mcp_port);
-        result.append(fastmcp::html_templates::default_html_page_middle);
-        appendPort(rest_port);
-        result.append(fastmcp::html_templates::default_html_page_suffix);
-        appendPort(mcp_port);
-        result.append(fastmcp::html_templates::default_html_page_end);
-        appendPort(rest_port);
-        result.append(fastmcp::html_templates::default_html_page_tail);
-
-        return result;
-    }
-
-    // move to FastMcpStringUtils.hpp
-
-    struct RuntimeResource
-    {
-        std::string uri;
-        std::string name;
-        std::string description;
-        std::string mime_type;
-        std::function<std::string()> body_provider;
-    };
-
-    bool addRuntimeResource(std::vector<RuntimeResource>& resources,
-        std::set<std::string>& seen_resource_uris,
-        RuntimeResource resource,
-        bool mcp_debug)
-    {
-        if (!seen_resource_uris.insert(resource.uri).second)
-        {
-            if (mcp_debug)
-            {
-                logDiag("MCP-RESOURCE", "Skipping duplicate resource URI " + resource.uri);
-            }
-            return false;
-        }
-
-        resources.push_back(std::move(resource));
-        return true;
-    }
-
-} // namespace
+} // anonymous namespace
 
 // ===========================================================================
 // main
@@ -909,17 +301,17 @@ int main(int argc, char** argv)
 {
     ServerConfig config = parseArguments(argc, argv);
     gMcpDebug.store(envFlagEnabled("FASTMCP_MCP_DEBUG", false));
-    const bool mcp_debug = gMcpDebug.load();
+    const bool mcp_debug          = gMcpDebug.load();
     const bool require_session_id = envFlagEnabled("FASTMCP_REQUIRE_SESSION_ID", true);
 
     if (config.plugin_paths.empty())
-        config.plugin_paths = getAllPluginsInLib(argv[0]);
+        config.plugin_paths = fastmcp::getAllPluginsInLib(argv[0]);
 
-    // ── Load plugins ──────────────────────────────────────────────────────
-    cmdsdk::CommandRegistry registry;
-    PluginLoader loader;
-    cmdsdk::OpenApiAggregator api_aggregator;
-    bool loaded_at_least_one = false;
+    // ── Load plugins ───────────────────────────────────────────────────────
+    cmdsdk::CommandRegistry    registry;
+    PluginLoader               loader;
+    cmdsdk::OpenApiAggregator  api_aggregator;
+    bool                       loaded_at_least_one = false;
 
     for (const auto& path : config.plugin_paths)
     {
@@ -935,64 +327,16 @@ int main(int argc, char** argv)
         }
     }
 
-    // ── Build OpenAPI aggregator ──────────────────────────────────────────
-    std::map<std::string, bool> processed_plugins;
-    const auto& pm_registry = cmdsdk::PluginMetadataRegistry::instance();
-
-    if (!registry.listMetadata().empty())
-    {
-        std::cout << "\nRegistered commands:\n";
-        for (const auto& meta : registry.listMetadata())
-        {
-            const auto pname = resolvePluginName(meta);
-            const bool has_custom = pm_registry.hasCustomOpenApi(pname);
-            const auto cmd_path = openApiPathForCommand(meta);
-
-            if (!processed_plugins[pname])
-            {
-                processed_plugins[pname] = true;
-                if (has_custom)
-                {
-                    api_aggregator.addPluginSpec(pname,
-                        pm_registry.getCustomOpenApi(pname),
-                        "registered-metadata");
-                    std::cout << "    [OpenAPI] Custom spec loaded\n";
-                }
-            }
-
-            if (has_custom)
-            {
-                auto pspec = api_aggregator.getPluginSpec(pname);
-                if (!pspec.contains("paths") || !pspec["paths"].contains(cmd_path))
-                {
-                    api_aggregator.addAutoGeneratedSpec(meta, pname);
-                }
-                else if (mergeMissingSubtypeEnumsIntoSpec(pspec, meta))
-                {
-                    api_aggregator.addPluginSpec(pname, pspec, "registered-metadata+provider");
-                }
-            }
-            else
-            {
-                api_aggregator.addAutoGeneratedSpec(meta, pname);
-            }
-
-            std::cout << "  - [" << pname << "] " << meta.cmd_name
-                << ": " << meta.description << '\n';
-            for (const auto& st : meta.sub_cmd_types)
-                std::cout << "      - " << st.sub_type_name << ": " << st.description << '\n';
-        }
-    }
+    fastmcp::buildOpenApiAggregator(registry, api_aggregator);
 
     if (!loaded_at_least_one)
         std::cerr << "Warning: no plugins loaded.\n";
 
-    auto plugins = buildPluginRegistry(registry);
-
-    // ── Build MCP resources (apps) ─────────────────────────────
+    // ── Build MCP resources (external mcp-apps) ───────────────────────────
     std::vector<RuntimeResource> resources;
-    std::set<std::string> seen_resource_uris;
-    for (const auto& ext : fetchExternalAppResources())
+    std::set<std::string>        seen_resource_uris;
+
+    for (const auto& ext : fastmcp::fetchExternalAppResources())
     {
         addRuntimeResource(resources, seen_resource_uris, RuntimeResource{
             ext.uri,
@@ -1002,378 +346,102 @@ int main(int argc, char** argv)
             [uri = ext.uri]()
             {
                 std::string canon, mime, body, err;
-                if (readMcpAppResource(uri, canon, mime, body, err))
+                if (fastmcp::readMcpAppResource(uri, canon, mime, body, err))
                     return body;
                 return std::string("Error: " + err);
             }
-            }, mcp_debug);
+        }, mcp_debug);
     }
 
-    auto createConfiguredMcpServer = [&registry, &resources, mcp_debug]()
-        {
-            const auto server_instance_id = ++gMcpServerInstanceCounter;
-            if (mcp_debug)
-            {
-                logDiag("MCP-CONNECT",
-                    "Creating MCP server instance #" + std::to_string(server_instance_id) +
-                    " (new initialize attempt/session)");
-            }
-
-            try
-            {
-                const mcp::ErrorReporter sdk_error_reporter = [mcp_debug](const mcp::ErrorEvent& event)
-                    {
-                        if (!mcp_debug) return;
-                        logDiag("MCP-SDK-ERROR",
-                            std::string(event.component()) + ": " + std::string(event.message()));
-                    };
-
-                mcp::lifecycle::session::ToolsCapability tools_capability;
-                tools_capability.listChanged = true;
-
-                mcp::lifecycle::session::ResourcesCapability resources_capability;
-                resources_capability.listChanged = true;
-
-                mcp::server::ServerConfiguration server_config;
-                server_config.sessionOptions.errorReporter = sdk_error_reporter;
-                server_config.capabilities = mcp::lifecycle::session::ServerCapabilities(
-                    std::nullopt,
-                    std::nullopt,
-                    std::nullopt,
-                    resources_capability,
-                    tools_capability,
-                    std::nullopt,
-                    std::nullopt);
-                server_config.serverInfo = mcp::lifecycle::session::Implementation("fastmcp_server", "0.3.0");
-                server_config.instructions = "Use tools for command execution and resources for plugin/app metadata. UI-enabled commands can expose app tools via CommandMetadata.is_app_tool and resource_uri.";
-
-                auto mcp_server = mcp::server::Server::create(std::move(server_config));
-
-                ToolRegistrationState registration_state;
-
-                for (const auto& meta : registry.listMetadata())
-                {
-                    const auto cmd_name = meta.cmd_name;
-                    // command handler extracted into a lambda to capture cmd_name and registry by reference
-                    const auto cmd_handler = [&registry, cmd_name](const json& args) -> json
-                        {
-                            auto command = registry.create(cmd_name);
-                            if (!command)
-                                throw std::runtime_error("Tool not found: " + cmd_name);
-
-                            std::string error;
-                            if (!command->validate(args, error))
-                                throw std::invalid_argument("Validation failed: " + error);
-                            if (!command->execute(args, error))
-                                throw std::runtime_error("Execution failed: " + error);
-
-                            return command->getResult();
-                        };
-
-                    if (meta.is_tool)
-                    {
-                        registerCmdAsTool(
-                            registry,
-                            *mcp_server,
-                            meta,
-                            cmd_handler,
-                            registration_state);
-                    }
-
-                    if (meta.is_app_tool)
-                    {
-                        registerAppToolWithUI(
-                            registry,
-                            *mcp_server,
-                            meta,
-                            registration_state);
-                    }
-                }
-
-                // ─── Register remaining resources (non-app UI resources) ───────
-                for (const auto& resource : resources)
-                {
-                    // Skip ui://ui/math-form and ui://ui/geo-form as they're already registered
-                    // if (resource.uri == "ui://ui/math-form" || resource.uri == "ui://ui/geo-form")
-                    //     continue;
-
-                    mcp::server::ResourceDefinition definition;
-                    definition.uri = resource.uri;
-                    definition.name = resource.name;
-                    definition.description = resource.description;
-                    definition.mimeType = resource.mime_type;
-
-                    if (mcp_debug)
-                    {
-                        logDiag("MCP-REGISTER", "Registering resource " + resource.uri);
-                    }
-
-                    mcp_server->registerResource(
-                        std::move(definition),
-                        [resource, mcp_debug](const mcp::server::ResourceReadContext& ctx) -> std::vector<mcp::server::ResourceContent>
-                        {
-                            if (mcp_debug)
-                            {
-                                logRequestContext("MCP-RESOURCE-READ", ctx.requestContext, "uri=" + resource.uri);
-                            }
-                            std::string content = resource.body_provider();
-
-                            auto item = mcp::server::ResourceContent::text(
-                                resource.uri,
-                                content,
-                                resource.mime_type + ";profile=mcp-app"
-                            );
-                            return { item };
-                        });
-                }
-
-                return mcp_server;
-            }
-            catch (...)
-            {
-                logDiag("MCP-CONNECT",
-                    "Failed to construct MCP server instance #" + std::to_string(server_instance_id) +
-                    ": " + currentExceptionMessage());
-                throw;
-            }
-        };
-
-    // =========================================================================
-    // Auxiliary httplib REST server (non-MCP routes)
-    //
-    // cpp-mcp owns port N (MCP).  We run httplib on port N+1 for REST/Swagger.
-    // If you want everything on one port you need a cpp-mcp version that
-    // exposes get_server() — check your checkout for that accessor.
-    // =========================================================================
+    // ── Auxiliary REST server ─────────────────────────────────────────────
     const int rest_port = config.port + 1;
     httplib::Server rest_server;
 
-    // GET /
-    rest_server.Get("/", [&](const httplib::Request&, httplib::Response& res)
-        {
-            addCorsHeaders(res);
-            res.set_header("Cache-Control", "no-store");
-            res.set_content(defaultHtmlPage(config.port, rest_port), "text/html");
-        });
+    fastmcp::registerRestRoutes(rest_server, registry, api_aggregator,
+                                config.port, rest_port,
+                                config.protocol_mode == ProtocolMode::MCP_ONLY);
 
-    // GET /swagger
-    rest_server.Get("/swagger", [&](const httplib::Request&, httplib::Response& res)
-        {
-            addCorsHeaders(res);
-            res.set_content(std::string(cmdsdk::swagger_resources::swagger_html), "text/html");
-        });
-
-    // GET /openapi.json
-    rest_server.Get("/openapi.json", [&](const httplib::Request&, httplib::Response& res)
-        {
-            addCorsHeaders(res);
-            res.set_content(
-                api_aggregator.buildCombinedSpec("FastMCP API", "0.1.0").dump(2),
-                "application/json");
-        });
-
-    // GET /openapi.yaml
-    rest_server.Get("/openapi.yaml", [&](const httplib::Request&, httplib::Response& res)
-        {
-            addCorsHeaders(res);
-            res.set_content(
-                api_aggregator.buildCombinedSpec("FastMCP API", "0.1.0").dump(2),
-                "application/yaml");
-        });
-
-    // GET /openapi/:plugin
-    rest_server.Get("/openapi/:plugin", [&](const httplib::Request& req,
-        httplib::Response& res)
-        {
-            addCorsHeaders(res);
-            std::string pname = req.path_params.at("plugin");
-            if (StringUtils::endsWith(pname, ".json"))       pname = pname.substr(0, pname.size() - 5);
-            else if (StringUtils::endsWith(pname, ".yaml") || StringUtils::endsWith(pname, ".yml"))
-                pname = pname.substr(0, pname.rfind('.'));
-
-            const auto spec = api_aggregator.getPluginSpec(pname);
-            if (spec.is_object() && !spec.empty())
-            {
-                res.set_content(spec.dump(2), "application/json");
-            }
-            else
-            {
-                res.status = 404;
-                res.set_content(
-                    json({ {"error", "Plugin spec not found: " + pname} }).dump(),
-                    "application/json");
-            }
-        });
-
-    // POST /api/:command — REST command execution
-    if (config.protocol_mode != ProtocolMode::MCP_ONLY)
-    {
-        rest_server.Post("/api/:command", [&](const httplib::Request& req,
-            httplib::Response& res)
-            {
-                addCorsHeaders(res);
-                const auto cmd_name = req.path_params.at("command");
-                std::cout << "[REST POST] /api/" << cmd_name << " body=" << req.body << '\n';
-                json body;
-                try { body = json::parse(req.body); }
-                catch (const std::exception& e)
-                {
-                    res.status = 400;
-                    res.set_content(
-                        cmdsdk::RestApiHandler::buildResponse(
-                            false, "Invalid JSON: " + std::string(e.what())).dump(),
-                        "application/json");
-                    return;
-                }
-                if (!body.is_object())
-                {
-                    res.status = 400;
-                    res.set_content(
-                        cmdsdk::RestApiHandler::buildResponse(false, "Body must be a JSON object").dump(),
-                        "application/json");
-                    return;
-                }
-                std::string err;
-                const auto result = cmdsdk::RestApiHandler::executeCommand(
-                    cmd_name, body, registry, err);
-                if (!result["success"].get<bool>()) res.status = 400;
-                res.set_content(result.dump(), "application/json");
-            });
-    }
-
-    // GET /mcp-apps  &  /mcp-apps/:path — reverse-proxy
-    auto proxy_mcp_app = [](const std::string& path, httplib::Response& res)
-        {
-            httplib::Client cl(kMcpAppsHost, kMcpAppsPort);
-            cl.set_connection_timeout(2, 0);
-            cl.set_read_timeout(5, 0);
-            const auto r = cl.Get(path.c_str());
-            if (!r)
-            {
-                res.status = 502;
-                res.set_content(
-                    json({ {"error", "mcp-apps unreachable"} }).dump(), "application/json");
-                return;
-            }
-            res.status = r->status;
-            res.set_content(r->body, contentTypeFromResponse(r, "text/plain"));
-        };
-
-    rest_server.Get("/mcp-apps", [&](const httplib::Request&, httplib::Response& res)
-        {
-            addCorsHeaders(res);
-            std::cout << "[REST GET] /mcp-apps (proxy -> :6543/)\n";
-            proxy_mcp_app("/", res);
-        });
-    rest_server.Get(R"(/mcp-apps/(.+))", [&](const httplib::Request& req,
-        httplib::Response& res)
-        {
-            addCorsHeaders(res);
-            const auto app_path = "/" + req.matches[1].str();
-            std::cout << "[REST GET] /mcp-apps" << app_path << " (proxy -> :6543" << app_path << ")\n";
-            proxy_mcp_app(app_path, res);
-        });
-
-    // CORS preflight
-    rest_server.Options(".*", [](const httplib::Request&, httplib::Response& res)
-        {
-            res.set_header("Access-Control-Allow-Origin", "*");
-            res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            res.set_header("Access-Control-Allow-Headers", "Content-Type");
-            res.status = 200;
-        });
-
-    // =========================================================================
-    // Banner
-    // =========================================================================
+    // ── Banner ─────────────────────────────────────────────────────────────
     std::cout << "\n========================================\n"
-        << "FastMCP Server  (cpp-mcp-sdk by itcv-GmbH)\n"
-        << "========================================\n"
-        << "Protocol mode : " << StringUtils::protocolModeToString(config.protocol_mode) << "\n\n"
-        << "MCP  (cpp-mcp-sdk)  → http://0.0.0.0:" << config.port << "/mcp\n"
-        << "REST (httplib)  → http://0.0.0.0:" << rest_port << "/\n\n"
-        << "REST routes:\n"
-        << "  GET  /              — Homepage\n"
-        << "  GET  /swagger       — Swagger UI\n"
-        << "  GET  /openapi.json  — Combined OpenAPI\n"
-        << "  GET  /openapi.yaml  — YAML OpenAPI\n"
-        << "  GET  /openapi/{p}   — Per-plugin spec\n"
-        << "  GET  /mcp-apps/*    — Proxy to :6543\n";
+              << "FastMCP Server  (cpp-mcp-sdk by itcv-GmbH)\n"
+              << "========================================\n"
+              << "Protocol mode : "
+              << StringUtils::protocolModeToString(config.protocol_mode) << "\n\n"
+              << "MCP  (cpp-mcp-sdk)  → http://0.0.0.0:" << config.port << "/mcp\n"
+              << "REST (httplib)  → http://0.0.0.0:" << rest_port << "/\n\n"
+              << "REST routes:\n"
+              << "  GET  /              — Homepage\n"
+              << "  GET  /swagger       — Swagger UI\n"
+              << "  GET  /openapi.json  — Combined OpenAPI\n"
+              << "  GET  /openapi.yaml  — YAML OpenAPI\n"
+              << "  GET  /openapi/{p}   — Per-plugin spec\n"
+              << "  GET  /mcp-apps/*    — Proxy to :6543\n";
     if (config.protocol_mode != ProtocolMode::MCP_ONLY)
         std::cout << "  POST /api/{cmd}     — REST execution\n";
     std::cout << "========================================\n\n";
 
-    // =========================================================================
-    // Start servers
-    // =========================================================================
-
-    std::signal(SIGINT, handleSignal);
+    // ── Start servers ──────────────────────────────────────────────────────
+    std::signal(SIGINT,  handleSignal);
     std::signal(SIGTERM, handleSignal);
 
     std::unique_ptr<mcp::server::StreamableHttpServerRunner> mcp_runner;
     if (config.protocol_mode != ProtocolMode::REST_ONLY)
     {
-        const mcp::server::ServerFactory server_factory = [createConfiguredMcpServer]()
-            {
-                return createConfiguredMcpServer();
-            };
+        const mcp::server::ServerFactory server_factory =
+            [&registry, &resources]()
+        {
+            return createConfiguredMcpServer(registry, resources);
+        };
 
         mcp::server::StreamableHttpServerRunnerOptions mcp_options;
-        mcp_options.transportOptions.http.errorReporter = [mcp_debug](const mcp::ErrorEvent& event)
-            {
-                if (!mcp_debug) return;
-                logDiag("MCP-HTTP-ERROR",
-                    std::string(event.component()) + ": " + std::string(event.message()));
-            };
-        mcp_options.transportOptions.http.endpoint.bindAddress = "0.0.0.0";
+        mcp_options.transportOptions.http.errorReporter =
+            [mcp_debug](const mcp::ErrorEvent& event)
+        {
+            if (!mcp_debug) return;
+            fastmcp::logDiag("MCP-HTTP-ERROR",
+                std::string(event.component()) + ": " + std::string(event.message()));
+        };
+        mcp_options.transportOptions.http.endpoint.bindAddress       = "0.0.0.0";
         mcp_options.transportOptions.http.endpoint.bindLocalhostOnly = false;
-        mcp_options.transportOptions.http.endpoint.port = static_cast<std::uint16_t>(config.port);
-        mcp_options.transportOptions.http.endpoint.path = "/mcp";
-        mcp_options.transportOptions.http.requireSessionId = require_session_id;
+        mcp_options.transportOptions.http.endpoint.port =
+            static_cast<std::uint16_t>(config.port);
+        mcp_options.transportOptions.http.endpoint.path              = "/mcp";
+        mcp_options.transportOptions.http.requireSessionId           = require_session_id;
 
         if (mcp_debug)
         {
             if (require_session_id)
-            {
-                logDiag("MCP-CONNECT",
+                fastmcp::logDiag("MCP-CONNECT",
                     "Streamable HTTP policy requireSessionId=true (strict multi-session mode). "
                     "Clients must NOT send MCP-Session-Id on initialize; "
                     "server mints MCP-Session-Id on successful initialize response.");
-            }
             else
-            {
-                logDiag("MCP-CONNECT",
+                fastmcp::logDiag("MCP-CONNECT",
                     "Streamable HTTP policy requireSessionId=false (compat mode). "
                     "All HTTP clients share one MCP session; this improves compatibility "
                     "with proxies that do not replay MCP-Session-Id consistently.");
-            }
         }
 
-        mcp_runner = std::make_unique<mcp::server::StreamableHttpServerRunner>(server_factory, mcp_options);
+        mcp_runner = std::make_unique<mcp::server::StreamableHttpServerRunner>(
+            server_factory, mcp_options);
         mcp_runner->start();
         std::cout << "MCP  server listening on http://0.0.0.0:" << config.port << "\n";
     }
 
-    // REST on a background thread (detached — lives for the process lifetime)
     if (config.protocol_mode != ProtocolMode::MCP_ONLY)
     {
         std::thread([&rest_server, rest_port]()
-            {
-                std::cout << "REST server listening on http://0.0.0.0:" << rest_port << '\n';
-                if (!rest_server.listen("0.0.0.0", rest_port))
-                    std::cerr << "ERROR: failed to bind REST server on port " << rest_port << '\n';
-            }).detach();
+        {
+            std::cout << "REST server listening on http://0.0.0.0:" << rest_port << '\n';
+            if (!rest_server.listen("0.0.0.0", rest_port))
+                std::cerr << "ERROR: failed to bind REST server on port " << rest_port << '\n';
+        }).detach();
     }
 
     while (!gStopRequested.load())
-    {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
 
-    if (mcp_runner)
-    {
-        mcp_runner->stop();
-    }
+    if (mcp_runner) mcp_runner->stop();
     rest_server.stop();
 
     return 0;
