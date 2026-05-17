@@ -1239,37 +1239,15 @@ int main(int argc, char** argv)
                     geo_tool_name = it->second.front();
                 }
 
-                // Build geo form schema from registered geo command metadata when possible.
-                json geo_form_schema = json::object();
-                const cmdsdk::CommandMetadata* geo_meta = nullptr;
-                for (const auto& meta : registry.listMetadata())
-                {
-                    const auto plugin_name = resolvePluginName(meta);
-                    const bool is_geo_command =
-                        (meta.cmd_name == "geo.calculate") ||
-                        (StringUtils::toUpperAscii(plugin_name) == "GEO");
-                    if (is_geo_command)
-                    {
-                        geo_meta = &meta;
-                        break;
-                    }
-                }
-
-                if (geo_meta)
-                {
-                    geo_form_schema = buildInputSchema(*geo_meta, std::nullopt);
-                }
-                else
-                {
-                    // Fallback: expose only subType enum so UI can at least select an operation
-                    geo_form_schema = {
-                        {"type", "object"},
-                        {"properties", json{
-                            {"subType", json{{"type", "string"}, {"enum", geo_subtypes}, {"description", "operator option for geometry"}}}
-                        }},
-                        {"required", json::array({"subType"})}
-                    };
-                }
+                json geo_form_schema = {
+                    {"type", "object"},
+                    {"properties", json{
+                        {"left", json{{"type", "number"}, {"description", "first number in operation"}}},
+                        {"right", json{{"type", "number"}, {"description", "second number in operation"}}},
+                        {"subType", json{{"type", "string"}, {"enum", geo_subtypes}, {"description", "operator option for geometry"}}}
+                    }},
+                    {"required", json::array({"left", "right", "subType"})}
+                };
 
                 // Define the handler for the geo form tool
                 auto geo_form_handler = [geo_subtypes, geo_labels, geo_tool_name](const json& args) -> mcp::server::CallToolResult
