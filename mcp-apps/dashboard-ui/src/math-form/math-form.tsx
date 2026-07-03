@@ -63,7 +63,7 @@ function isMathFormConfig(value: unknown): value is MathFormConfig {
 }
 
 // ─── Component ───────────────────────────────────────────────────────────────
-function MathFormWidget() {
+export function MathFormWidget() {
   const [appInstance] = useState(
     () => new App({ name: 'Math Calculator', version: '1.0.0' }),
   );
@@ -389,4 +389,9 @@ function MathFormWidget() {
   );
 }
 
-createRoot(document.getElementById('root')!).render(<MathFormWidget />);
+if (typeof document !== 'undefined') {
+  const mountNode = document.getElementById('root');
+  if (mountNode) {
+    createRoot(mountNode).render(<MathFormWidget />);
+  }
+}

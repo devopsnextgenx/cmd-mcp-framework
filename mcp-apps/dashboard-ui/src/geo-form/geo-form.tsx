@@ -257,7 +257,7 @@ function isGeoFormConfig(value: unknown): value is GeoFormConfig {
 
 // ─── Component ──────────────────────────────────────────────────────────────
 
-function GeoFormWidget() {
+export function GeoFormWidget() {
 
   const [appInstance] = useState(
     () => new App({
@@ -968,6 +968,9 @@ function GeoFormWidget() {
   );
 }
 
-createRoot(
-  document.getElementById('root')!,
-).render(<GeoFormWidget />);
+if (typeof document !== 'undefined') {
+  const mountNode = document.getElementById('root');
+  if (mountNode) {
+    createRoot(mountNode).render(<GeoFormWidget />);
+  }
+}
