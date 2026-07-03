@@ -331,13 +331,11 @@ namespace fastmcp
                             const cmdsdk::CommandMetadata& cmd_meta,
                             ToolRegistrationState& registration_state)
     {
+        const bool mcp_debug = gMcpDebug.load();
         const std::string original_cmd_name = cmd_meta.cmd_name;
         const std::string tool_base_name =
             "open-" + StringUtils::sanitizeToolName(original_cmd_name) + "-form";
         const std::string tool_name  = allocateUniqueToolName(tool_base_name, registration_state);
-        const std::string resource_uri = cmd_meta.resource_uri.empty()
-            ? "ui://ui/" + StringUtils::sanitizeToolName(original_cmd_name) + "-form.html"
-            : cmd_meta.resource_uri;
         const std::string title       = "Open " + original_cmd_name + " Form";
         const std::string description = "Open a UI form for " + original_cmd_name + ".";
         const json        input_schema = buildInputSchema(cmd_meta, std::nullopt);
@@ -350,12 +348,22 @@ namespace fastmcp
             subtype_labels[st.sub_type_name] = st.description;
         }
 
+        const std::string resolved_resource_uri = cmd_meta.resource_uri.empty()
+            ? "ui://ui/" + StringUtils::sanitizeToolName(original_cmd_name) + "-form.html"
+            : cmd_meta.resource_uri;
         const std::string command_tool_name =
             (!registration_state.command_tool_names[original_cmd_name].empty())
                 ? registration_state.command_tool_names[original_cmd_name].front()
                 : std::string();
 
-        auto ui_handler = [resource_uri, command_tool_name, original_cmd_name,
+        if (mcp_debug)
+            logDiagLocal("MCP-REGISTER",
+                "App tool registration for " + original_cmd_name +
+                ": tool=" + tool_name +
+                ", resourceUri=" + resolved_resource_uri +
+                ", metadata.resource_uri=" + (cmd_meta.resource_uri.empty() ? "<none>" : cmd_meta.resource_uri));
+
+        auto ui_handler = [resolved_resource_uri, command_tool_name, original_cmd_name,
                         subtype_names, subtype_labels](const json& args)
             -> mcp::server::CallToolResult
         {
@@ -364,7 +372,7 @@ namespace fastmcp
                 {"status",       "success"},
                 {"availability", original_cmd_name + " form available"},
                 {"message",      "UI form available"},
-                {"resourceUri",  resource_uri},
+                {"resourceUri",  resolved_resource_uri},
                 {"toolName",     command_tool_name},
                 {"commandName",  original_cmd_name},
                 {"subTypes",     subtype_names},
@@ -381,7 +389,7 @@ namespace fastmcp
         };
 
         return registerToolWithUI(server, tool_name, title, description,
-                                resource_uri, input_schema, ui_handler);
+                                resolved_resource_uri, input_schema, ui_handler);
     }
 
     // ==========================================================================
@@ -644,8 +652,10 @@ namespace fastmcp
         {
             if (mcp_debug)
                 logDiagLocal("MCP-APP-READ",
-                    "Non-200 for " + uri + ": " + std::to_string(r->status));
-            error = "mcp-apps error: " + std::to_string(r->status);
+                    "Resource not found for " + uri + ": HTTP " + std::to_string(r->status));
+            error = (r->status == 404)
+                ? "Resource not found: " + uri
+                : "mcp-apps error: " + std::to_string(r->status);
             return false;
         }
 
