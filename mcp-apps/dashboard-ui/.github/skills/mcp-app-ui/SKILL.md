@@ -2,20 +2,8 @@
 
 Use this skill when you need to create a new UI resource for an MCP app tool from scratch.
 
-## Goal
-Create a small, self-contained web UI that can be served as an MCP app resource. The UI should be simple, readable, and easy to extend.
-
-## Assumption
-Do not assume that an existing repository, UI folder, or sample resource is available. Create the structure yourself if it does not already exist.
-
 ## Recommended project structure
-Create a fresh project with this shape:
-
-- package.json
-- tsconfig.json
-- tsconfig.node.json
 - vite.config.ts
-- build-ui.mjs
 - server.ts
 - ui/<resource-name>.html
 - src/index.css
