@@ -332,9 +332,29 @@ int main(int argc, char** argv)
     if (!loaded_at_least_one)
         std::cerr << "Warning: no plugins loaded.\n";
 
-    // ── Build MCP resources (external mcp-apps) ───────────────────────────
+    // ── Build MCP resources (external mcp-apps + app-tool metadata) ─────
     std::vector<RuntimeResource> resources;
     std::set<std::string>        seen_resource_uris;
+
+    for (const auto& meta : registry.listMetadata())
+    {
+        if (!meta.is_app_tool || meta.resource_uri.empty())
+            continue;
+
+        addRuntimeResource(resources, seen_resource_uris, RuntimeResource{
+            meta.resource_uri,
+            "UI resource for " + meta.cmd_name,
+            meta.description,
+            "text/html",
+            [uri = meta.resource_uri]()
+            {
+                std::string canon, mime, body, err;
+                if (fastmcp::readMcpAppResource(uri, canon, mime, body, err))
+                    return body;
+                return std::string("Error: " + err);
+            }
+        }, mcp_debug);
+    }
 
     for (const auto& ext : fastmcp::fetchExternalAppResources())
     {
