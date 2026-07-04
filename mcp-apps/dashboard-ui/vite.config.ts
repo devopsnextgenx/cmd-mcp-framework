@@ -1,47 +1,10 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { viteSingleFile } from 'vite-plugin-singlefile';
+import resourceManifest from './resource-manifest.json' assert { type: 'json' };
 
 // When INPUT is set, build-ui.mjs drives a single-file bundle for that HTML entry.
 const INPUT = process.env.INPUT;
-
-const resourceManifest = {
-  resources: [
-    {
-      uri: 'ui://ui/math-form',
-      name: 'Math Form UI',
-      description: 'Math operation form with subtype enum and two numeric inputs',
-      mimeType: 'text/html',
-      _meta: {
-        ui: {
-          resourceUri: 'http://localhost:6543/ui/math-form.html',
-        },
-      },
-    },
-    {
-      uri: 'ui://ui/geo-form',
-      name: 'Geometry Form UI',
-      description: 'Geometry operation form with perimeter, area, and volume calculations',
-      mimeType: 'text/html',
-      _meta: {
-        ui: {
-          resourceUri: 'http://localhost:6543/ui/geo-form.html',
-        },
-      },
-    },
-    {
-      uri: 'ui://ui/greet',
-      name: 'Greetings UI',
-      description: 'Simple greeting UI that displays Hello <name>!!! or Hello World!!!',
-      mimeType: 'text/html',
-      _meta: {
-        ui: {
-          resourceUri: 'http://localhost:6543/ui/greet.html',
-        },
-      },
-    },
-  ],
-};
 
 const mcpMiddlewarePlugin = {
   name: 'mcp-middleware',
