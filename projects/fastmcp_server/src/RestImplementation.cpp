@@ -1,8 +1,10 @@
 // RestImplementation.cpp
 #include "RestImplementation.hpp"
 
+#include <cstdlib>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <nlohmann/json.hpp>
 #include <charconv>
 
@@ -20,6 +22,35 @@ namespace fastmcp
     static constexpr const char* kMcpAppsHost = "localhost";
     static constexpr int         kMcpAppsPort = 6543;
 
+    // Resolves the mcp-apps resource server host/port from environment
+    // variables, falling back to the localhost:6543 defaults if unset or invalid.
+    static std::pair<std::string, int> resolveMcpAppsServerHostPort()
+    {
+        std::string host = kMcpAppsHost;
+        int         port = kMcpAppsPort;
+
+        if (const char* env_host = std::getenv("MCP_APP_RESOURCE_SERVER_HOST");
+            env_host != nullptr && *env_host != '\0')
+        {
+            host = env_host;
+        }
+
+        if (const char* env_port = std::getenv("MCP_APP_RESOURCE_SERVER_PORT");
+            env_port != nullptr && *env_port != '\0')
+        {
+            int parsed = 0;
+            const std::string_view sv(env_port);
+            const auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), parsed);
+            if (ec == std::errc() && ptr == sv.data() + sv.size() && parsed > 0 && parsed <= 65535)
+                port = parsed;
+            else
+                std::cout << "[mcp-apps] Invalid MCP_APP_RESOURCE_SERVER_PORT value '"
+                        << env_port << "', falling back to " << kMcpAppsPort << '\n';
+        }
+
+        return { host, port };
+    }
+
     static std::string contentTypeFromResponse(const httplib::Result& r, const std::string& fb)
     {
         if (!r || !r->has_header("Content-Type")) return fb;
@@ -30,7 +61,9 @@ namespace fastmcp
 
     static void proxyMcpApp(const std::string& path, httplib::Response& res)
     {
-        httplib::Client cl(kMcpAppsHost, kMcpAppsPort);
+        const auto [host, port] = resolveMcpAppsServerHostPort();
+
+        httplib::Client cl(host, port);
         cl.set_connection_timeout(2, 0);
         cl.set_read_timeout(5, 0);
         const auto r = cl.Get(path.c_str());
@@ -38,7 +71,8 @@ namespace fastmcp
         {
             res.status = 502;
             res.set_content(
-                json({ {"error", "mcp-apps unreachable"} }).dump(), "application/json");
+                json({ {"error", "mcp-apps unreachable at " + host + ":" + std::to_string(port)} }).dump(),
+                "application/json");
             return;
         }
         res.status = r->status;
@@ -198,7 +232,8 @@ namespace fastmcp
         server.Get("/mcp-apps", [](const httplib::Request&, httplib::Response& res)
         {
             addCorsHeaders(res);
-            std::cout << "[REST GET] /mcp-apps (proxy -> :6543/)\n";
+            const auto [host, port] = resolveMcpAppsServerHostPort();
+            std::cout << "[REST GET] /mcp-apps (proxy -> " << host << ":" << port << "/)\n";
             proxyMcpApp("/", res);
         });
 
@@ -207,8 +242,9 @@ namespace fastmcp
         {
             addCorsHeaders(res);
             const auto app_path = "/" + req.matches[1].str();
+            const auto [host, port] = resolveMcpAppsServerHostPort();
             std::cout << "[REST GET] /mcp-apps" << app_path
-                    << " (proxy -> :6543" << app_path << ")\n";
+                    << " (proxy -> " << host << ":" << port << app_path << ")\n";
             proxyMcpApp(app_path, res);
         });
 

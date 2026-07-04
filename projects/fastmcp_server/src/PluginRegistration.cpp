@@ -46,6 +46,36 @@ namespace fastmcp
     static constexpr const char* kMcpAppsHost = "localhost";
     static constexpr int         kMcpAppsPort = 6543;
 
+    // Resolves the mcp-apps resource server host/port from environment variables,
+    // falling back to the localhost:6543 defaults if unset or invalid.
+    static std::pair<std::string, int> resolveMcpAppsServerHostPort()
+    {
+        std::string host = kMcpAppsHost;
+        int         port = kMcpAppsPort;
+
+        if (const char* env_host = std::getenv("MCP_APP_RESOURCE_SERVER_HOST");
+            env_host != nullptr && *env_host != '\0')
+        {
+            host = env_host;
+        }
+
+        if (const char* env_port = std::getenv("MCP_APP_RESOURCE_SERVER_PORT");
+            env_port != nullptr && *env_port != '\0')
+        {
+            int parsed = 0;
+            const std::string_view sv(env_port);
+            const auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), parsed);
+            if (ec == std::errc() && ptr == sv.data() + sv.size() && parsed > 0 && parsed <= 65535)
+                port = parsed;
+            else if (gMcpDebug.load())
+                logDiagLocal("MCP-APP-CONFIG",
+                    "Invalid MCP_APP_RESOURCE_SERVER_PORT value '" + std::string(env_port) +
+                    "', falling back to " + std::to_string(kMcpAppsPort));
+        }
+
+        return { host, port };
+    }
+
     static std::string contentTypeFromResult(const httplib::Result& r, const std::string& fb)
     {
         if (!r || !r->has_header("Content-Type")) return fb;
@@ -617,10 +647,10 @@ namespace fastmcp
     }
 
     bool readMcpAppResource(const std::string& uri,
-                            std::string& canonical_uri,
-                            std::string& mime_type,
-                            std::string& content,
-                            std::string& error)
+                        std::string& canonical_uri,
+                        std::string& mime_type,
+                        std::string& content,
+                        std::string& error)
     {
         const bool mcp_debug = gMcpDebug.load();
         std::string path;
@@ -634,19 +664,22 @@ namespace fastmcp
         if (path.empty() || path[0] != '/')
             path = "/" + path;
 
-        httplib::Client cl(kMcpAppsHost, kMcpAppsPort);
+        const auto [host, port] = resolveMcpAppsServerHostPort();
+
+        httplib::Client cl(host, port);
         cl.set_connection_timeout(1, 0);
         cl.set_read_timeout(2, 0);
 
         if (mcp_debug)
-            logDiagLocal("MCP-APP-READ", "Fetching " + uri + " via " + path);
+            logDiagLocal("MCP-APP-READ",
+                "Fetching " + uri + " via " + path + " from " + host + ":" + std::to_string(port));
 
         const auto r = cl.Get(path.c_str());
         if (!r)
         {
             if (mcp_debug)
                 logDiagLocal("MCP-APP-READ", "Connection failed for " + uri);
-            error = "mcp-apps connection failed at " + std::string(kMcpAppsHost);
+            error = "mcp-apps connection failed at " + host + ":" + std::to_string(port);
             return false;
         }
         if (r->status != 200)

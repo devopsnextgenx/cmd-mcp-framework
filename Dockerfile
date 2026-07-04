@@ -1,3 +1,6 @@
+# docker build -t cmd-mcp-server:local .
+# docker run --rm -d --name cmd-mcp-framework-test -p 5432:5432 -p 5433:5433 -p 6543:6543 localhost/cmd-mcp-server:local
+
 FROM debian:bookworm-slim AS build
 
 RUN apt-get update \
@@ -52,12 +55,17 @@ COPY <<'EOF' /usr/local/bin/entrypoint.sh
 #!/bin/sh
 set -eu
 
+# Default the UI server's listen port to the resource-server port the
+# fastmcp_server client is configured to talk to, unless PORT is set
+# explicitly (allows splitting listen-port from the advertised port).
+UI_PORT="${PORT:-${MCP_APP_RESOURCE_SERVER_PORT:-6543}}"
+
 /opt/cmd-mcp-server/bin/fastmcp_server "$@" &
 mcp_pid=$!
 
 (
   cd /opt/cmd-mcp-server/dashboard-ui
-  PORT="${PORT:-6543}" ./node_modules/.bin/tsx server.ts
+  PORT="$UI_PORT" ./node_modules/.bin/tsx server.ts
 ) &
 ui_pid=$!
 
@@ -82,5 +90,11 @@ ENV FASTMCP_MCP_DEBUG=1
 ENV PATH=/opt/cmd-mcp-server/bin:$PATH
 ENV LD_LIBRARY_PATH=/opt/cmd-mcp-server/lib:${LD_LIBRARY_PATH}
 ENV NODE_ENV=production
+
+# mcp-apps resource server connection settings (overridable at runtime, e.g.
+# `docker run -e MCP_APP_RESOURCE_SERVER_HOST=myhost -e MCP_APP_RESOURCE_SERVER_PORT=7000 ...`)
+ENV MCP_APP_RESOURCE_SERVER_HOST=localhost
+ENV MCP_APP_RESOURCE_SERVER_PORT=6543
+
 EXPOSE 5432 5433 6543
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
