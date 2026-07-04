@@ -30,13 +30,13 @@ const resourceManifest = {
       },
     },
     {
-      uri: 'ui://ui/hello-world',
-      name: 'Hello World UI',
+      uri: 'ui://ui/greet',
+      name: 'Greetings UI',
       description: 'Simple greeting UI that displays Hello <name>!!! or Hello World!!!',
       mimeType: 'text/html',
       _meta: {
         ui: {
-          resourceUri: 'http://localhost:6543/ui/hello-world.html',
+          resourceUri: 'http://localhost:6543/ui/greet.html',
         },
       },
     },

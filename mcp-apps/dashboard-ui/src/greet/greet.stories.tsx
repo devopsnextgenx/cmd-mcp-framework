@@ -1,9 +1,9 @@
 import type { Meta, StoryObj } from '@storybook/react';
-import { HelloWorldWidget } from './hello-world';
+import { GreetWidget } from './greet';
 
-const meta: Meta<typeof HelloWorldWidget> = {
-  title: 'MCP UI/Hello World',
-  component: HelloWorldWidget,
+const meta: Meta<typeof GreetWidget> = {
+  title: 'MCP UI/Greetings',
+  component: GreetWidget,
   parameters: {
     layout: 'centered',
   },
@@ -13,7 +13,7 @@ const meta: Meta<typeof HelloWorldWidget> = {
 };
 
 export default meta;
-type Story = StoryObj<typeof HelloWorldWidget>;
+type Story = StoryObj<typeof GreetWidget>;
 
 export const Default: Story = {};
 

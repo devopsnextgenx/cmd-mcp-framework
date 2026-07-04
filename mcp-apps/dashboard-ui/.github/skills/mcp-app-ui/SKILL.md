@@ -30,7 +30,7 @@ Example behavior for a Hello World resource:
 - if the input is empty, display Hello World!!!
 
 ## Example HTML entry
-Create a file such as ui/hello-world.html:
+Create a file such as ui/greet.html:
 
 ```html
 <!DOCTYPE html>
@@ -38,17 +38,17 @@ Create a file such as ui/hello-world.html:
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Hello World UI</title>
+    <title>Greetings UI</title>
   </head>
   <body>
     <div id="root"></div>
-    <script type="module" src="/src/hello-world/hello-world.tsx"></script>
+    <script type="module" src="/src/greet/greet.tsx"></script>
   </body>
 </html>
 ```
 
 ## Example React entry
-Create a file such as src/hello-world/hello-world.tsx:
+Create a file such as src/greet/greet.tsx:
 
 ```tsx
 import { createRoot } from 'react-dom/client';
@@ -92,13 +92,13 @@ Example:
 
 ```ts
 {
-  uri: 'ui://ui/hello-world',
-  name: 'Hello World UI',
+  uri: 'ui://ui/greet',
+  name: 'Greetings UI',
   description: 'Simple greeting UI for an MCP app tool',
   mimeType: 'text/html',
   _meta: {
     ui: {
-      resourceUri: 'http://localhost:6543/ui/hello-world.html',
+      resourceUri: 'http://localhost:6543/ui/greet.html',
     },
   },
 }

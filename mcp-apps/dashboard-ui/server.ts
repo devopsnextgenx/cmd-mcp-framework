@@ -37,13 +37,13 @@ app.get('/resource-manifest.json', (req, res) => {
         },
       },
       {
-        uri: 'ui://ui/hello-world.html',
-        name: 'Hello World UI',
+        uri: 'ui://ui/greet.html',
+        name: 'Greetings UI',
         description: 'Simple greeting UI that displays Hello <name>!!! or Hello World!!!',
         mimeType: 'text/html',
         _meta: {
           ui: {
-            resourceUri: 'http://localhost:6543/ui/hello-world.html',
+            resourceUri: 'http://localhost:6543/ui/greet.html',
           },
         },
       }
@@ -71,7 +71,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`✓ Serving static content from: ${path.join(__dirname, 'dist')}`);
   console.log(`✓ Math form available at: http://localhost:${PORT}/ui/math-form.html`);
   console.log(`✓ Geometry form available at: http://localhost:${PORT}/ui/geo-form.html`);
-  console.log(`✓ Hello World UI available at: http://localhost:${PORT}/ui/hello-world.html`);
+  console.log(`✓ Greetings UI available at: http://localhost:${PORT}/ui/greet.html`);
   console.log(`✓ Resource manifest available at: http://localhost:${PORT}/resource-manifest.json\n`);
 });
 
