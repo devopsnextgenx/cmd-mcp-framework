@@ -151,12 +151,17 @@ add_subdirectory(projects/fastmcp_server)
 
 # ---------------------------------------------------------------------------
 # React UI build (mcp-apps/dashboard-ui)
-# Uses vite-plugin-singlefile to produce embeddable HTML/JS/CSS artifact
+# Uses vite-plugin-singlefile to produce embeddable HTML/JS/CSS artifact.
+# Disabled by default for container builds to keep the runtime image small.
 # ---------------------------------------------------------------------------
-find_program(NPM_EXECUTABLE npm)
-find_program(NODE_EXECUTABLE node)
+option(BUILD_MCP_UI "Build the React dashboard UI artifacts" ON)
 
-if(NPM_EXECUTABLE AND NODE_EXECUTABLE)
+if(BUILD_MCP_UI)
+  find_program(NPM_EXECUTABLE npm)
+  find_program(NODE_EXECUTABLE node)
+endif()
+
+if(BUILD_MCP_UI AND NPM_EXECUTABLE AND NODE_EXECUTABLE)
   set(UI_BUILD_DIR "${CMAKE_SOURCE_DIR}/mcp-apps/dashboard-ui")
   set(UI_OUTPUT_DIR "${UI_BUILD_DIR}/dist")
   
