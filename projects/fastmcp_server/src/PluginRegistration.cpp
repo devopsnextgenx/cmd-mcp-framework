@@ -367,8 +367,8 @@ namespace fastmcp
         const std::string tool_base_name =
             "open_" + StringUtils::sanitizeToolName(original_cmd_name) + "_form";
         const std::string tool_name  = allocateUniqueToolName(tool_base_name, registration_state);
-        const std::string title       = "Open " + original_cmd_name + " Form";
-        const std::string description = "Open a UI form for " + original_cmd_name + ".";
+        const std::string title       = "MCP app ui for " + original_cmd_name;
+        const std::string description = "MCP app tool ui to collect and invoke MCP tool command " + original_cmd_name + ".";
         const json        input_schema = buildInputSchema(cmd_meta, std::nullopt);
 
         std::vector<std::string>         subtype_names;
