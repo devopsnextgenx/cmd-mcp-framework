@@ -47,9 +47,9 @@ Suggested project structure:
 - index.html
 - src/
   - index.css
-  - hello-world/hello-world.tsx
+  - greet/greet.tsx
 - ui/
-  - hello-world.html
+  - greet.html
 - .github/skills/mcp-app-ui/SKILL.md
 
 Behavior requirements:
@@ -61,7 +61,7 @@ Behavior requirements:
 Manifest requirements:
 - Add a resource entry for the new UI resource.
 - The manifest should include:
-  - a resource URI such as ui://ui/hello-world
+  - a resource URI such as ui://ui/greet.html
   - a name such as Hello World UI
   - a description
   - a mime type of text/html

@@ -1,6 +1,7 @@
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import resourceManifest from './resource-manifest.json' assert { type: 'json' };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -12,45 +13,7 @@ app.use(express.static(path.join(__dirname, 'dist')));
 
 // Resource manifest endpoint for MCP apps discovery
 app.get('/resource-manifest.json', (req, res) => {
-  const manifest = {
-    resources: [
-      {
-        uri: 'ui://ui/math-form.html',
-        name: 'Math Form UI',
-        description: 'Math operation form with subtype enum and two numeric inputs',
-        mimeType: 'text/html',
-        _meta: {
-          ui: {
-            resourceUri: 'http://localhost:6543/ui/math-form.html',
-          },
-        },
-      },
-      {
-        uri: 'ui://ui/geo-form.html',
-        name: 'Geometry Form UI',
-        description: 'Geometry operation form with perimeter, area, and volume calculations',
-        mimeType: 'text/html',
-        _meta: {
-          ui: {
-            resourceUri: 'http://localhost:6543/ui/geo-form.html',
-          },
-        },
-      },
-      {
-        uri: 'ui://ui/hello-world.html',
-        name: 'Hello World UI',
-        description: 'Simple greeting UI that displays Hello <name>!!! or Hello World!!!',
-        mimeType: 'text/html',
-        _meta: {
-          ui: {
-            resourceUri: 'http://localhost:6543/ui/hello-world.html',
-          },
-        },
-      }
-    ],
-  };
-
-  res.json(manifest);
+  res.json(resourceManifest);
 });
 
 // Fallback: serve index.html for root and dashboard routes
@@ -71,7 +34,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`✓ Serving static content from: ${path.join(__dirname, 'dist')}`);
   console.log(`✓ Math form available at: http://localhost:${PORT}/ui/math-form.html`);
   console.log(`✓ Geometry form available at: http://localhost:${PORT}/ui/geo-form.html`);
-  console.log(`✓ Hello World UI available at: http://localhost:${PORT}/ui/hello-world.html`);
+  console.log(`✓ Greetings UI available at: http://localhost:${PORT}/ui/greet.html`);
   console.log(`✓ Resource manifest available at: http://localhost:${PORT}/resource-manifest.json\n`);
 });
 

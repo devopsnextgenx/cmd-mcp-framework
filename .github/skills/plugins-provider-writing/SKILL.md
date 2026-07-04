@@ -107,7 +107,7 @@ This enables the server to register the tool with a UI resource.
 For a UI-backed tool, add the resource in [mcp-apps/dashboard-ui/vite.config.ts](mcp-apps/dashboard-ui/vite.config.ts) and, if needed, in [mcp-apps/dashboard-ui/server.ts](mcp-apps/dashboard-ui/server.ts).
 
 The UI resource should include:
-- a unique resource URI such as ui://ui/hello-world
+- a unique resource URI such as ui://ui/greet.html
 - a human-friendly name and description
 - a matching _meta.ui.resourceUri entry
 

@@ -27,7 +27,7 @@ class GreetingCmdProvider final : public cmdsdk::SubCmd {
     };
     metadata.is_tool = true;
     metadata.is_app_tool = true;
-    metadata.resource_uri = "ui://ui/hello-world.html";
+    metadata.resource_uri = "ui://ui/greet.html";
     return metadata;
   }
 

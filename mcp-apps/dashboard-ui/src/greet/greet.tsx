@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import '../index.css';
 
-interface HelloWorldWidgetProps {
+interface GreetWidgetProps {
   name?: string;
 }
 
@@ -11,7 +11,7 @@ function getGreeting(name: string | undefined) {
   return trimmedName ? `Hello ${trimmedName}!!!` : 'Hello World!!!';
 }
 
-export function HelloWorldWidget({ name: initialName }: HelloWorldWidgetProps) {
+export function GreetWidget({ name: initialName }: GreetWidgetProps) {
   const [name, setName] = useState(initialName ?? '');
 
   useEffect(() => {
@@ -68,7 +68,7 @@ export function HelloWorldWidget({ name: initialName }: HelloWorldWidgetProps) {
 
   return (
     <div style={containerStyle}>
-      <h1 style={titleStyle}>Hello World</h1>
+      <h1 style={titleStyle}>Greetings</h1>
       <p style={subtitleStyle}>Enter a name to personalize the greeting.</p>
       <label style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
         <span>Name</span>
@@ -87,5 +87,5 @@ export function HelloWorldWidget({ name: initialName }: HelloWorldWidgetProps) {
 const mountNode = document.getElementById('root');
 
 if (mountNode) {
-  createRoot(mountNode).render(<HelloWorldWidget />);
+  createRoot(mountNode).render(<GreetWidget />);
 }
