@@ -333,8 +333,9 @@ namespace fastmcp
     {
         const bool mcp_debug = gMcpDebug.load();
         const std::string original_cmd_name = cmd_meta.cmd_name;
+        // TODO: [devopsnextgenx]: Supported but for legacy we cant have '-' in the tool name.
         const std::string tool_base_name =
-            "open-" + StringUtils::sanitizeToolName(original_cmd_name) + "-form";
+            "open_" + StringUtils::sanitizeToolName(original_cmd_name) + "_form";
         const std::string tool_name  = allocateUniqueToolName(tool_base_name, registration_state);
         const std::string title       = "Open " + original_cmd_name + " Form";
         const std::string description = "Open a UI form for " + original_cmd_name + ".";

@@ -216,7 +216,7 @@ createConfiguredMcpServer(const cmdsdk::CommandRegistry& registry,
             resources_capability, tools_capability,
             std::nullopt, std::nullopt);
         server_config.serverInfo    = mcp::lifecycle::session::Implementation(
-            "fastmcp_server", "0.3.0");
+            "cmd-mcp-server", "0.3.0");
         server_config.instructions  =
             "Use tools for command execution and resources for plugin/app metadata. "
             "UI-enabled commands can expose app tools via CommandMetadata.is_app_tool "
