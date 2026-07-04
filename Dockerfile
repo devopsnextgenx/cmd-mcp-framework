@@ -1,5 +1,5 @@
 # docker build -t cmd-mcp-server:local .
-# docker run --rm -d --name cmd-mcp-framework-test -p 5432:5432 -p 5433:5433 -p 6543:6543 localhost/cmd-mcp-server:local
+# docker run --rm -d --name cmd-mcp-framework-test -p 5432:5432 -p 5433:5433 -p 6543:6543 -e FASTMCP_MCP_DEBUG=1 localhost/cmd-mcp-server:local
 
 FROM debian:bookworm-slim AS build
 
