@@ -183,6 +183,7 @@ interface GeoFormConfig {
   slant?: number;
 
   subType?: string;
+  args?: GeoFormConfig;
 }
 
 interface GeoResult {
@@ -323,38 +324,60 @@ export function GeoFormWidget() {
 
         const newParamValues = { ...paramValues };
 
-        if (typeof data.a === 'number') {
-          newParamValues.a = data.a.toString();
+        // Extract values from args field if present, otherwise from top level
+        let a = data.a;
+        let b = data.b;
+        let c = data.c;
+        let radius = data.radius;
+        let height = data.height;
+        let side = data.side;
+        let slant = data.slant;
+        let subType = data.subType;
+
+        if (data.args && typeof data.args === 'object') {
+          const args = data.args;
+          if (typeof args.a === 'number') a = args.a;
+          if (typeof args.b === 'number') b = args.b;
+          if (typeof args.c === 'number') c = args.c;
+          if (typeof args.radius === 'number') radius = args.radius;
+          if (typeof args.height === 'number') height = args.height;
+          if (typeof args.side === 'number') side = args.side;
+          if (typeof args.slant === 'number') slant = args.slant;
+          if (typeof args.subType === 'string') subType = args.subType;
         }
 
-        if (typeof data.b === 'number') {
-          newParamValues.b = data.b.toString();
+        if (typeof a === 'number') {
+          newParamValues.a = a.toString();
         }
 
-        if (typeof data.c === 'number') {
-          newParamValues.c = data.c.toString();
+        if (typeof b === 'number') {
+          newParamValues.b = b.toString();
         }
 
-        if (typeof data.radius === 'number') {
-          newParamValues.radius = data.radius.toString();
+        if (typeof c === 'number') {
+          newParamValues.c = c.toString();
         }
 
-        if (typeof data.height === 'number') {
-          newParamValues.height = data.height.toString();
+        if (typeof radius === 'number') {
+          newParamValues.radius = radius.toString();
         }
 
-        if (typeof data.side === 'number') {
-          newParamValues.side = data.side.toString();
+        if (typeof height === 'number') {
+          newParamValues.height = height.toString();
         }
 
-        if (typeof data.slant === 'number') {
-          newParamValues.slant = data.slant.toString();
+        if (typeof side === 'number') {
+          newParamValues.side = side.toString();
+        }
+
+        if (typeof slant === 'number') {
+          newParamValues.slant = slant.toString();
         }
 
         setParamValues(newParamValues);
 
-        if (typeof data.subType === 'string') {
-          setOperation(data.subType);
+        if (typeof subType === 'string') {
+          setOperation(subType);
         }
       }
 

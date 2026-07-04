@@ -1,8 +1,13 @@
 import { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { App } from '@modelcontextprotocol/ext-apps';
 import '../index.css';
 
 interface GreetWidgetProps {
+  name?: string;
+}
+
+interface GreetFormConfig {
   name?: string;
 }
 
@@ -11,12 +16,43 @@ function getGreeting(name: string | undefined) {
   return trimmedName ? `Hello ${trimmedName}!!!` : 'Hello World!!!';
 }
 
+function isGreetFormConfig(value: unknown): value is GreetFormConfig {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as GreetFormConfig;
+  return typeof candidate.name === 'string';
+}
+
 export function GreetWidget({ name: initialName }: GreetWidgetProps) {
+  const [appInstance] = useState(
+    () => new App({ name: 'Greetings', version: '1.0.0' }),
+  );
   const [name, setName] = useState(initialName ?? '');
 
   useEffect(() => {
-    setName(initialName ?? '');
-  }, [initialName]);
+    appInstance.ontoolresult = (toolResult) => {
+      if (isGreetFormConfig(toolResult.structuredContent)) {
+        const data = toolResult.structuredContent;
+        if (typeof data.name === 'string') {
+          setName(data.name);
+        }
+      } else if (toolResult.structuredContent?.args) {
+        // Handle args field if present
+        const args = toolResult.structuredContent.args as GreetFormConfig;
+        if (typeof args.name === 'string') {
+          setName(args.name);
+        }
+      }
+    };
+
+    appInstance
+      .connect()
+      .then(() => {
+        // Connected
+      })
+      .catch(() => {
+        // Gracefully degrade — the form still works; users can enter values manually.
+      });
+  }, [appInstance]);
 
   const greeting = useMemo(() => getGreeting(name), [name]);
 

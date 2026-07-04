@@ -25,6 +25,7 @@ interface MathFormConfig {
   left?: number;
   right?: number;
   subType?: string;
+  args?: MathFormConfig;
 }
 
 interface MathResult {
@@ -88,15 +89,27 @@ export function MathFormWidget() {
         if (data.subTypes?.length) {
           setOperation(data.subTypes[0]);
         }
-        // Prepopulate fields if provided
-        if (typeof data.left === 'number') {
-          setLeftValue(data.left.toString());
+        // Prepopulate fields if provided (top-level or nested in args)
+        let left = data.left;
+        let right = data.right;
+        let subType = data.subType;
+        
+        // Check for args field which contains the original input parameters
+        if (data.args && typeof data.args === 'object') {
+          const args = data.args as MathFormConfig;
+          if (typeof args.left === 'number') left = args.left;
+          if (typeof args.right === 'number') right = args.right;
+          if (typeof args.subType === 'string') subType = args.subType;
         }
-        if (typeof data.right === 'number') {
-          setRightValue(data.right.toString());
+        
+        if (typeof left === 'number') {
+          setLeftValue(left.toString());
         }
-        if (typeof data.subType === 'string') {
-          setOperation(data.subType);
+        if (typeof right === 'number') {
+          setRightValue(right.toString());
+        }
+        if (typeof subType === 'string') {
+          setOperation(subType);
         }
       }
       setIsConnected(true);
