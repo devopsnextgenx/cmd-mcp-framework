@@ -1,0 +1,38 @@
+--- build/_deps/mcp_sdk-src/src/lifecycle/session.cpp	2026-07-04 10:38:45.858049557 -0400
++++ patch/mcp_sdk-src/src/lifecycle/session.cpp	2026-07-04 10:38:27.693163742 -0400
+@@ -1,6 +1,7 @@
+ #include <algorithm>
+ #include <cstddef>
+ #include <future>
++#include <iostream>
+ #include <memory>
+ #include <mutex>
+ #include <optional>
+@@ -588,6 +589,27 @@
+   const ClientCapabilities clientCaps = detail::parseClientCapabilities(params["capabilities"]);
+   const Implementation clientInfo = detail::parseImplementation(params["clientInfo"], std::string(kDefaultClientName), std::string(kSdkVersion));
+ 
++  std::ostringstream clientInfoLog;
++  clientInfoLog << "[MCP Session] Connected Client: name=" << clientInfo.name()
++                << ", version=" << clientInfo.version();
++  if (clientInfo.title().has_value())
++  {
++    clientInfoLog << ", title=" << *clientInfo.title();
++  }
++  if (clientInfo.description().has_value())
++  {
++    clientInfoLog << ", description=" << *clientInfo.description();
++  }
++  if (clientInfo.websiteUrl().has_value())
++  {
++    clientInfoLog << ", websiteUrl=" << *clientInfo.websiteUrl();
++  }
++  if (clientInfo.icons().has_value() && !clientInfo.icons()->empty())
++  {
++    clientInfoLog << ", icons=" << clientInfo.icons()->size();
++  }
++  std::cout << clientInfoLog.str() << '\n';
++
+   const auto negotiatedVersion = selectServerProtocolVersion(clientProposedVersion, options_.supportedProtocolVersions);
+ 
+   if (!negotiatedVersion)

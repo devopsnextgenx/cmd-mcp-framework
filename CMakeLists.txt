@@ -75,6 +75,73 @@ set(BUILD_TESTING              OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(cpp_httplib)
 
 # ---------------------------------------------------------------------------
+# Idempotent Patch Layer (Executes during CMake Configuration)
+# ---------------------------------------------------------------------------
+find_program(PATCH_EXECUTABLE patch REQUIRED)
+
+# Discover all .patch files inside the patch/ folder
+file(GLOB_RECURSE PATCH_FILES "${CMAKE_SOURCE_DIR}/patch/*.patch")
+
+if(PATCH_FILES)
+  message(STATUS "--------------------------------------------------------")
+  message(STATUS "MCP Framework: Processing dependency patch files...")
+  message(STATUS "--------------------------------------------------------")
+endif()
+
+foreach(PATCH_FILE IN LISTS PATCH_FILES)
+  # Extract the relative path from the patch/ directory
+  file(RELATIVE_PATH REL_PATCH_PATH "${CMAKE_SOURCE_DIR}/patch" "${PATCH_FILE}")
+  
+  # Strip the trailing '.patch' extension to find the target file relative path
+  string(REGEX REPLACE "\\.patch$" "" REL_TARGET_PATH "${REL_PATCH_PATH}")
+  
+  # Formulate the absolute path to the target file inside the build directory
+  set(TARGET_FILE "${CMAKE_BINARY_DIR}/_deps/${REL_TARGET_PATH}")
+
+  if(EXISTS "${TARGET_FILE}")
+    # Check if the patch has already been applied using a dry run reverse-check
+    # -R: Reverse patch check, -N: Forward patch check, --dry-run: No modifications
+    execute_process(
+      COMMAND ${PATCH_EXECUTABLE} -R -N --dry-run "${TARGET_FILE}" "${PATCH_FILE}"
+      RESULT_VARIABLE PATCH_ALREADY_APPLIED
+      OUTPUT_QUIET
+      ERROR_QUIET
+    )
+
+    if(NOT PATCH_ALREADY_APPLIED EQUAL 0)
+      # Print high-visibility message BEFORE applying the patch
+      message(STATUS "[PATCHING] Applying patch file: patch/${REL_PATCH_PATH}")
+      message(STATUS "           Targeting source:    build/_deps/${REL_TARGET_PATH}")
+      
+      execute_process(
+        COMMAND ${PATCH_EXECUTABLE} -N "${TARGET_FILE}" "${PATCH_FILE}"
+        RESULT_VARIABLE PATCH_RESULT
+        OUTPUT_VARIABLE PATCH_OUTPUT
+        ERROR_VARIABLE PATCH_ERROR
+      )
+      
+      if(PATCH_RESULT EQUAL 0)
+        # Print high-visibility message AFTER successful application
+        message(STATUS "[SUCCESS]  Successfully patched: build/_deps/${REL_TARGET_PATH}")
+      else()
+        message(STATUS "${PATCH_OUTPUT}")
+        message(STATUS "${PATCH_ERROR}")
+        message(FATAL_ERROR "[FAILED]   Failed to apply patch: patch/${REL_PATCH_PATH}")
+      endif()
+      
+    else()
+      message(STATUS "[SKIPPED]  Patch already applied for: build/_deps/${REL_TARGET_PATH}")
+    endif()
+  else()
+    message(WARNING "[WARNING]  Patch target file not found, skipping for now: ${TARGET_FILE}")
+  endif()
+endforeach()
+
+if(PATCH_FILES)
+  message(STATUS "--------------------------------------------------------")
+endif()
+
+# ---------------------------------------------------------------------------
 # Sub-projects
 # ---------------------------------------------------------------------------
 add_subdirectory(projects/cmd_sdk)
