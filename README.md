@@ -12,7 +12,7 @@ npx @modelcontextprotocol/inspector@0.15.0 -- --url http://localhost:5432/mcp --
 
 ## Implementation
 
-A multi-project C/C++ framework for exposing command plugins through a FastMCP-style server with MCP over HTTP (streamable HTTP transport).
+A multi-project C/C++ framework for exposing command plugins through a FastMCP-style server with MCP over HTTP (streamable transport with legacy HTTP+SSE compatibility).
 
 This repository is structured so that:
 - one project builds an executable server (`fastmcp_server`)
@@ -31,6 +31,7 @@ The server publishes command metadata (name, description, parameters, validation
 - endpoints for:
   - default info page (`/`)
   - MCP JSON-RPC (`/mcp`)
+  - legacy SSE stream (`/events`) and POST bridge (`/rpc`) for older MCP clients
 
 ## Project layout
 - `CMakeLists.txt`
@@ -175,6 +176,15 @@ Default HTML page describing available endpoints and MCP usage hints.
 
 ### `POST /mcp`
 MCP JSON-RPC endpoint for tools and resources.
+
+### Legacy compatibility endpoints
+- `GET /events` (SSE stream)
+- `POST /messages` (JSON-RPC POST bridge)
+
+These run on the same MCP port as `/mcp` and are enabled by default for compatibility with clients that only support legacy HTTP+SSE transport.
+
+Set `FASTMCP_ENABLE_LEGACY_SSE=0` to disable legacy endpoints and keep streamable-only behavior.
+Set `FASTMCP_LEGACY_POST_PATH=/message` (or `/rpc`) if your client posts to a non-default legacy path.
 
 ## MCP Examples
 

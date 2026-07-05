@@ -1,0 +1,119 @@
+--- build/_deps/mcp_sdk-src/src/transport/http/server.cpp	2026-07-05 09:55:48.092884706 -0400
++++ patch/mcp_sdk-src/src/transport/http/server.cpp	2026-07-05 09:54:43.868642399 -0400
+@@ -3,9 +3,11 @@
+ #include <chrono>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdlib>
+ #include <exception>
+ #include <iomanip>
+ #include <ios>
++#include <iostream>
+ #include <limits>
+ #include <memory>
+ #include <mutex>
+@@ -113,6 +115,32 @@
+   return "POST";
+ }
+ 
++static auto httpTraceEnabled() -> bool
++{
++  const char *value = std::getenv("FASTMCP_HTTP_TRACE");
++  if (value == nullptr || *value == '\0')
++  {
++    return false;
++  }
++
++  std::string normalized = value;
++  std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch) {
++    return static_cast<char>(std::tolower(ch));
++  });
++
++  return !(normalized == "0" || normalized == "false" || normalized == "off" || normalized == "no");
++}
++
++static auto logHttpTrace(const std::string &message) -> void
++{
++  if (!httpTraceEnabled())
++  {
++    return;
++  }
++
++  std::cerr << "[MCP-HTTP-TRACE] " << message << '\n';
++}
++
+ static auto normalizeEndpointPath(std::string path) -> std::string
+ {
+   if (path.empty())
+@@ -1112,7 +1140,15 @@
+     ServerResponse response;
+     response.statusCode = kStatusOk;
+     setHeader(response.headers, kHeaderContentType, "text/event-stream");
++    setHeader(response.headers, "Cache-Control", "no-cache");
+     response.body = mcp::http::sse::encodeEvents(events);
++
++    SseStreamResponse sse;
++    sse.streamId = "legacy-sse";
++    sse.events = events;
++    sse.terminateStream = false;
++    response.sse = std::move(sse);
++
+     return response;
+   }
+ 
+@@ -1569,6 +1605,22 @@
+   {
+     std::unique_lock<std::mutex> lock(mutex);
+ 
++    std::string routePath = request.path;
++    const std::size_t queryPos = routePath.find('?');
++    if (queryPos != std::string::npos)
++    {
++      routePath = routePath.substr(0, queryPos);
++      if (routePath.empty())
++      {
++        routePath = "/";
++      }
++    }
++
++    logHttpTrace("Incoming " + requestMethodToString(request.method) + " " + request.path +
++                 " (streamable=" + options.http.endpoint.path +
++                 ", legacy_sse=" + legacyCompatibility.sseEndpointPath +
++                 ", legacy_post=" + legacyCompatibility.postEndpointPath + ")");
++
+     const std::optional<ServerResponse> protectedResourceMetadataResponse = handleProtectedResourceMetadataRequest(request);
+     if (protectedResourceMetadataResponse.has_value())
+     {
+@@ -1577,19 +1629,22 @@
+ 
+     if (legacyCompatibility.enabled)
+     {
+-      if (request.path == legacyCompatibility.sseEndpointPath)
++      if (routePath == legacyCompatibility.sseEndpointPath)
+       {
++        logHttpTrace("Matched legacy SSE endpoint " + routePath);
+         return request.method == ServerRequestMethod::kGet ? handleLegacyGet(request) : statusResponse(kStatusMethodNotAllowed);
+       }
+ 
+-      if (request.path == legacyCompatibility.postEndpointPath)
++      if (routePath == legacyCompatibility.postEndpointPath)
+       {
++        logHttpTrace("Matched legacy POST endpoint " + routePath);
+         return request.method == ServerRequestMethod::kPost ? handleLegacyPost(request, lock) : statusResponse(kStatusMethodNotAllowed);
+       }
+     }
+ 
+-    if (request.path != options.http.endpoint.path)
++    if (routePath != options.http.endpoint.path)
+     {
++      logHttpTrace("No endpoint match for " + requestMethodToString(request.method) + " " + request.path + " (normalized=" + routePath + ") -> 404");
+       return statusResponse(kStatusNotFound);
+     }
+ 
+@@ -1713,4 +1768,4 @@
+   return impl_->enqueueServerMessage(message, sessionId);
+ }
+ 
+-}  // namespace mcp::transport::http
+\ No newline at end of file
++}  // namespace mcp::transport::http

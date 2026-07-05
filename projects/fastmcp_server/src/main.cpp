@@ -102,6 +102,13 @@ bool envFlagEnabled(const char* name, bool default_value = false)
     return !(v == "0" || v == "false" || v == "off" || v == "no");
 }
 
+std::string envStringOr(const char* name, const std::string& default_value)
+{
+    const char* value = std::getenv(name);
+    if (!value || *value == '\0') return default_value;
+    return value;
+}
+
 void handleSignal(int) { gStopRequested.store(true); }
 
 McpJson toMcpJson(const json& value) { return McpJson::parse(value.dump()); }
@@ -302,7 +309,12 @@ int main(int argc, char** argv)
     ServerConfig config = parseArguments(argc, argv);
     gMcpDebug.store(envFlagEnabled("FASTMCP_MCP_DEBUG", false));
     const bool mcp_debug          = gMcpDebug.load();
-    const bool require_session_id = envFlagEnabled("FASTMCP_REQUIRE_SESSION_ID", true);
+    const bool enable_legacy_sse  = envFlagEnabled("FASTMCP_ENABLE_LEGACY_SSE", true);
+    const bool requested_require_session_id = envFlagEnabled("FASTMCP_REQUIRE_SESSION_ID", true);
+    const bool require_session_id = requested_require_session_id && !enable_legacy_sse;
+    std::string legacy_post_path = envStringOr("FASTMCP_LEGACY_POST_PATH", "/messages");
+    if (!legacy_post_path.empty() && legacy_post_path.front() != '/')
+        legacy_post_path.insert(legacy_post_path.begin(), '/');
 
     if (config.plugin_paths.empty())
         config.plugin_paths = fastmcp::getAllPluginsInLib(argv[0]);
@@ -389,6 +401,9 @@ int main(int argc, char** argv)
               << StringUtils::protocolModeToString(config.protocol_mode) << "\n\n"
               << "MCP  (cpp-mcp-sdk)  → http://0.0.0.0:" << config.port << "/mcp\n"
               << "REST (httplib)  → http://0.0.0.0:" << rest_port << "/\n\n"
+              << "MCP compatibility endpoints (same MCP port):\n"
+              << "  GET  /events       — Legacy SSE stream\n"
+              << "  POST " << legacy_post_path << "     — Legacy JSON-RPC POST\n\n"
               << "REST routes:\n"
               << "  GET  /              — Homepage\n"
               << "  GET  /swagger       — Swagger UI\n"
@@ -427,6 +442,9 @@ int main(int argc, char** argv)
             static_cast<std::uint16_t>(config.port);
         mcp_options.transportOptions.http.endpoint.path              = "/mcp";
         mcp_options.transportOptions.http.requireSessionId           = require_session_id;
+        mcp_options.transportOptions.enableLegacyHttpSseCompatibility = enable_legacy_sse;
+        mcp_options.transportOptions.legacySseEndpointPath            = "/events";
+        mcp_options.transportOptions.legacyPostEndpointPath           = legacy_post_path;
 
         if (mcp_debug)
         {
@@ -440,6 +458,16 @@ int main(int argc, char** argv)
                     "Streamable HTTP policy requireSessionId=false (compat mode). "
                     "All HTTP clients share one MCP session; this improves compatibility "
                     "with proxies that do not replay MCP-Session-Id consistently.");
+
+            if (requested_require_session_id && enable_legacy_sse)
+                fastmcp::logDiag("MCP-CONNECT",
+                    "FASTMCP_REQUIRE_SESSION_ID requested but FASTMCP_ENABLE_LEGACY_SSE is enabled; "
+                    "forcing requireSessionId=false so legacy /events clients can initialize.");
+
+            fastmcp::logDiag("MCP-CONNECT",
+                std::string("Legacy HTTP+SSE compatibility ") +
+                (enable_legacy_sse ? "enabled" : "disabled") +
+                " (/events + " + legacy_post_path + ")");
         }
 
         mcp_runner = std::make_unique<mcp::server::StreamableHttpServerRunner>(

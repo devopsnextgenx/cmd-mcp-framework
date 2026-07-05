@@ -1,0 +1,609 @@
+--- build/_deps/mcp_sdk-src/src/transport/http/runtime.cpp	2026-07-05 09:55:31.877805798 -0400
++++ patch/mcp_sdk-src/src/transport/http/runtime.cpp	2026-07-05 09:54:43.886419306 -0400
+@@ -1,9 +1,6 @@
+-#include <algorithm>
+ #include <atomic>
+-#include <chrono>
+ #include <cstdint>
+ #include <exception>
+-#include <functional>
+ #include <future>
+ #include <memory>
+ #include <mutex>
+@@ -13,7 +10,6 @@
+ #include <string_view>
+ #include <thread>
+ #include <utility>
+-#include <vector>
+ 
+ #include <boost/asio/connect.hpp>  // NOLINT(misc-include-cleaner)
+ #include <boost/asio/io_context.hpp>
+@@ -272,13 +268,27 @@
+ auto toBeastResponse(const beast_http::request<beast_http::string_body> &request, const http::ServerResponse &response) -> beast_http::response<beast_http::string_body>
+ {
+   beast_http::response<beast_http::string_body> outbound {static_cast<beast_http::status>(response.statusCode), request.version()};
+-  outbound.keep_alive(false);
++  const bool holdSseOpen = response.sse.has_value() && !response.sse->terminateStream;
++  outbound.keep_alive(holdSseOpen);
+ 
+   for (const http::Header &header : response.headers)
+   {
+     outbound.set(header.name, header.value);
+   }
+ 
++  if (holdSseOpen)
++  {
++    if (!outbound.base().count(beast_http::field::cache_control))
++    {
++      outbound.set(beast_http::field::cache_control, "no-cache");
++    }
++
++    if (!outbound.base().count(beast_http::field::connection))
++    {
++      outbound.set(beast_http::field::connection, "keep-alive");
++    }
++  }
++
+   outbound.body() = response.body;
+   outbound.prepare_payload();
+   return outbound;
+@@ -311,43 +321,6 @@
+ }
+ #endif
+ 
+-auto applyConnectionTimeout(beast::tcp_stream &stream, std::chrono::milliseconds timeout) -> void
+-{
+-  if (timeout.count() > 0)
+-  {
+-    stream.expires_after(timeout);
+-  }
+-}
+-
+-auto closeConnectionStream(beast::tcp_stream &stream) noexcept -> void
+-{
+-  beast::error_code error;
+-  stream.socket().cancel(error);
+-  stream.socket().shutdown(tcp::socket::shutdown_both, error);
+-  stream.socket().close(error);
+-}
+-
+-#if MCP_SDK_ENABLE_TLS
+-using TlsServerStream = ssl::stream<beast::tcp_stream>;
+-
+-auto applyConnectionTimeout(TlsServerStream &stream, std::chrono::milliseconds timeout) -> void
+-{
+-  if (timeout.count() > 0)
+-  {
+-    beast::get_lowest_layer(stream).expires_after(timeout);
+-  }
+-}
+-
+-auto closeConnectionStream(TlsServerStream &stream) noexcept -> void
+-{
+-  beast::error_code error;
+-  auto &tcpStream = beast::get_lowest_layer(stream);
+-  tcpStream.socket().cancel(error);
+-  tcpStream.socket().shutdown(tcp::socket::shutdown_both, error);
+-  tcpStream.socket().close(error);
+-}
+-#endif
+-
+ }  // namespace
+ 
+ struct HttpServerRuntime::Impl
+@@ -357,59 +330,6 @@
+   {
+   }
+ 
+-  class ActiveConnection
+-  {
+-  public:
+-    auto setCloseHandler(std::function<void()> closeHandler) -> void
+-    {
+-      const std::scoped_lock lock(mutex_);
+-      closeHandler_ = std::move(closeHandler);
+-    }
+-
+-    auto clearCloseHandler() noexcept -> void
+-    {
+-      const std::scoped_lock lock(mutex_);
+-      closeHandler_ = nullptr;
+-    }
+-
+-    auto closeNow() noexcept -> void
+-    {
+-      const std::scoped_lock lock(mutex_);
+-      if (closeHandler_)
+-      {
+-        closeHandler_();
+-      }
+-    }
+-
+-  private:
+-    std::mutex mutex_;
+-    std::function<void()> closeHandler_;
+-  };
+-
+-  class ActiveConnectionCloseGuard
+-  {
+-  public:
+-    ActiveConnectionCloseGuard(ActiveConnection &connection, std::function<void()> closeHandler)
+-      : connection_(connection)
+-    {
+-      connection_.setCloseHandler(std::move(closeHandler));
+-    }
+-
+-    ~ActiveConnectionCloseGuard() noexcept { connection_.clearCloseHandler(); }
+-
+-    ActiveConnectionCloseGuard(const ActiveConnectionCloseGuard &) = delete;
+-    auto operator=(const ActiveConnectionCloseGuard &) -> ActiveConnectionCloseGuard & = delete;
+-
+-  private:
+-    ActiveConnection &connection_;
+-  };
+-
+-  struct ConnectionWorker
+-  {
+-    std::thread thread;
+-    std::shared_ptr<std::atomic<bool>> completed;
+-  };
+-
+   auto setRequestHandler(HttpRequestHandler handler) -> void
+   {
+     const std::scoped_lock lock(mutex_);
+@@ -418,18 +338,11 @@
+ 
+   auto start() -> void
+   {
+-    const std::scoped_lock lifecycleLock(lifecycleMutex_);
+-    if (running_.load())
++    if (running_.exchange(true))
+     {
+       return;
+     }
+ 
+-    if (serverThread_.joinable())
+-    {
+-      serverThread_.join();
+-    }
+-
+-    running_.store(true);
+     stopRequested_.store(false);
+ 
+     std::promise<std::uint16_t> startupPromise;
+@@ -450,13 +363,12 @@
+ 
+     try
+     {
+-      localPort_.store(startupFuture.get());
++      localPort_ = startupFuture.get();
+     }
+     catch (...)
+     {
+       running_.store(false);
+       stopRequested_.store(true);
+-      closeActiveConnections();
+       if (serverThread_.joinable())
+       {
+         serverThread_.join();
+@@ -468,27 +380,23 @@
+ 
+   auto stop() noexcept -> void
+   {
+-    const std::scoped_lock lifecycleLock(lifecycleMutex_);
++    const bool wasRunning = running_.exchange(false);
+     stopRequested_.store(true);
+ 
+-    if (running_.load() || serverThread_.joinable())
++    if (wasRunning)
+     {
+       wakeAcceptLoop();
+-      closeActiveConnections();
+     }
+ 
+     if (serverThread_.joinable())
+     {
+       serverThread_.join();
+     }
+-
+-    joinConnectionThreads();
+-    running_.store(false);
+   }
+ 
+   [[nodiscard]] auto isRunning() const noexcept -> bool { return running_.load(); }
+ 
+-  [[nodiscard]] auto localPort() const noexcept -> std::uint16_t { return localPort_.load(); }
++  [[nodiscard]] auto localPort() const noexcept -> std::uint16_t { return localPort_; }
+ 
+   auto run(std::promise<std::uint16_t> startupPromise) -> void
+   {
+@@ -528,27 +436,27 @@
+         throw std::runtime_error("HTTP server failed to enter listen state.");
+       }
+ 
+-      localPort_.store(acceptor.local_endpoint(error).port());
+-      if (error || localPort_.load() == 0)
++      localPort_ = acceptor.local_endpoint(error).port();
++      if (error || localPort_ == 0)
+       {
+         throw std::runtime_error("HTTP server failed to resolve bound local port.");
+       }
+ 
+ #if MCP_SDK_ENABLE_TLS
+-      std::shared_ptr<ssl::context> tlsContext;
++      std::optional<ssl::context> tlsContext;
+ #endif
+ 
+       if (options_.tls.has_value())
+       {
+ #if MCP_SDK_ENABLE_TLS
+-        tlsContext = std::make_shared<ssl::context>(ssl::context::tls_server);
++        tlsContext.emplace(ssl::context::tls_server);
+         configureServerTlsContext(*tlsContext, *options_.tls);
+ #else
+         throw std::invalid_argument("Server TLS configuration requires MCP_SDK_ENABLE_TLS=ON.");
+ #endif
+       }
+ 
+-      startupPromise.set_value(localPort_.load());
++      startupPromise.set_value(localPort_);
+       startupSignaled = true;
+ 
+       while (!stopRequested_.load())
+@@ -565,33 +473,41 @@
+           break;
+         }
+ 
+-        joinCompletedConnectionThreads();
+-
+         if (options_.tls.has_value())
+         {
+ #if MCP_SDK_ENABLE_TLS
+-          if (!tlsContext)
++          if (!tlsContext.has_value())
+           {
+             throw std::runtime_error("Server TLS context was not initialized.");
+           }
+-          launchTlsConnection(std::move(socket), tlsContext);
++          activeConnections_.emplace_back([this, socket = std::move(socket), &tlsContext]() mutable
++          {
++            handleTlsConnection(std::move(socket), *tlsContext);
++          });
+ #else
+           throw std::runtime_error("Server TLS requested but TLS support is disabled.");
+ #endif
+         }
+         else
+         {
+-          launchPlainConnection(std::move(socket));
++          activeConnections_.emplace_back([this, socket = std::move(socket)]() mutable
++          {
++            handlePlainConnection(std::move(socket));
++          });
+         }
+       }
+ 
+-      closeActiveConnections();
+-      joinConnectionThreads();
++      for (std::thread &thread : activeConnections_)
++      {
++        if (thread.joinable())
++        {
++          thread.join();
++        }
++      }
++      activeConnections_.clear();
+     }
+     catch (...)
+     {
+-      closeActiveConnections();
+-      joinConnectionThreads();
+       if (!startupSignaled)
+       {
+         startupPromise.set_exception(std::current_exception());
+@@ -603,148 +519,6 @@
+     running_.store(false);
+   }
+ 
+-  [[nodiscard]] auto tryAddActiveConnection(const std::shared_ptr<ActiveConnection> &connection) -> bool
+-  {
+-    const std::scoped_lock lock(connectionMutex_);
+-    if (activeConnections_.size() >= options_.limits.maxConcurrentInFlightRequests)
+-    {
+-      return false;
+-    }
+-
+-    activeConnections_.push_back(connection);
+-    return true;
+-  }
+-
+-  auto removeActiveConnection(const std::shared_ptr<ActiveConnection> &connection) noexcept -> void
+-  {
+-    const std::scoped_lock lock(connectionMutex_);
+-    activeConnections_.erase(std::remove(activeConnections_.begin(), activeConnections_.end(), connection), activeConnections_.end());
+-  }
+-
+-  auto closeActiveConnections() noexcept -> void
+-  {
+-    const std::scoped_lock lock(connectionMutex_);
+-    for (const std::shared_ptr<ActiveConnection> &connection : activeConnections_)
+-    {
+-      connection->closeNow();
+-    }
+-  }
+-
+-  auto joinCompletedConnectionThreads() noexcept -> void
+-  {
+-    const std::scoped_lock lock(connectionMutex_);
+-    auto worker = connectionWorkers_.begin();
+-    while (worker != connectionWorkers_.end())
+-    {
+-      if (!worker->completed->load())
+-      {
+-        ++worker;
+-        continue;
+-      }
+-
+-      if (worker->thread.joinable())
+-      {
+-        worker->thread.join();
+-      }
+-      worker = connectionWorkers_.erase(worker);
+-    }
+-  }
+-
+-  auto joinConnectionThreads() noexcept -> void
+-  {
+-    std::vector<ConnectionWorker> workers;
+-    {
+-      const std::scoped_lock lock(connectionMutex_);
+-      workers.swap(connectionWorkers_);
+-    }
+-
+-    for (ConnectionWorker &worker : workers)
+-    {
+-      if (worker.thread.joinable())
+-      {
+-        worker.thread.join();
+-      }
+-    }
+-  }
+-
+-  static auto closeSocket(tcp::socket &socket) noexcept -> void
+-  {
+-    beast::error_code error;
+-    socket.cancel(error);
+-    socket.shutdown(tcp::socket::shutdown_both, error);
+-    socket.close(error);
+-  }
+-
+-  auto addConnectionWorker(std::thread worker, std::shared_ptr<std::atomic<bool>> completed) -> void
+-  {
+-    const std::scoped_lock lock(connectionMutex_);
+-    connectionWorkers_.push_back(ConnectionWorker {std::move(worker), std::move(completed)});
+-  }
+-
+-  auto launchPlainConnection(tcp::socket socket) -> void
+-  {
+-    auto connection = std::make_shared<ActiveConnection>();
+-    if (!tryAddActiveConnection(connection))
+-    {
+-      closeSocket(socket);
+-      return;
+-    }
+-
+-    auto completed = std::make_shared<std::atomic<bool>>(false);
+-    std::thread worker(
+-      [this, socket = std::move(socket), connection, completed]() mutable noexcept -> void
+-      {
+-        try
+-        {
+-          handlePlainConnection(std::move(socket), *connection);
+-        }
+-        catch (...)
+-        {
+-          reportCurrentException(options_.errorReporter, "HttpServerRuntime");
+-          stopRequested_.store(true);
+-          wakeAcceptLoop();
+-        }
+-
+-        removeActiveConnection(connection);
+-        completed->store(true);
+-      });
+-
+-    addConnectionWorker(std::move(worker), std::move(completed));
+-  }
+-
+-#if MCP_SDK_ENABLE_TLS
+-  auto launchTlsConnection(tcp::socket socket, std::shared_ptr<ssl::context> context) -> void
+-  {
+-    auto connection = std::make_shared<ActiveConnection>();
+-    if (!tryAddActiveConnection(connection))
+-    {
+-      closeSocket(socket);
+-      return;
+-    }
+-
+-    auto completed = std::make_shared<std::atomic<bool>>(false);
+-    std::thread worker(
+-      [this, socket = std::move(socket), connection, context = std::move(context), completed]() mutable noexcept -> void
+-      {
+-        try
+-        {
+-          handleTlsConnection(std::move(socket), *context, *connection);
+-        }
+-        catch (...)
+-        {
+-          reportCurrentException(options_.errorReporter, "HttpServerRuntime");
+-          stopRequested_.store(true);
+-          wakeAcceptLoop();
+-        }
+-
+-        removeActiveConnection(connection);
+-        completed->store(true);
+-      });
+-
+-    addConnectionWorker(std::move(worker), std::move(completed));
+-  }
+-#endif
+-
+   auto dispatch(const beast_http::request<beast_http::string_body> &request) -> http::ServerResponse
+   {
+     const std::optional<http::ServerRequestMethod> method = toServerRequestMethod(request.method());
+@@ -779,46 +553,41 @@
+     return handler(translated);
+   }
+ 
+-  auto handlePlainConnection(tcp::socket socket, ActiveConnection &connection) -> void
++  auto handlePlainConnection(tcp::socket socket) -> void
+   {
+-    beast::tcp_stream stream {std::move(socket)};
+-
+     beast::flat_buffer buffer;
+     beast_http::request<beast_http::string_body> request;
+ 
+     beast::error_code error;
+-    {
+-      ActiveConnectionCloseGuard closeGuard(connection, [&stream]() noexcept -> void { closeConnectionStream(stream); });
+-      applyConnectionTimeout(stream, options_.connectionIoTimeout);
+-      beast_http::read(stream, buffer, request, error);
+-    }
++    beast_http::read(socket, buffer, request, error);
+     if (error)
+     {
+       return;
+     }
+ 
+-    const beast_http::response<beast_http::string_body> response = toBeastResponse(request, dispatch(request));
++    const http::ServerResponse translated = dispatch(request);
++    const beast_http::response<beast_http::string_body> response = toBeastResponse(request, translated);
++    beast_http::write(socket, response, error);
+ 
++    const bool holdSseOpen = translated.sse.has_value() && !translated.sse->terminateStream;
++    if (holdSseOpen)
+     {
+-      ActiveConnectionCloseGuard closeGuard(connection, [&stream]() noexcept -> void { closeConnectionStream(stream); });
+-      applyConnectionTimeout(stream, options_.connectionIoTimeout);
+-      beast_http::write(stream, response, error);
++      while (!stopRequested_.load())
++      {
++        std::this_thread::sleep_for(std::chrono::milliseconds(250));
++      }
+     }
+ 
+-    stream.socket().shutdown(tcp::socket::shutdown_both, error);
++    socket.shutdown(tcp::socket::shutdown_both, error);
+   }
+ 
+ #if MCP_SDK_ENABLE_TLS
+-  auto handleTlsConnection(tcp::socket socket, ssl::context &context, ActiveConnection &connection) -> void
++  auto handleTlsConnection(tcp::socket socket, ssl::context &context) -> void
+   {
+-    TlsServerStream stream(std::move(socket), context);
++    ssl::stream<tcp::socket> stream(std::move(socket), context);
+ 
+     beast::error_code error;
+-    {
+-      ActiveConnectionCloseGuard closeGuard(connection, [&stream]() noexcept -> void { closeConnectionStream(stream); });
+-      applyConnectionTimeout(stream, options_.connectionIoTimeout);
+-      stream.handshake(ssl::stream_base::server, error);
+-    }
++    stream.handshake(ssl::stream_base::server, error);
+     if (error)
+     {
+       return;
+@@ -826,36 +595,32 @@
+ 
+     beast::flat_buffer buffer;
+     beast_http::request<beast_http::string_body> request;
+-    {
+-      ActiveConnectionCloseGuard closeGuard(connection, [&stream]() noexcept -> void { closeConnectionStream(stream); });
+-      applyConnectionTimeout(stream, options_.connectionIoTimeout);
+-      beast_http::read(stream, buffer, request, error);
+-    }
++    beast_http::read(stream, buffer, request, error);
+     if (error)
+     {
+       return;
+     }
+ 
+-    const beast_http::response<beast_http::string_body> response = toBeastResponse(request, dispatch(request));
++    const http::ServerResponse translated = dispatch(request);
++    const beast_http::response<beast_http::string_body> response = toBeastResponse(request, translated);
++    beast_http::write(stream, response, error);
+ 
++    const bool holdSseOpen = translated.sse.has_value() && !translated.sse->terminateStream;
++    if (holdSseOpen)
+     {
+-      ActiveConnectionCloseGuard closeGuard(connection, [&stream]() noexcept -> void { closeConnectionStream(stream); });
+-      applyConnectionTimeout(stream, options_.connectionIoTimeout);
+-      beast_http::write(stream, response, error);
++      while (!stopRequested_.load())
++      {
++        std::this_thread::sleep_for(std::chrono::milliseconds(250));
++      }
+     }
+ 
+-    {
+-      ActiveConnectionCloseGuard closeGuard(connection, [&stream]() noexcept -> void { closeConnectionStream(stream); });
+-      applyConnectionTimeout(stream, options_.connectionIoTimeout);
+-      stream.shutdown(error);
+-    }
++    stream.shutdown(error);
+   }
+ #endif
+ 
+   auto wakeAcceptLoop() const noexcept -> void
+   {
+-    const std::uint16_t localPort = localPort_.load();
+-    if (localPort == 0)
++    if (localPort_ == 0)
+     {
+       return;
+     }
+@@ -865,7 +630,7 @@
+       asio::io_context ioContext {1};
+       tcp::socket socket {ioContext};
+       beast::error_code error;
+-      socket.connect({asio::ip::address_v4::loopback(), localPort}, error);
++      socket.connect({asio::ip::address_v4::loopback(), localPort_}, error);
+     }
+     catch (...)
+     {
+@@ -877,12 +642,9 @@
+   std::thread serverThread_;
+   std::atomic<bool> stopRequested_ {false};
+   std::atomic<bool> running_ {false};
+-  mutable std::mutex lifecycleMutex_;
+   mutable std::mutex mutex_;
+-  mutable std::mutex connectionMutex_;
+-  std::vector<ConnectionWorker> connectionWorkers_;
+-  std::vector<std::shared_ptr<ActiveConnection>> activeConnections_;
+-  std::atomic<std::uint16_t> localPort_ {0};
++  std::vector<std::thread> activeConnections_;
++  std::uint16_t localPort_ = 0;
+ };
+ 
+ struct HttpClientRuntime::Impl
+@@ -992,11 +754,11 @@
+       if (options_.tls.verifyPeer)
+       {
+         // Use rfc2818_verification for Boost < 1.73, host_name_verification for newer versions
+-#  if BOOST_VERSION >= 107300
++#if BOOST_VERSION >= 107300
+         stream.set_verify_callback(ssl::host_name_verification(sniHost));
+-#  else
++#else
+         stream.set_verify_callback(ssl::rfc2818_verification(sniHost));
+-#  endif
++#endif
+       }
+     }
+ 
+@@ -1080,4 +842,4 @@
+ // NOLINTEND(misc-include-cleaner, llvm-prefer-static-over-anonymous-namespace, readability-identifier-naming,
+ // cppcoreguidelines-avoid-magic-numbers, readability-magic-numbers, bugprone-unused-return-value, cert-err33-c, hicpp-signed-bitwise,
+ // google-runtime-int, modernize-use-trailing-return-type, readability-implicit-bool-conversion, performance-no-automatic-move,
+-// bugprone-empty-catch, cppcoreguidelines-pro-bounds-array-to-pointer-decay, hicpp-no-array-decay, modernize-return-braced-init-list)
+\ No newline at end of file
++// bugprone-empty-catch, cppcoreguidelines-pro-bounds-array-to-pointer-decay, hicpp-no-array-decay, modernize-return-braced-init-list)
