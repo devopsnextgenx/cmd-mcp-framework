@@ -1,4 +1,4 @@
-*.hpp
 *.h
+*.hpp
 *.c
 *.cpp
