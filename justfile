@@ -15,8 +15,8 @@ start:
     sleep 5
     npx @modelcontextprotocol/inspector --url http://localhost:5432/mcp --transport http
 
-start-docker:
+startd:
     #!/usr/bin/env bash
-    docker run --rm --name cmd-mcp-framework-test -p 5432:5432 -p 5433:5433 -p 6543:6543 -e FASTMCP_MCP_DEBUG=1 localhost/cmd-mcp-server:local &
+    docker run --rm --name cmd-mcp-framework-test -p 5432:5432 -p 5433:5433 -p 6543:6543 -e FASTMCP_MCP_DEBUG=1 docker.io/amitkshirsagar13/cmd-mcp-server:latest &
     sleep 5
     npx @modelcontextprotocol/inspector --url http://localhost:5432/mcp --transport http
