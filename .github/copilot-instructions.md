@@ -17,5 +17,7 @@ Type `/graphify` in Copilot Chat to build or update the graph.
 When writing, refactoring, or troubleshooting code, always ensure the changes adhere to the project's build system.
 
 - **Primary Build Command:** `bash build.sh`
+- **Docker Build Command:** `docker build -t cmd-mcp-server:local .`
 - **Development/Watch Command[mcp server]:** `FASTMCP_MCP_DEBUG=1 ./build/bin/fastmcp_server`
+- **docker run Command[mcp server]:** `docker run --rm --name cmd-mcp-framework-test -p 5432:5432 -p 5433:5433 -p 6543:6543 -e FASTMCP_MCP_DEBUG=1 localhost/cmd-mcp-server:local`
 - **Development/Watch Command[mcp-apps/dashboard-ui]:** `cd mcp-apps/dashboard-ui && npm run start`
