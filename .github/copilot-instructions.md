@@ -11,3 +11,11 @@ graph. Only read source files when (a) modifying/debugging specific code, (b) th
 the needed detail, or (c) the graph is missing or stale.
 
 Type `/graphify` in Copilot Chat to build or update the graph.
+
+## Build & Compilation Instructions
+
+When writing, refactoring, or troubleshooting code, always ensure the changes adhere to the project's build system.
+
+- **Primary Build Command:** `bash build.sh`
+- **Development/Watch Command[mcp server]:** `FASTMCP_MCP_DEBUG=1 ./build/bin/fastmcp_server`
+- **Development/Watch Command[mcp-apps/dashboard-ui]:** `cd mcp-apps/dashboard-ui && npm run start`
