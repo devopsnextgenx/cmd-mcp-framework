@@ -145,6 +145,7 @@ endif()
 # Sub-projects
 # ---------------------------------------------------------------------------
 add_subdirectory(projects/cmd_sdk)
+add_subdirectory(projects/cmdsdk_bridge)
 add_subdirectory(projects/plugins/math_cmd_provider)
 add_subdirectory(projects/plugins/greeting_cmd_provider)
 add_subdirectory(projects/fastmcp_server)

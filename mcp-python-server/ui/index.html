@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Python MCP Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="bg-grid"></div>
+    <main class="container">
+      <header class="hero">
+        <p class="eyebrow">cmd-sdk bridge host</p>
+        <h1>Python MCP + REST Control Plane</h1>
+        <p>
+          Streamable MCP endpoint runs on <strong>5432</strong>, REST and Swagger run on
+          <strong>5433</strong>.
+        </p>
+      </header>
+
+      <section class="card">
+        <h2>Endpoints</h2>
+        <ul class="endpoint-list">
+          <li><span>MCP</span><code>POST /mcp</code></li>
+          <li><span>MCP</span><code>GET /mcp</code></li>
+          <li><span>MCP</span><code>DELETE /mcp</code></li>
+          <li><span>REST</span><code>GET /api/commands</code></li>
+          <li><span>REST</span><code>POST /api/commands/{command_name}</code></li>
+          <li><span>REST</span><code>GET /docs</code></li>
+        </ul>
+      </section>
+
+      <section class="card two-col">
+        <div>
+          <h2>Client Registration Config</h2>
+          <label for="clientType">Choose client profile</label>
+          <select id="clientType">
+            <option value="claude">Claude Desktop</option>
+            <option value="chatgpt">ChatGPT Desktop</option>
+            <option value="vscode">VS Code Copilot</option>
+          </select>
+          <p class="hint">This JSON is generated for endpoint registration hints.</p>
+          <pre><code id="clientConfig"></code></pre>
+        </div>
+
+        <div>
+          <h2>Register Local Client</h2>
+          <form id="registerForm" class="stack">
+            <label>
+              Client Name
+              <input id="clientName" placeholder="team-dev-client" required />
+            </label>
+            <label>
+              Session Token
+              <input id="sessionToken" placeholder="dev-session-01" required />
+            </label>
+            <button type="submit">Register</button>
+          </form>
+          <div id="registerMessage" class="hint"></div>
+          <pre><code id="registeredClients"></code></pre>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>MCP Test Console</h2>
+        <p class="hint">
+          Send JSON-RPC payloads to MCP through REST proxy. Try tools/list first.
+        </p>
+        <form id="mcpForm" class="stack">
+          <label>
+            Session Id
+            <input id="testSessionId" value="default" />
+          </label>
+          <label>
+            Request Body
+            <textarea id="mcpPayload" rows="14"></textarea>
+          </label>
+          <button type="submit">Send Request</button>
+        </form>
+        <pre><code id="mcpResponse"></code></pre>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
