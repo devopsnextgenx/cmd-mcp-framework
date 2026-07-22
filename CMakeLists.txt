@@ -256,21 +256,34 @@ if(BUILD_MCP_UI AND NPM_EXECUTABLE AND NODE_EXECUTABLE)
   # This runs after the UI is built and only if index.html exists
   if(CMAKE_CXX_COMPILER)
     set(UI_HEADER_FILE "${CMAKE_BINARY_DIR}/generated/mcp_ui_artifact.h")
+    set(EMBED_UI_SCRIPT "${CMAKE_BINARY_DIR}/cmake/embed_mcp_ui.cmake")
+
+    file(GENERATE OUTPUT "${EMBED_UI_SCRIPT}" CONTENT [=[
+file(WRITE "${OUTPUT_FILE}" "// Auto-generated MCP UI artifact\n")
+file(APPEND "${OUTPUT_FILE}" "#ifndef MCP_UI_ARTIFACT_H\n")
+file(APPEND "${OUTPUT_FILE}" "#define MCP_UI_ARTIFACT_H\n\n")
+file(APPEND "${OUTPUT_FILE}" "// Index.html content\n")
+file(APPEND "${OUTPUT_FILE}" "const char* MCP_UI_INDEX_HTML = R\"raw_content(\n")
+
+if(EXISTS "${INPUT_FILE}")
+  file(READ "${INPUT_FILE}" UI_INDEX_HTML)
+  file(APPEND "${OUTPUT_FILE}" "${UI_INDEX_HTML}")
+else()
+  file(APPEND "${OUTPUT_FILE}" "// index.html not found")
+endif()
+
+file(APPEND "${OUTPUT_FILE}" "\n)raw_content\";\n\n")
+file(APPEND "${OUTPUT_FILE}" "#endif // MCP_UI_ARTIFACT_H\n")
+]=])
     
     # Create a custom target that generates the header after the UI is built
     add_custom_target(embed_mcp_ui_in_cpp
       DEPENDS ${UI_BUILD_STAMP}
       COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/generated"
-      COMMAND ${CMAKE_COMMAND} -E echo "// Auto-generated MCP UI artifact" > ${UI_HEADER_FILE}
-      COMMAND ${CMAKE_COMMAND} -E echo "#ifndef MCP_UI_ARTIFACT_H" >> ${UI_HEADER_FILE}
-      COMMAND ${CMAKE_COMMAND} -E echo "#define MCP_UI_ARTIFACT_H" >> ${UI_HEADER_FILE}
-      COMMAND ${CMAKE_COMMAND} -E echo "" >> ${UI_HEADER_FILE}
-      COMMAND ${CMAKE_COMMAND} -E echo "// Index.html content" >> ${UI_HEADER_FILE}
-      COMMAND ${CMAKE_COMMAND} -E echo "const char* MCP_UI_INDEX_HTML = R\"raw_content(" >> ${UI_HEADER_FILE}
-      COMMAND ${CMAKE_COMMAND} -E cat ${UI_OUTPUT_DIR}/index.html >> ${UI_HEADER_FILE} 2>/dev/null || ${CMAKE_COMMAND} -E echo "// index.html not found" >> ${UI_HEADER_FILE}
-      COMMAND ${CMAKE_COMMAND} -E echo ")raw_content\";" >> ${UI_HEADER_FILE}
-      COMMAND ${CMAKE_COMMAND} -E echo "" >> ${UI_HEADER_FILE}
-      COMMAND ${CMAKE_COMMAND} -E echo "#endif // MCP_UI_ARTIFACT_H" >> ${UI_HEADER_FILE}
+      COMMAND ${CMAKE_COMMAND}
+              -DINPUT_FILE=${UI_OUTPUT_DIR}/index.html
+              -DOUTPUT_FILE=${UI_HEADER_FILE}
+              -P ${EMBED_UI_SCRIPT}
       COMMENT "Embedding UI in C++ header (if index.html exists)..."
       VERBATIM
     )
