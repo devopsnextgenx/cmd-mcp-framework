@@ -19,10 +19,12 @@ fi
 if [ ! -d "$VENV_DIR" ]; then
   echo "Creating virtual environment at $VENV_DIR"
   "$PYTHON_BIN" -m venv "$VENV_DIR"
+fi
 
+if ! "$VENV_DIR/bin/python" -c "import mcp_python_server" >/dev/null 2>&1; then
   echo "Installing project dependencies"
   "$VENV_DIR/bin/python" -m pip install --upgrade pip
-  "$VENV_DIR/bin/pip" install -e "$PROJECT_DIR"
+  "$VENV_DIR/bin/python" -m pip install -e "$PROJECT_DIR"
 fi
 
 cd "$PROJECT_DIR"

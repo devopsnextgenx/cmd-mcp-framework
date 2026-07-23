@@ -4,7 +4,7 @@ Python host process for:
 - MCP streamable HTTP server on port 5432
 - REST API server on port 5433
 - Swagger documentation for REST endpoints
-- Dynamic command/tool execution through cmdsdk_bridge.dll and plugin DLLs
+- Dynamic command/tool execution through cmdsdk_bridge shared library and plugin shared libraries
 
 ## Prerequisites
 
@@ -14,7 +14,9 @@ Python host process for:
 bash build.sh
 ```
 
-2. Ensure bridge and plugin DLLs exist in `build/bin`.
+2. Ensure bridge and plugin shared libraries exist.
+  - Linux/macOS: `build/lib`
+  - Windows: `build/bin`
 
 ## Python setup with uv
 
@@ -31,11 +33,15 @@ uv run mcp-python-server
 
 ## Environment variables
 
-- `MCP_PYTHON_BRIDGE_DLL`:
-  - Default: `../build/bin/cmdsdk_bridge.dll`
-- `MCP_PYTHON_PLUGIN_DLLS`:
+- `MCP_PYTHON_BRIDGE_LIB` (or legacy `MCP_PYTHON_BRIDGE_DLL`):
+  - Default (Linux): `../build/lib/libcmdsdk_bridge.so`
+  - Default (macOS): `../build/lib/libcmdsdk_bridge.dylib`
+  - Default (Windows): `../build/bin/cmdsdk_bridge.dll`
+- `MCP_PYTHON_PLUGIN_LIBS` (or legacy `MCP_PYTHON_PLUGIN_DLLS`):
   - Semicolon/comma-separated plugin list.
-  - Default: `../build/bin/greeting_cmd_provider.dll,../build/bin/math_cmd_provider.dll`
+  - Default (Linux): `../build/lib/libgreeting_cmd_provider.so,../build/lib/libmath_cmd_provider.so`
+  - Default (macOS): `../build/lib/libgreeting_cmd_provider.dylib,../build/lib/libmath_cmd_provider.dylib`
+  - Default (Windows): `../build/bin/greeting_cmd_provider.dll,../build/bin/math_cmd_provider.dll`
 - `MCP_PYTHON_MCP_HOST`: default `0.0.0.0`
 - `MCP_PYTHON_MCP_PORT`: default `5432`
 - `MCP_PYTHON_MCP_PATH`: default `/mcp`
