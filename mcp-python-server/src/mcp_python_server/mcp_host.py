@@ -71,6 +71,14 @@ def create_mcp_server(bridge: BridgeClient) -> FastMCP:
             "External resources from mcp-apps are also served as resources."
         )
 
+    @mcp.resource("ui://ui/{filename}", mime_type="text/html;profile=mcp-app")
+    def ui_resource_handler(filename: str) -> str:
+        """Dynamically fetch any ui://ui/<filename> resource at runtime via the mcp-apps server."""
+        resource_uri = f"ui://ui/{filename}"
+        print(f"Fetching UI resource for URI: {resource_uri}")
+        content = _read_mcp_app_resource(bridge, resource_uri)
+        return content if content else f"<p>No content available for {resource_uri}</p>"
+
     return mcp
 
 
@@ -270,7 +278,8 @@ def register_external_resource(
             return f"<p>Error loading resource: {str(e)}</p>"
     
     # Register the resource with FastMCP using the manifest metadata
-    mcp.resource(ext_resource.uri, name=ext_resource.name, description=ext_resource.description)(
+    mime_type = (ext_resource.mime_type or "text/plain") + ";profile=mcp-app"
+    mcp.resource(ext_resource.uri, name=ext_resource.name, description=ext_resource.description, mime_type=mime_type)(
         resource_content_provider
     )
 
