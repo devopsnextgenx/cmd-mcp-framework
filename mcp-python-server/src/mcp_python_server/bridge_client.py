@@ -4,6 +4,8 @@ import ctypes
 import json
 from pathlib import Path
 from typing import Any
+import urllib.request
+import urllib.error
 
 
 class BridgeError(RuntimeError):
@@ -95,6 +97,59 @@ class BridgeClient:
 
     def last_error(self) -> str:
         return self._read_allocated_string(self._dll.cmdsdk_bridge_last_error())
+
+    def read_resource(self, resource_uri: str) -> str:
+        """
+        Read MCP app resource content via HTTP from the mcp-apps server.
+        
+        Mirrors C++ readMcpAppResource: converts resource URI to HTTP path
+        and fetches content from localhost:6543 (default mcp-apps port).
+        
+        Supports URI schemes like:
+        - mcp-app://approval-panel/approval-panel.html → /approval-panel.html
+        """
+        try:
+            # Convert mcp-app:// URIs to HTTP paths
+            path = self._uri_to_path(resource_uri)
+            if not path:
+                return ""
+            
+            # Ensure path starts with /
+            if not path.startswith("/"):
+                path = "/" + path
+            
+            # Fetch from mcp-apps server (default: localhost:6543)
+            mcp_apps_host = "localhost"
+            mcp_apps_port = 6543
+            
+            url = f"http://{mcp_apps_host}:{mcp_apps_port}{path}"
+            
+            with urllib.request.urlopen(url, timeout=2) as response:
+                if response.status == 200:
+                    content = response.read().decode("utf-8")
+                    return content
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError):
+            pass
+        
+        return ""
+
+    def _uri_to_path(self, uri: str) -> str:
+        """
+        Convert mcp-app:// URI to HTTP path.
+        
+        Examples:
+        - mcp-app://approval-panel/approval-panel.html → /approval-panel/approval-panel.html
+        - mcp-app://dashboard-ui/index.html → /dashboard-ui/index.html
+        """
+        if not uri or not isinstance(uri, str):
+            return ""
+        
+        # Handle mcp-app:// scheme
+        if uri.startswith("mcp-app://"):
+            return uri[9:]  # Remove "mcp-app://" prefix and keep the rest
+        
+        # For other schemes or plain paths, return as-is
+        return uri
 
     def _read_allocated_string(self, pointer: int | None) -> str:
         if not pointer:

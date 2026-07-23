@@ -21,14 +21,28 @@ def create_mcp_server(bridge: BridgeClient) -> FastMCP:
     commands_payload = bridge.list_commands()
     commands: list[dict[str, Any]] = commands_payload.get("commands", [])
 
+    # Track resources to avoid duplicates
+    seen_resource_uris: set[str] = set()
+
     for command in commands:
         register_bridge_tool(mcp, bridge, command)
+        
+        # Register resources for app tools
+        is_app_tool = bool(command.get("is_app_tool", False))
+        resource_uri = command.get("resource_uri", "").strip()
+        
+        if is_app_tool and resource_uri and resource_uri not in seen_resource_uris:
+            cmd_name = command.get("cmd_name", "")
+            description = command.get("description", "Bridge command UI")
+            register_app_tool_resource(mcp, bridge, resource_uri, cmd_name, description)
+            seen_resource_uris.add(resource_uri)
 
     @mcp.resource("docs://overview")
     def docs_overview() -> str:
         return (
             "This MCP server is hosted by Python and backed by cmdsdk_bridge. "
-            "Plugin commands are loaded from DLLs and registered as MCP tools."
+            "Plugin commands are loaded from DLLs and registered as MCP tools. "
+            "UI-enabled commands are exposed as app tools with card-based UIs."
         )
 
     return mcp
@@ -55,6 +69,51 @@ def register_bridge_tool(mcp: FastMCP, bridge: BridgeClient, command_meta: dict[
     registered_tool = mcp._tool_manager.get_tool(command_name)
     if registered_tool is not None:
         registered_tool.parameters = copy.deepcopy(input_schema)
+
+
+def register_app_tool_resource(
+    mcp: FastMCP, 
+    bridge: BridgeClient, 
+    resource_uri: str, 
+    cmd_name: str,
+    description: str
+) -> None:
+    """
+    Register a resource for an app tool (card-based UI).
+    
+    Mirrors the C++ implementation: creates a resource handler that reads
+    HTML content from the bridge for the given resource_uri, enabling
+    card-based UI rendering in chat clients.
+    """
+    resource_name = f"UI resource for {cmd_name}"
+    
+    def resource_content_provider() -> str:
+        """Fetch the HTML content for the app tool resource."""
+        try:
+            # Attempt to read the MCP app resource via bridge
+            content = _read_mcp_app_resource(bridge, resource_uri)
+            return content if content else f"<p>No UI available for {cmd_name}</p>"
+        except Exception as e:
+            return f"<p>Error loading UI for {cmd_name}: {str(e)}</p>"
+    
+    # Register the resource with FastMCP
+    mcp.resource(resource_uri, name=resource_name, description=description)(
+        resource_content_provider
+    )
+
+
+def _read_mcp_app_resource(bridge: BridgeClient, resource_uri: str) -> str:
+    """
+    Read MCP app resource content via the bridge.
+    
+    Attempts to retrieve HTML or other resource content from the mcp-apps server
+    for serving UI to chat clients. Mirrors fastmcp::readMcpAppResource from C++.
+    """
+    try:
+        content = bridge.read_resource(resource_uri)
+        return content if content else ""
+    except Exception:
+        return ""
 
 
 def _build_input_schema(command_meta: dict[str, Any]) -> dict[str, Any]:
