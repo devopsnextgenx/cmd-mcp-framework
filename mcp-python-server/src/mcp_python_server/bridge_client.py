@@ -12,6 +12,16 @@ class BridgeError(RuntimeError):
     pass
 
 
+class ExternalResourceInfo:
+    """Represents a resource from the external resource manifest."""
+    def __init__(self, uri: str, name: str, description: str, mime_type: str, resource_url: str = ""):
+        self.uri = uri
+        self.name = name
+        self.description = description
+        self.mime_type = mime_type
+        self.resource_url = resource_url  # Direct URL to fetch the resource
+
+
 class BridgeClient:
     def __init__(self, dll_path: Path) -> None:
         if not dll_path.exists():
@@ -106,10 +116,10 @@ class BridgeClient:
         and fetches content from localhost:6543 (default mcp-apps port).
         
         Supports URI schemes like:
-        - mcp-app://approval-panel/approval-panel.html → /approval-panel.html
+        - ui://ui/math-form → /ui/math-form.html (via resource manifest)
         """
         try:
-            # Convert mcp-app:// URIs to HTTP paths
+            # Convert ui:// URIs to HTTP paths
             path = self._uri_to_path(resource_uri)
             if not path:
                 return ""
@@ -133,20 +143,95 @@ class BridgeClient:
         
         return ""
 
+    def fetch_external_resources(self) -> list[ExternalResourceInfo]:
+        """
+        Fetch the resource manifest from the mcp-apps server and extract resources.
+        
+        Mirrors C++ fetchExternalAppResources: reads /resource-manifest.json
+        and extracts all available external resources with their metadata.
+        """
+        resources: list[ExternalResourceInfo] = []
+        
+        try:
+            # Fetch resource manifest from mcp-apps server
+            url = "http://localhost:6543/resource-manifest.json"
+            with urllib.request.urlopen(url, timeout=2) as response:
+                if response.status == 200:
+                    manifest_data = json.loads(response.read().decode("utf-8"))
+                    
+                    if not isinstance(manifest_data, dict) or "resources" not in manifest_data:
+                        return resources
+                    
+                    for resource_entry in manifest_data["resources"]:
+                        if not isinstance(resource_entry, dict) or "uri" not in resource_entry:
+                            continue
+                        
+                        uri = resource_entry.get("uri", "").strip()
+                        if not uri:
+                            continue
+                        
+                        name = resource_entry.get("name", f"App Resource: {uri}")
+                        description = resource_entry.get("description", "Resource from local mcp-apps")
+                        mime_type = resource_entry.get("mimeType", "application/json")
+                        
+                        # Extract the actual resource URL from _meta if available
+                        resource_url = ""
+                        meta = resource_entry.get("_meta", {})
+                        if isinstance(meta, dict):
+                            ui_meta = meta.get("ui", {})
+                            if isinstance(ui_meta, dict):
+                                resource_url = ui_meta.get("resourceUri", "")
+                        
+                        resources.append(ExternalResourceInfo(
+                            uri=uri,
+                            name=name,
+                            description=description,
+                            mime_type=mime_type,
+                            resource_url=resource_url
+                        ))
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError, json.JSONDecodeError):
+            pass
+        
+        return resources
+
+    def fetch_resource_by_url(self, url: str) -> tuple[str, str]:
+        """
+        Fetch resource content from a direct URL.
+        
+        Returns tuple of (content, mime_type). If fetch fails, returns ("", "").
+        """
+        try:
+            with urllib.request.urlopen(url, timeout=2) as response:
+                if response.status == 200:
+                    content = response.read().decode("utf-8")
+                    # Try to get mime type from response headers
+                    content_type = response.headers.get("content-type", "application/json")
+                    # Extract mime type before semicolon if present
+                    mime_type = content_type.split(";")[0].strip()
+                    return content, mime_type
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError):
+            pass
+        
+        return "", ""
+
     def _uri_to_path(self, uri: str) -> str:
         """
-        Convert mcp-app:// URI to HTTP path.
+        Convert ui:// URI to HTTP path.
         
         Examples:
-        - mcp-app://approval-panel/approval-panel.html → /approval-panel/approval-panel.html
-        - mcp-app://dashboard-ui/index.html → /dashboard-ui/index.html
+        - ui://ui/math-form → /ui/math-form
+        - ui://ui/geo-form.html → /ui/geo-form.html
         """
         if not uri or not isinstance(uri, str):
             return ""
         
-        # Handle mcp-app:// scheme
-        if uri.startswith("mcp-app://"):
-            return uri[9:]  # Remove "mcp-app://" prefix and keep the rest
+        # Handle ui:// scheme
+        if uri.startswith("ui://"):
+            rest = uri[5:]  # Remove "ui://" prefix
+            # If it starts with "ui/", convert to path format
+            if rest.startswith("ui/"):
+                return "/" + rest
+            return "/" + rest
         
         # For other schemes or plain paths, return as-is
         return uri
