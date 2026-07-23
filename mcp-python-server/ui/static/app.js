@@ -7,6 +7,12 @@ const defaultPayload = {
 
 const initializeProtocolVersion = "2025-03-26";
 
+const mcpRequestHeaders = {
+  "Content-Type": "application/json",
+  Accept: "application/json, text/event-stream",
+  "MCP-Protocol-Version": initializeProtocolVersion
+};
+
 function getMcpEndpoint() {
   const url = new URL(window.location.href);
   url.port = "5432";
@@ -147,9 +153,7 @@ function buildInitializePayload(name) {
 async function createMcpSession(name) {
   const response = await fetch(getMcpEndpoint(), {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
+    headers: mcpRequestHeaders,
     body: JSON.stringify(buildInitializePayload(name))
   });
 
@@ -173,7 +177,7 @@ async function createMcpSession(name) {
   await fetch(getMcpEndpoint(), {
     method: "POST",
     headers: {
-      "Content-Type": "application/json",
+      ...mcpRequestHeaders,
       "MCP-Session-Id": sessionId
     },
     body: JSON.stringify({
@@ -239,7 +243,7 @@ async function registerClient(event) {
 async function sendMcpRequest(event) {
   event.preventDefault();
   const responseCode = document.getElementById("mcpResponse");
-  const sessionId = document.getElementById("testSessionId").value || "default";
+  const sessionId = document.getElementById("testSessionId").value.trim();
   const payloadRaw = document.getElementById("mcpPayload").value;
 
   let payload;
@@ -251,12 +255,14 @@ async function sendMcpRequest(event) {
   }
 
   try {
+    const headers = { ...mcpRequestHeaders };
+    if (sessionId) {
+      headers["MCP-Session-Id"] = sessionId;
+    }
+
     const response = await fetch(getMcpEndpoint(), {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "MCP-Session-Id": sessionId
-      },
+      headers,
       body: JSON.stringify(payload)
     });
 
