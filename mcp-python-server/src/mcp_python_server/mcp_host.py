@@ -25,7 +25,7 @@ def create_mcp_server(bridge: BridgeClient) -> FastMCP:
 
     # Track resources/tools to avoid duplicate registration
     seen_resource_uris: set[str] = set()
-    seen_tool_names: set[str] = {"bridge.session_state"}
+    seen_tool_names: set[str] = {"bridge_session_state"}
     seen_app_tool_names: set[str] = set()
 
     # Register command-based tools and resources
@@ -89,6 +89,7 @@ def register_bridge_tool(
     seen_tool_names: set[str] | None = None,
 ) -> None:
     command_name = command_meta.get("cmd_name", "")
+    sanitized_name = command_name.replace(".", "_") # fix for tool name issue from ui
     description = command_meta.get("description", "Bridge command")
     if not command_name:
         return
@@ -98,26 +99,26 @@ def register_bridge_tool(
     def tool_impl(**kwargs: Any) -> dict[str, Any]:
         return bridge.execute(session_id="default", command_name=command_name, arguments=kwargs)
 
-    tool_impl.__name__ = f"{command_name.replace('.', '_')}_tool"
+    tool_impl.__name__ = sanitized_name # f"{command_name.replace('.', '_')}_tool"
     tool_impl.__signature__ = _build_signature_from_schema(input_schema)
 
     # Skip duplicate tool names from repeated command metadata entries.
-    if seen_tool_names is not None and command_name in seen_tool_names:
+    if seen_tool_names is not None and sanitized_name in seen_tool_names:
         return
 
     existing_tool = mcp._tool_manager.get_tool(command_name) if hasattr(mcp, "_tool_manager") else None
     if existing_tool is not None:
         if seen_tool_names is not None:
-            seen_tool_names.add(command_name)
+            seen_tool_names.add(sanitized_name)
         return
 
     # Register one MCP tool per command metadata entry.
-    mcp.tool(name=command_name, title=command_name, description=description)(tool_impl)
+    mcp.tool(name=sanitized_name, title=command_name, description=description)(tool_impl)
     if seen_tool_names is not None:
         seen_tool_names.add(command_name)
 
     # Keep list_tools aligned with command metadata schema instead of Pydantic's expanded form.
-    registered_tool = mcp._tool_manager.get_tool(command_name)
+    registered_tool = mcp._tool_manager.get_tool(sanitized_name)
     if registered_tool is not None:
         registered_tool.parameters = copy.deepcopy(input_schema)
 
