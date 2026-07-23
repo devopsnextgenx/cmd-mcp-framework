@@ -5,6 +5,8 @@ const defaultPayload = {
   params: {}
 };
 
+const initializeProtocolVersion = "2025-03-26";
+
 function getMcpEndpoint() {
   const url = new URL(window.location.href);
   url.port = "5432";
@@ -126,6 +128,66 @@ function saveClients(items) {
   localStorage.setItem("mcpPythonClients", JSON.stringify(items));
 }
 
+function buildInitializePayload(name) {
+  return {
+    jsonrpc: "2.0",
+    id: `initialize-${Date.now()}`,
+    method: "initialize",
+    params: {
+      protocolVersion: initializeProtocolVersion,
+      capabilities: {},
+      clientInfo: {
+        name,
+        version: "0.1.0"
+      }
+    }
+  };
+}
+
+async function createMcpSession(name) {
+  const response = await fetch(getMcpEndpoint(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(buildInitializePayload(name))
+  });
+
+  const contentType = response.headers.get("content-type") || "";
+  const body = contentType.includes("application/json") ? await response.json() : await response.text();
+
+  if (!response.ok) {
+    throw new Error(pretty({ status: response.status, body }));
+  }
+
+  const sessionId =
+    response.headers.get("mcp-session-id") ||
+    body?.sessionId ||
+    body?.result?.sessionId ||
+    null;
+
+  if (!sessionId) {
+    throw new Error("MCP initialize succeeded but did not return a session ID");
+  }
+
+  await fetch(getMcpEndpoint(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "MCP-Session-Id": sessionId
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      method: "notifications/initialized"
+    })
+  });
+
+  return {
+    sessionId,
+    initializeResponse: body
+  };
+}
+
 function renderClientConfig() {
   const select = document.getElementById("clientType");
   const code = document.getElementById("clientConfig");
@@ -139,8 +201,9 @@ function renderRegisteredClients() {
   code.textContent = pretty(loadClients());
 }
 
-function registerClient(event) {
+async function registerClient(event) {
   event.preventDefault();
+  const registerMessage = document.getElementById("registerMessage");
   const name = document.getElementById("clientName").value.trim();
   const token = document.getElementById("sessionToken").value.trim();
   const type = document.getElementById("clientType").value;
@@ -149,18 +212,28 @@ function registerClient(event) {
     return;
   }
 
-  const clients = loadClients();
-  clients.push({
-    name,
-    token,
-    type,
-    endpoint: getMcpEndpoint(),
-    registeredAt: new Date().toISOString()
-  });
+  registerMessage.textContent = "Creating MCP session...";
 
-  saveClients(clients);
-  document.getElementById("registerMessage").textContent = `Registered ${name} (${type})`;
-  renderRegisteredClients();
+  try {
+    const { sessionId, initializeResponse } = await createMcpSession(name);
+    const clients = loadClients();
+    clients.push({
+      name,
+      token,
+      type,
+      endpoint: getMcpEndpoint(),
+      sessionId,
+      initializeResponse,
+      registeredAt: new Date().toISOString()
+    });
+
+    saveClients(clients);
+    document.getElementById("testSessionId").value = sessionId;
+    registerMessage.textContent = `Registered ${name} (${type}) with sessionId ${sessionId}`;
+    renderRegisteredClients();
+  } catch (error) {
+    registerMessage.textContent = `Registration failed: ${error}`;
+  }
 }
 
 async function sendMcpRequest(event) {
