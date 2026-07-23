@@ -36,6 +36,70 @@ function pretty(value) {
   return JSON.stringify(value, null, 2);
 }
 
+function detectProtocolLabel(url) {
+  if (url.includes("/mcp")) {
+    return "MCP";
+  }
+  if (url.includes("/api/")) {
+    return "REST";
+  }
+  return null;
+}
+
+function installFetchLoggingInterceptor() {
+  const originalFetch = window.fetch.bind(window);
+
+  window.fetch = async (input, init = {}) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    const protocol = detectProtocolLabel(url);
+
+    if (!protocol) {
+      return originalFetch(input, init);
+    }
+
+    const method = (init.method || "GET").toUpperCase();
+    const requestHeaders = init.headers || {};
+    const requestBody = init.body ?? null;
+
+    console.log(`[${protocol}] Request`, {
+      method,
+      url,
+      headers: requestHeaders,
+      body: requestBody
+    });
+
+    try {
+      const response = await originalFetch(input, init);
+      const responseClone = response.clone();
+      const contentType = responseClone.headers.get("content-type") || "";
+      let responseBody;
+
+      if (contentType.includes("application/json")) {
+        responseBody = await responseClone.json();
+      } else {
+        responseBody = await responseClone.text();
+      }
+
+      console.log(`[${protocol}] Response`, {
+        method,
+        url,
+        status: response.status,
+        headers: Object.fromEntries(response.headers.entries()),
+        body: responseBody
+      });
+
+      return response;
+    } catch (error) {
+      console.error(`[${protocol}] Request failed`, {
+        method,
+        url,
+        error
+      });
+      throw error;
+    }
+  };
+}
+
 function loadClients() {
   const raw = localStorage.getItem("mcpPythonClients");
   if (!raw) {
@@ -103,7 +167,7 @@ async function sendMcpRequest(event) {
   }
 
   try {
-    const response = await fetch("/api/mcp-proxy", {
+    const response = await fetch("/mcp", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -121,6 +185,7 @@ async function sendMcpRequest(event) {
 }
 
 function setup() {
+  installFetchLoggingInterceptor();
   document.getElementById("mcpPayload").value = pretty(defaultPayload);
   document.getElementById("clientType").addEventListener("change", renderClientConfig);
   document.getElementById("registerForm").addEventListener("submit", registerClient);
