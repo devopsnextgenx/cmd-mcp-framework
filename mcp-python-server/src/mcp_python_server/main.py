@@ -4,6 +4,7 @@ import asyncio
 from contextlib import suppress
 
 import uvicorn
+from fastapi.middleware.cors import CORSMiddleware
 
 from .bridge_client import BridgeClient
 from .config import Settings
@@ -26,6 +27,15 @@ async def run_servers() -> None:
 
     mcp_server = create_mcp_server(bridge)
     mcp_app = mcp_server.streamable_http_app()
+    mcp_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            f"http://localhost:{settings.rest_port}",
+            f"http://127.0.0.1:{settings.rest_port}",
+        ],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     rest_app = create_rest_app(settings, bridge)
 

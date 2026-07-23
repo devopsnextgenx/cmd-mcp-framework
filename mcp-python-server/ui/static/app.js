@@ -5,12 +5,21 @@ const defaultPayload = {
   params: {}
 };
 
+function getMcpEndpoint() {
+  const url = new URL(window.location.href);
+  url.port = "5432";
+  url.pathname = "/mcp";
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
 const clientConfigs = {
   claude: {
     mcpServers: {
       "cmdsdk-python": {
         transport: "streamable_http",
-        url: "http://localhost:5432/mcp"
+        url: "__MCP_ENDPOINT__"
       }
     }
   },
@@ -18,7 +27,7 @@ const clientConfigs = {
     mcp_servers: {
       cmdsdk_python: {
         type: "http",
-        url: "http://localhost:5432/mcp"
+        url: "__MCP_ENDPOINT__"
       }
     }
   },
@@ -26,7 +35,7 @@ const clientConfigs = {
     servers: {
       "cmdsdk-python": {
         type: "http",
-        endpoint: "http://localhost:5432/mcp"
+        endpoint: "__MCP_ENDPOINT__"
       }
     }
   }
@@ -120,7 +129,9 @@ function saveClients(items) {
 function renderClientConfig() {
   const select = document.getElementById("clientType");
   const code = document.getElementById("clientConfig");
-  code.textContent = pretty(clientConfigs[select.value]);
+  const endpoint = getMcpEndpoint();
+  const config = JSON.parse(JSON.stringify(clientConfigs[select.value]).replaceAll("__MCP_ENDPOINT__", endpoint));
+  code.textContent = pretty(config);
 }
 
 function renderRegisteredClients() {
@@ -143,7 +154,7 @@ function registerClient(event) {
     name,
     token,
     type,
-    endpoint: "http://localhost:5432/mcp",
+    endpoint: getMcpEndpoint(),
     registeredAt: new Date().toISOString()
   });
 
@@ -167,7 +178,7 @@ async function sendMcpRequest(event) {
   }
 
   try {
-    const response = await fetch("/mcp", {
+    const response = await fetch(getMcpEndpoint(), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
