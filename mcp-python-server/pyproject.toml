@@ -1,0 +1,22 @@
+[project]
+name = "mcp-python-server"
+version = "0.1.0"
+description = "Python host for cmd_sdk bridge-backed MCP and REST servers"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.116.0",
+  "uvicorn[standard]>=0.35.0",
+  "httpx>=0.28.0",
+  "mcp>=1.12.0"
+]
+
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_python_server"]
+
+[project.scripts]
+mcp-python-server = "mcp_python_server.main:run"

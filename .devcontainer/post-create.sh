@@ -7,3 +7,6 @@ if [ -f "mcp-apps/dashboard-ui/package-lock.json" ]; then
 elif [ -f "mcp-apps/dashboard-ui/package.json" ]; then
   npm --prefix mcp-apps/dashboard-ui install
 fi
+
+# Create the Python virtual environment and install dependencies (first run only).
+bash mcp-python-server/start-with-venv.sh --setup-only
