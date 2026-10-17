@@ -2,6 +2,7 @@
 #include <memory>
 #include <string>
 #include <cmath>
+#include <functional>
 #include <unordered_map>
 
 #include <nlohmann/json.hpp>
@@ -83,6 +84,10 @@ static constexpr double PI = M_PI;
 
 class GeometryCmdProvider final : public cmdsdk::SubCmd {
  public:
+  // Handler types for the dispatcher maps.
+  using ExecHandler     = std::function<bool(GeometryCmdProvider*, const nlohmann::json&)>;
+  using ValidateHandler = std::function<bool(const nlohmann::json&, std::string&)>;
+
   GeometryCmdProvider() : cmdsdk::SubCmd() {
     setPluginName("GEO");
 
@@ -201,6 +206,87 @@ class GeometryCmdProvider final : public cmdsdk::SubCmd {
         "GEO.VOLUME.SPHERE",
         {"GEO.VOLUME.SPHERE",
          "Volume of a sphere. Params: radius."});
+
+    // ── Execution dispatcher ────────────────────────────────────────────────
+    // O(1) lookup in execute() replaces a 21-branch if-chain.
+    // To add a new shape: register its subtype above, add entries here and in
+    // the validator map, then implement the private exec/validate methods.
+    exec_dispatcher_ = {
+      {"GEO.PERIMETER.TRIANGLE",   [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execPerimeterTriangle(in);   }},
+      {"GEO.PERIMETER.RECTANGLE",  [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execPerimeterRectangle(in);  }},
+      {"GEO.PERIMETER.CIRCLE",     [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execPerimeterCircle(in);     }},
+      {"GEO.AREA.TRIANGLE",        [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execAreaTriangle(in);        }},
+      {"GEO.AREA.RECTANGLE",       [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execAreaRectangle(in);       }},
+      {"GEO.AREA.CIRCLE",          [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execAreaCircle(in);          }},
+      {"GEO.AREA.SPHERE",          [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execAreaSphere(in);          }},
+      {"GEO.AREA.PYRAMID",         [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execAreaPyramid(in);         }},
+      {"GEO.AREA.TETRAHEDRON",     [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execAreaTetrahedron(in);     }},
+      {"GEO.AREA.CUBE",            [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execAreaCube(in);            }},
+      {"GEO.AREA.CUBOID",          [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execAreaCuboid(in);          }},
+      {"GEO.AREA.PRISM",           [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execAreaPrism(in);           }},
+      {"GEO.AREA.CYLINDER",        [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execAreaCylinder(in);        }},
+      {"GEO.AREA.CONE",            [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execAreaCone(in);            }},
+      {"GEO.VOLUME.PYRAMID",       [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execVolumePyramid(in);       }},
+      {"GEO.VOLUME.TETRAHEDRON",   [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execVolumeTetrahedron(in);   }},
+      {"GEO.VOLUME.CUBE",          [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execVolumeCube(in);          }},
+      {"GEO.VOLUME.CUBOID",        [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execVolumeCuboid(in);        }},
+      {"GEO.VOLUME.PRISM",         [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execVolumePrism(in);         }},
+      {"GEO.VOLUME.CYLINDER",      [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execVolumeCylinder(in);      }},
+      {"GEO.VOLUME.CONE",          [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execVolumeCone(in);          }},
+      {"GEO.VOLUME.SPHERE",        [](GeometryCmdProvider* s, const nlohmann::json& in){ return s->execVolumeSphere(in);        }},
+    };
+
+    // ── Validation dispatcher ───────────────────────────────────────────────
+    // Maps each subtype to its parameter-validation lambda (free function, no
+    // instance capture needed since requirePositive is a static helper).
+    validate_dispatcher_ = {
+      {"GEO.PERIMETER.TRIANGLE",  [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"a",err) && requirePositive(in,"b",err) && requirePositive(in,"c",err)
+              && validateTriangleInequalityStatic(in,err); }},
+      {"GEO.AREA.TRIANGLE",       [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"a",err) && requirePositive(in,"b",err) && requirePositive(in,"c",err)
+              && validateTriangleInequalityStatic(in,err); }},
+      {"GEO.PERIMETER.RECTANGLE", [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"a",err) && requirePositive(in,"b",err); }},
+      {"GEO.AREA.RECTANGLE",      [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"a",err) && requirePositive(in,"b",err); }},
+      {"GEO.PERIMETER.CIRCLE",    [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"radius",err); }},
+      {"GEO.AREA.CIRCLE",         [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"radius",err); }},
+      {"GEO.AREA.SPHERE",         [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"radius",err); }},
+      {"GEO.VOLUME.SPHERE",       [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"radius",err); }},
+      {"GEO.AREA.PYRAMID",        [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"a",err) && requirePositive(in,"slant",err); }},
+      {"GEO.AREA.TETRAHEDRON",    [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"side",err); }},
+      {"GEO.VOLUME.TETRAHEDRON",  [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"side",err); }},
+      {"GEO.AREA.CUBE",           [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"side",err); }},
+      {"GEO.VOLUME.CUBE",         [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"side",err); }},
+      {"GEO.VOLUME.PYRAMID",      [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"a",err) && requirePositive(in,"height",err); }},
+      {"GEO.VOLUME.CUBOID",       [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"a",err) && requirePositive(in,"b",err) && requirePositive(in,"height",err); }},
+      {"GEO.VOLUME.PRISM",        [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"a",err) && requirePositive(in,"b",err) && requirePositive(in,"height",err); }},
+      {"GEO.AREA.CUBOID",         [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"a",err) && requirePositive(in,"b",err) && requirePositive(in,"height",err); }},
+      {"GEO.AREA.PRISM",          [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"a",err) && requirePositive(in,"b",err) && requirePositive(in,"height",err); }},
+      {"GEO.VOLUME.CYLINDER",     [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"radius",err) && requirePositive(in,"height",err); }},
+      {"GEO.AREA.CYLINDER",       [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"radius",err) && requirePositive(in,"height",err); }},
+      {"GEO.VOLUME.CONE",         [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"radius",err) && requirePositive(in,"height",err); }},
+      {"GEO.AREA.CONE",           [](const nlohmann::json& in, std::string& err){
+          return requirePositive(in,"radius",err) && requirePositive(in,"slant",err); }},
+    };
   }
 
   cmdsdk::CommandMetadata buildMetadata() const override {
@@ -349,6 +435,8 @@ class GeometryCmdProvider final : public cmdsdk::SubCmd {
     return metadata;
   }
 
+  // validate() now dispatches in O(1) via validate_dispatcher_ instead of
+  // the former O(n) if-chain of grouped subtype checks.
   bool validate(const nlohmann::json& input,
                 std::string& error) override {
     if (!input.is_object()) {
@@ -370,171 +458,44 @@ class GeometryCmdProvider final : public cmdsdk::SubCmd {
       return false;
     }
 
-    // Triangle
-    if (sub_type == "GEO.PERIMETER.TRIANGLE" ||
-        sub_type == "GEO.AREA.TRIANGLE") {
-
-      return requirePositive(input, "a", error) &&
-             requirePositive(input, "b", error) &&
-             requirePositive(input, "c", error) &&
-             validateTriangleInequality(input, error);
+    const auto it = validate_dispatcher_.find(sub_type);
+    if (it == validate_dispatcher_.end()) {
+      error = "Validation not implemented for subType: " + sub_type + ".";
+      return false;
     }
 
-    // Rectangle
-    if (sub_type == "GEO.PERIMETER.RECTANGLE" ||
-        sub_type == "GEO.AREA.RECTANGLE") {
-
-      return requirePositive(input, "a", error) &&
-             requirePositive(input, "b", error);
-    }
-
-    // Circle/Sphere
-    if (sub_type == "GEO.PERIMETER.CIRCLE" ||
-        sub_type == "GEO.AREA.CIRCLE" ||
-        sub_type == "GEO.AREA.SPHERE" ||
-        sub_type == "GEO.VOLUME.SPHERE") {
-
-      return requirePositive(input, "radius", error);
-    }
-
-    // Pyramid area
-    if (sub_type == "GEO.AREA.PYRAMID") {
-      return requirePositive(input, "a", error) &&
-             requirePositive(input, "slant", error);
-    }
-
-    // Cube/Tetrahedron
-    if (sub_type == "GEO.AREA.TETRAHEDRON" ||
-        sub_type == "GEO.VOLUME.TETRAHEDRON" ||
-        sub_type == "GEO.VOLUME.CUBE" ||
-        sub_type == "GEO.AREA.CUBE") {
-
-      return requirePositive(input, "side", error);
-    }
-
-    // Pyramid volume
-    if (sub_type == "GEO.VOLUME.PYRAMID") {
-      return requirePositive(input, "a", error) &&
-             requirePositive(input, "height", error);
-    }
-
-    // Cuboid/Prism
-    if (sub_type == "GEO.VOLUME.CUBOID" ||
-        sub_type == "GEO.VOLUME.PRISM" ||
-        sub_type == "GEO.AREA.CUBOID" ||
-        sub_type == "GEO.AREA.PRISM") {
-
-      return requirePositive(input, "a", error) &&
-             requirePositive(input, "b", error) &&
-             requirePositive(input, "height", error);
-    }
-
-    // Cylinder
-    if (sub_type == "GEO.VOLUME.CYLINDER" ||
-        sub_type == "GEO.AREA.CYLINDER") {
-
-      return requirePositive(input, "radius", error) &&
-             requirePositive(input, "height", error);
-    }
-
-    // Cone
-    if (sub_type == "GEO.VOLUME.CONE") {
-      return requirePositive(input, "radius", error) &&
-             requirePositive(input, "height", error);
-    }
-
-    if (sub_type == "GEO.AREA.CONE") {
-      return requirePositive(input, "radius", error) &&
-             requirePositive(input, "slant", error);
-    }
-
-    error = "Validation not implemented.";
-    return false;
+    return it->second(input, error);
   }
 
+  // execute() dispatches in O(1) via exec_dispatcher_ instead of the former
+  // 21-branch if-chain.  Adding a shape only requires a handler entry in the
+  // constructor map and a new private execXxx() method.
   bool execute(const nlohmann::json& input,
                std::string& error) override {
 
     const auto sub_type =
         resolveSubCmdType(input.at("subType").get<std::string>());
 
-    // ── PERIMETER ───────────────────────────────────────────────────────────
+    const auto it = exec_dispatcher_.find(sub_type);
+    if (it == exec_dispatcher_.end()) {
+      error = "Unsupported subType.";
+      return false;
+    }
 
-    if (sub_type == "GEO.PERIMETER.TRIANGLE")
-      return execPerimeterTriangle(input);
-
-    if (sub_type == "GEO.PERIMETER.RECTANGLE")
-      return execPerimeterRectangle(input);
-
-    if (sub_type == "GEO.PERIMETER.CIRCLE")
-      return execPerimeterCircle(input);
-
-    // ── AREA ────────────────────────────────────────────────────────────────
-
-    if (sub_type == "GEO.AREA.TRIANGLE")
-      return execAreaTriangle(input);
-
-    if (sub_type == "GEO.AREA.RECTANGLE")
-      return execAreaRectangle(input);
-
-    if (sub_type == "GEO.AREA.CIRCLE")
-      return execAreaCircle(input);
-
-    if (sub_type == "GEO.AREA.SPHERE")
-      return execAreaSphere(input);
-
-    if (sub_type == "GEO.AREA.PYRAMID")
-      return execAreaPyramid(input);
-
-    if (sub_type == "GEO.AREA.TETRAHEDRON")
-      return execAreaTetrahedron(input);
-
-    if (sub_type == "GEO.AREA.CUBE")
-      return execAreaCube(input);
-
-    if (sub_type == "GEO.AREA.CUBOID")
-      return execAreaCuboid(input);
-
-    if (sub_type == "GEO.AREA.PRISM")
-      return execAreaPrism(input);
-
-    if (sub_type == "GEO.AREA.CYLINDER")
-      return execAreaCylinder(input);
-
-    if (sub_type == "GEO.AREA.CONE")
-      return execAreaCone(input);
-
-    // ── VOLUME ──────────────────────────────────────────────────────────────
-
-    if (sub_type == "GEO.VOLUME.PYRAMID")
-      return execVolumePyramid(input);
-
-    if (sub_type == "GEO.VOLUME.TETRAHEDRON")
-      return execVolumeTetrahedron(input);
-
-    if (sub_type == "GEO.VOLUME.CUBE")
-      return execVolumeCube(input);
-
-    if (sub_type == "GEO.VOLUME.CUBOID")
-      return execVolumeCuboid(input);
-
-    if (sub_type == "GEO.VOLUME.PRISM")
-      return execVolumePrism(input);
-
-    if (sub_type == "GEO.VOLUME.CYLINDER")
-      return execVolumeCylinder(input);
-
-    if (sub_type == "GEO.VOLUME.CONE")
-      return execVolumeCone(input);
-
-    if (sub_type == "GEO.VOLUME.SPHERE")
-      return execVolumeSphere(input);
-
-    error = "Unsupported subType.";
-    return false;
+    return it->second(this, input);
   }
 
  private:
+  std::unordered_map<std::string, ExecHandler>     exec_dispatcher_;
+  std::unordered_map<std::string, ValidateHandler> validate_dispatcher_;
+
+  // Static wrapper so validate_dispatcher_ lambdas can call it without
+  // capturing `this` (they are free-function-style ValidateHandlers).
+  static bool validateTriangleInequalityStatic(
+      const nlohmann::json& input,
+      std::string& error) {
+    return validateTriangleInequality(input, error);
+  }
 
   static bool validateTriangleInequality(
       const nlohmann::json& input,
@@ -921,4 +882,12 @@ class GeometryCmdProvider final : public cmdsdk::SubCmd {
 
 }  // namespace
 
+// SIOF safety note:
+// CMDSDK_REGISTER_PROVIDER expands to a file-static AutoRegister<T> whose
+// constructor calls ProviderRegistrar::instance().addFactory(...).
+// ProviderRegistrar::instance() returns a *function-local* static, which
+// C++11 §6.7 guarantees is initialised exactly once, on first call, before
+// any use – regardless of cross-TU static-init order.  This eliminates the
+// Static Initialisation Order Fiasco even when multiple plugin shared libraries
+// are loaded in unpredictable order by the plugin host.
 CMDSDK_REGISTER_PROVIDER(GeometryCmdProvider);

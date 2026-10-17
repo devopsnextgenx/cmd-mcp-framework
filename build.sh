@@ -2,7 +2,19 @@
 
 set -eu
 
-VCPKG_ROOT="${VCPKG_ROOT:-/usr/local/vcpkg}"
+# ---------------------------------------------------------------------------
+# Default vcpkg root: prefer a local user install, fall back to the container
+# path (/usr/local/vcpkg) so both environments work without changes.
+# Override by exporting VCPKG_ROOT before calling this script.
+# ---------------------------------------------------------------------------
+if [ -z "${VCPKG_ROOT:-}" ]; then
+    if [ -d "$HOME/.local/share/vcpkg/.git" ] && [ -x "$HOME/.local/share/vcpkg/vcpkg" ]; then
+        VCPKG_ROOT="$HOME/.local/share/vcpkg"
+    else
+        VCPKG_ROOT="/usr/local/vcpkg"
+    fi
+fi
+
 VCPKG_REPO_URL="${VCPKG_REPO_URL:-https://github.com/microsoft/vcpkg.git}"
 BUILD_DIR="${BUILD_DIR:-build}"
 VCPKG_MANIFEST_DIR="${VCPKG_MANIFEST_DIR:-$PWD}"
@@ -140,10 +152,33 @@ if [ "$FORCE_RECOMPILE" = "1" ]; then
     CMAKE_EXTRA_FLAGS="-DFORCE_RECOMPILE=OFF"
 fi
 
-if command -v ninja >/dev/null 2>&1; then
-    cmake -S . -B "$BUILD_DIR" -G Ninja         -DCMAKE_TOOLCHAIN_FILE="$CMAKE_TOOLCHAIN_FILE"         -DVCPKG_MANIFEST_DIR="$VCPKG_MANIFEST_DIR"         -DCMAKE_C_COMPILER_LAUNCHER=ccache         -DCMAKE_CXX_COMPILER_LAUNCHER=ccache         $CMAKE_EXTRA_FLAGS
+# ---------------------------------------------------------------------------
+# ccache — optional compiler launcher; skip gracefully if not installed
+# ---------------------------------------------------------------------------
+CCACHE_FLAGS=""
+if command -v ccache >/dev/null 2>&1; then
+    echo "-- ccache found: $(ccache --version | head -1)"
+    CCACHE_FLAGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
 else
-    cmake -S . -B "$BUILD_DIR"         -DCMAKE_TOOLCHAIN_FILE="$CMAKE_TOOLCHAIN_FILE"         -DVCPKG_MANIFEST_DIR="$VCPKG_MANIFEST_DIR"         -DCMAKE_C_COMPILER_LAUNCHER=ccache         -DCMAKE_CXX_COMPILER_LAUNCHER=ccache         $CMAKE_EXTRA_FLAGS
+    echo "-- ccache not found, building without compiler cache (install ccache to speed up rebuilds)"
+fi
+
+# ---------------------------------------------------------------------------
+# CMake configure
+# ---------------------------------------------------------------------------
+if command -v ninja >/dev/null 2>&1; then
+    cmake -S . -B "$BUILD_DIR" \
+        -G Ninja \
+        -DCMAKE_TOOLCHAIN_FILE="$CMAKE_TOOLCHAIN_FILE" \
+        -DVCPKG_MANIFEST_DIR="$VCPKG_MANIFEST_DIR" \
+        $CCACHE_FLAGS \
+        $CMAKE_EXTRA_FLAGS
+else
+    cmake -S . -B "$BUILD_DIR" \
+        -DCMAKE_TOOLCHAIN_FILE="$CMAKE_TOOLCHAIN_FILE" \
+        -DVCPKG_MANIFEST_DIR="$VCPKG_MANIFEST_DIR" \
+        $CCACHE_FLAGS \
+        $CMAKE_EXTRA_FLAGS
 fi
 
 cmake --build "$BUILD_DIR" --parallel "$JOBS"

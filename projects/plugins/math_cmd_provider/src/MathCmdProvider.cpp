@@ -2,6 +2,8 @@
 #include <memory>
 #include <string>
 #include <cmath>
+#include <functional>
+#include <unordered_map>
 
 #include <nlohmann/json.hpp>
 
@@ -12,6 +14,12 @@
 #include "cmdsdk/ProviderRegistrar.hpp"
 
 namespace {
+
+// Floating-point epsilon for near-zero divisor checks.
+// A raw (right == 0) comparison is unreliable for doubles: arithmetic such as
+// (1.0/3.0 * 3.0 - 1.0) yields ~5.5e-17 instead of 0.  Values within
+// [-kDivEpsilon, kDivEpsilon] are treated as effectively zero.
+static constexpr double kDivEpsilon = 1e-9;
 
 nlohmann::json mathResultSchema(const std::string& subtype_name,
                                  const std::string& operation,
@@ -34,6 +42,9 @@ nlohmann::json mathResultSchema(const std::string& subtype_name,
 
 class MathCmdProvider final : public cmdsdk::SubCmd {
  public:
+  // Handler type for the dispatcher map.
+  using Handler = std::function<bool(MathCmdProvider*, double, double)>;
+
   MathCmdProvider() : cmdsdk::SubCmd() {
     setPluginName("MATH");
     registerSubCmdType("MATH.ADD", {"MATH.ADD", "Add left and right."});
@@ -42,6 +53,18 @@ class MathCmdProvider final : public cmdsdk::SubCmd {
     registerSubCmdType("MATH.DIV", {"MATH.DIV", "Divide left by right."});
     registerSubCmdType("MATH.MOD", {"MATH.MOD", "Modulo of left by right."});
     registerSubCmdType("MATH.POW", {"MATH.POW", "Raise left to the power of right."});
+
+    // Dispatcher map: built once at construction, looked up in O(1) in execute().
+    // To add a new operation: register its subtype above, add a handler here,
+    // and implement a private executeXxx() method below.
+    dispatcher_ = {
+      {"MATH.ADD", [](MathCmdProvider* s, double l, double r){ return s->executeAdd(l, r); }},
+      {"MATH.SUB", [](MathCmdProvider* s, double l, double r){ return s->executeSub(l, r); }},
+      {"MATH.MUL", [](MathCmdProvider* s, double l, double r){ return s->executeMul(l, r); }},
+      {"MATH.DIV", [](MathCmdProvider* s, double l, double r){ return s->executeDiv(l, r); }},
+      {"MATH.MOD", [](MathCmdProvider* s, double l, double r){ return s->executeMod(l, r); }},
+      {"MATH.POW", [](MathCmdProvider* s, double l, double r){ return s->executePow(l, r); }},
+    };
   }
 
   cmdsdk::CommandMetadata buildMetadata() const override {
@@ -49,7 +72,7 @@ class MathCmdProvider final : public cmdsdk::SubCmd {
     metadata.cmd_name   = "math.calculate";
     metadata.description =
         "Math command provider extending abstract Cmd. Demonstrates subtype "
-        "registration with switch-case execution.";
+        "registration with dispatcher-map execution.";
     metadata.parameters = {
         {"subType", "string", true,
          "Allowed values: MATH.ADD, MATH.SUB, MATH.MUL, MATH.DIV, MATH.MOD, MATH.POW.",
@@ -100,30 +123,25 @@ class MathCmdProvider final : public cmdsdk::SubCmd {
     return true;
   }
 
+  // Dispatches to the correct handler in O(1) via the dispatcher map.
+  // Adding a new operation only requires: a registerSubCmdType() call above,
+  // a new dispatcher_ entry, and a new private executeXxx() method.
   bool execute(const nlohmann::json& input, std::string& error) override {
     const auto sub_type = resolveSubCmdType(input.at("subType").get<std::string>());
-    const double left = input.at("left").get<double>();
+    const double left  = input.at("left").get<double>();
     const double right = input.at("right").get<double>();
 
-    if (sub_type == "MATH.ADD") {
-      return executeAdd(left, right);
-    } else if (sub_type == "MATH.SUB") {
-      return executeSub(left, right);
-    } else if (sub_type == "MATH.MUL") {
-      return executeMul(left, right);
-    } else if (sub_type == "MATH.DIV") {
-      return executeDiv(left, right);
-    } else if (sub_type == "MATH.MOD") {
-      return executeMod(left, right);
-    } else if (sub_type == "MATH.POW") {
-      return executePow(left, right);
-    } else {
+    const auto it = dispatcher_.find(sub_type);
+    if (it == dispatcher_.end()) {
       error = "Unsupported subtype requested.";
       return false;
     }
+
+    return it->second(this, left, right);
   }
 
  private:
+  std::unordered_map<std::string, Handler> dispatcher_;
 
   bool executeAdd(double left, double right) {
     setResult({
@@ -152,13 +170,15 @@ class MathCmdProvider final : public cmdsdk::SubCmd {
     return true;
   }
 
+  // Epsilon guard: std::abs(right) < kDivEpsilon rather than right == 0
+  // avoids false-positives from floating-point rounding noise and false-negatives
+  // from tiny but non-zero values that would cause IEEE 754 infinity.
   bool executeDiv(double left, double right) {
-    if (right == 0) {
-      // Note: In a real implementation, you might want to handle division by zero
+    if (std::abs(right) < kDivEpsilon) {
       setResult({
           {"subTypeExecuted", "MATH.DIV"},
           {"operation", "division"},
-          {"value", nullptr},  // or some error indicator
+          {"value", nullptr},  // divisor too close to zero – undefined result
       });
       return true;
     }
@@ -170,12 +190,13 @@ class MathCmdProvider final : public cmdsdk::SubCmd {
     return true;
   }
 
+  // Same epsilon guard: std::fmod is also undefined when |right| is effectively zero.
   bool executeMod(double left, double right) {
-    if (right == 0) {
+    if (std::abs(right) < kDivEpsilon) {
       setResult({
           {"subTypeExecuted", "MATH.MOD"},
           {"operation", "modulo"},
-          {"value", nullptr},
+          {"value", nullptr},  // divisor too close to zero – undefined result
       });
       return true;
     }
@@ -199,4 +220,12 @@ class MathCmdProvider final : public cmdsdk::SubCmd {
 
 }  // namespace
 
+// SIOF safety note:
+// CMDSDK_REGISTER_PROVIDER expands to a file-static AutoRegister<T> whose
+// constructor calls ProviderRegistrar::instance().addFactory(...).
+// ProviderRegistrar::instance() returns a *function-local* static, which
+// C++11 §6.7 guarantees is initialised exactly once, on first call, before
+// any use – regardless of cross-TU static-init order.  This eliminates the
+// Static Initialisation Order Fiasco even when multiple plugin shared libraries
+// are loaded in unpredictable order by the plugin host.
 CMDSDK_REGISTER_PROVIDER(MathCmdProvider);
